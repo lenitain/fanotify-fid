@@ -24,3 +24,4 @@ path = "src/lib.rs"
 
 [dependencies]
 libc = "0.2"
+smallvec = { version = "1", features = ["const_generics"] }
