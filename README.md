@@ -4,7 +4,7 @@ Linux fanotify **FID (File Identifier) mode** event parser and file handle utili
 
 ---
 
-## What this crate does
+## About this crate
 
 Linux fanotify has two event formats:
 
