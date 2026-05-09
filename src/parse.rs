@@ -103,11 +103,10 @@ pub fn parse_fid_events(buf: &[u8], mount_fds: &[i32]) -> Vec<FidEvent> {
                 FAN_EVENT_INFO_TYPE_FID | FAN_EVENT_INFO_TYPE_DFID => {
                     if let Some((key, resolved)) = extract_fid(buf, info_off, info_len, mount_fds) {
                         self_handle = Some(key);
-                        if path.as_os_str().is_empty() {
-                            if let Some(p) = resolved {
+                        if path.as_os_str().is_empty()
+                            && let Some(p) = resolved {
                                 path = p;
                             }
-                        }
                     }
                 }
                 _ => {}
@@ -174,8 +173,8 @@ pub fn resolve_with_cache(
         }
 
         // Try DFID_NAME: parent directory handle → cached dir path + filename
-        if let (Some(key), Some(filename)) = (&ev.dfid_name_handle, &ev.dfid_name_filename) {
-            if let Some(dir_path) = cache.get(key) {
+        if let (Some(key), Some(filename)) = (&ev.dfid_name_handle, &ev.dfid_name_filename)
+            && let Some(dir_path) = cache.get(key) {
                 ev.path = if filename.is_empty() {
                     dir_path.clone()
                 } else {
@@ -183,17 +182,14 @@ pub fn resolve_with_cache(
                 };
                 made_progress = true;
             }
-        }
 
         // Try self handle → cached path
-        if ev.path.as_os_str().is_empty() {
-            if let Some(ref key) = ev.self_handle {
-                if let Some(cached_path) = cache.get(key) {
+        if ev.path.as_os_str().is_empty()
+            && let Some(ref key) = ev.self_handle
+                && let Some(cached_path) = cache.get(key) {
                     ev.path = cached_path.clone();
                     made_progress = true;
                 }
-            }
-        }
     }
 
     made_progress

@@ -80,7 +80,7 @@ pub fn fanotify_init(flags: u32, event_f_flags: u32) -> std::io::Result<i32> {
 /// Thin safe wrapper around `fanotify_mark` (raw syscall).
 ///
 /// `path` can be a `&Path`, `&str`, or anything `AsRef<OsStr>`.
-pub fn fanotify_mark<P: AsRef<std::ffi::OsStr>>(
+pub fn fanotify_mark<P: AsRef<std::ffi::OsStr> + ?Sized>(
     fanotify_fd: i32,
     flags: u32,
     mask: u64,

@@ -39,9 +39,10 @@ pub fn name_to_handle_at(path: &Path) -> io::Result<HandleKey> {
     let mut buf = vec![0u8; 128];
     let mut mount_id: libc::c_int = 0;
 
-    // Write handle_bytes capacity at the start of the buffer (before file_handle header).
-    let capacity = (buf.len() as u32).to_ne_bytes();
-    buf[0..4].copy_from_slice(&capacity);
+    // Set handle_bytes to available payload space (total buf - 8 byte header).
+    // struct file_handle { u32 handle_bytes; i32 handle_type; u8 f_handle[]; };
+    let payload_bytes = (buf.len() - 8) as u32;
+    buf[0..4].copy_from_slice(&payload_bytes.to_ne_bytes());
 
     // SAFETY: `name_to_handle_at` is a pure syscall; we pass a valid C string
     // and a buffer large enough to hold the handle.
@@ -61,8 +62,8 @@ pub fn name_to_handle_at(path: &Path) -> io::Result<HandleKey> {
         if err.raw_os_error() == Some(libc::EOVERFLOW) {
             let needed = u32::from_ne_bytes(buf[0..4].try_into().unwrap()) as usize;
             let mut buf = vec![0u8; needed + 64];
-            let capacity = (buf.len() as u32).to_ne_bytes();
-            buf[0..4].copy_from_slice(&capacity);
+            let payload_bytes = (buf.len() - 8) as u32;
+            buf[0..4].copy_from_slice(&payload_bytes.to_ne_bytes());
             let ret = unsafe {
                 libc::name_to_handle_at(
                     libc::AT_FDCWD,
