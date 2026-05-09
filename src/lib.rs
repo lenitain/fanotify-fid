@@ -61,7 +61,7 @@ pub mod prelude {
     pub use crate::consts::*;
     pub use crate::handle::{name_to_handle_at, open_by_handle_at, resolve_file_handle};
     pub use crate::parse::parse_fid_events;
-    pub use crate::read::read_fid_events;
+    pub use crate::read::{read_fid_events, read_legacy, read_legacy_do, write_response};
     pub use crate::types::{FidEvent, HandleCache, HandleKey, LegacyEvent, FanotifyResponse};
     pub use crate::{fanotify_init, fanotify_mark, open_mount, Fanotify, FanotifyBuilder, FanotifyError};
 }
@@ -225,6 +225,45 @@ impl Fanotify {
         crate::read::read_fid_events(&self.fd, mount_fds, buf, cache)
     }
 
+    /// Read legacy (non-FID) events.
+    ///
+    /// The fanotify fd must NOT have been initialized with `FAN_REPORT_FID`.
+    pub fn read_legacy(&self) -> Result<Vec<crate::types::LegacyEvent>> {
+        crate::read::read_legacy(&self.fd)
+    }
+
+    /// Read legacy events with a callback.
+    ///
+    /// Convenience wrapper around [`read_legacy_do`](crate::read::read_legacy_do).
+    pub fn read_legacy_do<F>(&self, callback: F) -> Result<()>
+    where
+        F: FnMut(&crate::types::LegacyEvent),
+    {
+        crate::read::read_legacy_do(&self.fd, callback)
+    }
+
+    /// Write a permission response.
+    ///
+    /// Convenience wrapper around [`write_response`](crate::read::write_response).
+    pub fn send_response(&self, response: &crate::types::FanotifyResponse) -> Result<()> {
+        crate::read::write_response(&self.fd, response)
+    }
+
+    /// Add a mark on a mount point (monitor all files under it).
+    pub fn mark_mount<P: AsRef<OsStr> + ?Sized>(
+        &self,
+        mask: u64,
+        path: &P,
+    ) -> Result<()> {
+        fanotify_mark(
+            &self.fd,
+            crate::consts::FAN_MARK_ADD | crate::consts::FAN_MARK_MOUNT,
+            mask,
+            crate::consts::AT_FDCWD,
+            path,
+        )
+    }
+
     /// Get a reference to the underlying `OwnedFd`.
     pub fn as_fd(&self) -> &OwnedFd {
         &self.fd
@@ -328,6 +367,24 @@ impl FanotifyBuilder {
     /// is typically 0.
     pub fn event_flags(mut self, flags: u32) -> Self {
         self.event_f_flags = flags;
+        self
+    }
+
+    /// Enable audit logging for permission events.
+    pub fn enable_audit(mut self) -> Self {
+        self.flags |= crate::consts::FAN_ENABLE_AUDIT;
+        self
+    }
+
+    /// Report pidfd for event->pid.
+    pub fn report_pidfd(mut self) -> Self {
+        self.flags |= crate::consts::FAN_REPORT_PIDFD;
+        self
+    }
+
+    /// Report dirent target id.
+    pub fn report_target_fid(mut self) -> Self {
+        self.flags |= crate::consts::FAN_REPORT_TARGET_FID;
         self
     }
 

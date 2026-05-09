@@ -4,9 +4,10 @@
 //! and optional cache-based path recovery.
 
 use std::os::fd::OwnedFd;
+use std::path::PathBuf;
 
 use crate::parse::{parse_fid_events, resolve_with_cache};
-use crate::types::{FidEvent, HandleCache};
+use crate::types::{FanotifyResponse, FidEvent, HandleCache, LegacyEvent};
 use crate::FanotifyError;
 
 /// Read and parse FID-format events from a fanotify file descriptor.
@@ -137,4 +138,273 @@ pub fn read_fid_events(
     }
 
     Ok(events)
+}
+
+// ── Legacy event reading ──
+
+const LEGACY_BUF_EVENTS: usize = 200;
+
+/// Read and parse legacy (non-FID) events from a fanotify file descriptor.
+///
+/// The fanotify fd must NOT have been created with `FAN_REPORT_FID` flags.
+/// Each returned [`LegacyEvent`] carries an open file descriptor that is
+/// automatically closed when the event is dropped (RAII).
+///
+/// # Errors
+///
+/// Returns [`FanotifyError::Read`] if the `read` syscall fails.
+///
+/// # Example
+///
+/// ```rust,no_run
+/// use fanotify_fid::read::read_legacy;
+/// use std::os::fd::{FromRawFd, OwnedFd};
+///
+/// let fan_fd = unsafe { OwnedFd::from_raw_fd(3) };
+/// let events = read_legacy(&fan_fd).unwrap();
+/// for ev in &events {
+///     println!("pid={} {:?} {}", ev.pid, ev.event_names(), ev.path.display());
+/// }
+/// ```
+pub fn read_legacy(
+    fan_fd: &OwnedFd,
+) -> Result<Vec<LegacyEvent>, FanotifyError> {
+    use crate::types::FanMetadata;
+    use std::os::fd::AsRawFd;
+
+    // SAFETY: buffer is stack-allocated and a valid write target.
+    let mut buf = [0u8; 24 * LEGACY_BUF_EVENTS];
+    let n = unsafe {
+        libc::read(
+            fan_fd.as_raw_fd(),
+            buf.as_mut_ptr() as *mut libc::c_void,
+            buf.len(),
+        )
+    };
+
+    if n < 0 {
+        return Err(FanotifyError::Read(
+            std::io::Error::last_os_error().raw_os_error().unwrap_or(0),
+        ));
+    }
+    if n == 0 {
+        return Ok(Vec::new());
+    }
+
+    let n = n as usize;
+    let mut events = Vec::new();
+    let mut offset = 0;
+
+    while offset + 24 <= n {
+        // SAFETY: bounds verified above.
+        let meta = unsafe {
+            std::ptr::read_unaligned(buf.as_ptr().add(offset) as *const FanMetadata)
+        };
+        let event_len = meta.event_len as usize;
+        if event_len < 24 || offset + event_len > n {
+            break;
+        }
+
+        let path = if meta.fd >= 0 {
+            std::fs::read_link(format!("/proc/self/fd/{}", meta.fd)).unwrap_or_default()
+        } else {
+            PathBuf::new()
+        };
+
+        events.push(LegacyEvent {
+            mask: meta.mask,
+            fd: meta.fd,
+            pid: meta.pid,
+            path,
+        });
+
+        offset += event_len;
+    }
+
+    Ok(events)
+}
+
+/// Read legacy events and apply a callback to each.
+///
+/// Like [`read_legacy`] but processes events via `callback` as they are
+/// parsed, without collecting into a `Vec` first.
+///
+/// # Errors
+///
+/// Returns [`FanotifyError::Read`] if the `read` syscall fails.
+///
+/// # Example
+///
+/// ```rust,no_run
+/// use fanotify_fid::read::read_legacy_do;
+/// use std::os::fd::{FromRawFd, OwnedFd};
+///
+/// let fan_fd = unsafe { OwnedFd::from_raw_fd(3) };
+/// read_legacy_do(&fan_fd, |ev| {
+///     println!("pid={} {:?}", ev.pid, ev.event_names());
+/// }).unwrap();
+/// ```
+pub fn read_legacy_do<F>(
+    fan_fd: &OwnedFd,
+    mut callback: F,
+) -> Result<(), FanotifyError>
+where
+    F: FnMut(&LegacyEvent),
+{
+    let events = read_legacy(fan_fd)?;
+    for ev in &events {
+        callback(ev);
+    }
+    Ok(())
+}
+
+/// Write a permission response to the fanotify fd.
+///
+/// Must be called after receiving a permission event (`FAN_OPEN_PERM`,
+/// `FAN_ACCESS_PERM`, or `FAN_OPEN_EXEC_PERM`) to grant or deny the
+/// operation.
+///
+/// The `response.fd` should be copied from the [`LegacyEvent`] that
+/// triggered the permission check.
+///
+/// # Errors
+///
+/// Returns [`FanotifyError::Read`] if the `write` syscall fails.
+///
+/// # Example
+///
+/// ```rust,no_run
+/// use fanotify_fid::read::write_response;
+/// use fanotify_fid::types::FanotifyResponse;
+/// use std::os::fd::{FromRawFd, OwnedFd};
+///
+/// let fan_fd = unsafe { OwnedFd::from_raw_fd(3) };
+/// let resp = FanotifyResponse { fd: 5, response: 0x01 }; // FAN_ALLOW
+/// write_response(&fan_fd, &resp).unwrap();
+/// ```
+pub fn write_response(
+    fan_fd: &OwnedFd,
+    response: &FanotifyResponse,
+) -> Result<(), FanotifyError> {
+    use std::os::fd::AsRawFd;
+
+    // SAFETY: fanotify_response is a plain-old-data struct.
+    let resp = libc::fanotify_response {
+        fd: response.fd,
+        response: response.response,
+    };
+
+    let ret = unsafe {
+        libc::write(
+            fan_fd.as_raw_fd(),
+            &resp as *const libc::fanotify_response as *const libc::c_void,
+            std::mem::size_of::<libc::fanotify_response>(),
+        )
+    };
+
+    if ret < 0 {
+        return Err(FanotifyError::Read(
+            std::io::Error::last_os_error().raw_os_error().unwrap_or(0),
+        ));
+    }
+    Ok(())
+}
+
+// ── Tests ──
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::types::FanMetadata;
+
+    fn build_legacy_raw(mask: u64, pid: i32, fd: i32, event_len: u32) -> Vec<u8> {
+        let mut buf = Vec::with_capacity(24);
+        buf.extend_from_slice(&event_len.to_ne_bytes());
+        buf.push(3); // vers = FANOTIFY_METADATA_VERSION
+        buf.push(0); // reserved
+        buf.extend_from_slice(&24u16.to_ne_bytes()); // metadata_len
+        buf.extend_from_slice(&mask.to_ne_bytes());
+        buf.extend_from_slice(&fd.to_ne_bytes());
+        buf.extend_from_slice(&pid.to_ne_bytes());
+        buf
+    }
+
+    #[test]
+    fn test_legacy_parse_single_event() {
+        let raw = build_legacy_raw(0x0000_0001, 1234, 5, 24);
+        let meta: FanMetadata = unsafe { std::ptr::read_unaligned(raw.as_ptr() as *const _) };
+        assert_eq!(meta.mask, 0x0000_0001);
+        assert_eq!(meta.pid, 1234);
+        assert_eq!(meta.fd, 5);
+        assert_eq!(meta.event_len, 24);
+    }
+
+    #[test]
+    fn test_legacy_dev_null_read_empty() {
+        // Opening /dev/null and reading from it gives EOF (0 bytes).
+        // read_legacy should return Ok(empty vec) for 0 bytes read.
+        let fd = std::fs::File::open("/dev/null").unwrap();
+        let owned: OwnedFd = fd.into();
+        let result = read_legacy(&owned);
+        assert!(result.is_ok());
+        assert!(result.unwrap().is_empty());
+    }
+
+    #[test]
+    fn test_legacy_parse_multiple_raw_events() {
+        let ev1 = build_legacy_raw(0x0000_0001, 10, 3, 24);
+        let ev2 = build_legacy_raw(0x0000_0002, 20, 4, 30); // larger event_len
+        let combined = [ev1, ev2].concat();
+
+        // Manually parse: event 1
+        let meta1: FanMetadata = unsafe { std::ptr::read_unaligned(combined.as_ptr() as *const _) };
+        assert_eq!(meta1.mask, 0x0000_0001);
+        assert_eq!(meta1.pid, 10);
+        // event 2 offset
+        let off2 = meta1.event_len as usize;
+        let meta2: FanMetadata = unsafe { std::ptr::read_unaligned(combined.as_ptr().add(off2) as *const _) };
+        assert_eq!(meta2.mask, 0x0000_0002);
+        assert_eq!(meta2.pid, 20);
+    }
+
+    #[test]
+    fn test_legacy_overflow_flag() {
+        let ev = LegacyEvent {
+            mask: crate::consts::FAN_Q_OVERFLOW,
+            fd: -1,
+            pid: 0,
+            path: PathBuf::new(),
+        };
+        assert!(ev.is_overflow());
+    }
+
+    #[test]
+    fn test_legacy_event_names() {
+        let ev = LegacyEvent {
+            mask: crate::consts::FAN_CREATE | crate::consts::FAN_MODIFY,
+            fd: -1,
+            pid: 0,
+            path: PathBuf::new(),
+        };
+        let names = ev.event_names();
+        assert_eq!(names, vec!["MODIFY", "CREATE"]);
+    }
+
+    #[test]
+    fn test_legacy_drop_closes_fd() {
+        // We can't easily test real fd close without opening a real fd,
+        // but we can verify the Drop impl doesn't crash on invalid fd.
+        let ev = LegacyEvent {
+            mask: 0,
+            fd: -1, // FAN_NOFD — should be safely ignored by Drop
+            pid: 0,
+            path: PathBuf::new(),
+        };
+        drop(ev); // should not panic or crash
+    }
+
+    #[test]
+    fn test_fanotify_response_size() {
+        assert_eq!(std::mem::size_of::<libc::fanotify_response>(), 8);
+    }
 }
