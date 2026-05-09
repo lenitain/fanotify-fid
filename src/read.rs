@@ -37,7 +37,7 @@ use crate::types::{FidEvent, HandleKey};
 /// that produce many events per read, pre-allocate a larger buffer:
 ///
 /// ```rust,no_run
-/// let mut buf = Vec::with_capacity(256 * 1024);
+/// let mut buf: Vec<u8> = Vec::with_capacity(256 * 1024);
 /// ```
 ///
 /// # Returns

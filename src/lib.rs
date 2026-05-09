@@ -13,23 +13,20 @@
 //! ```rust,no_run
 //! use fanotify_fid::prelude::*;
 //!
-//! // 1. Create fanotify fd (using fanotify-rs or raw syscall)
-//! let fan_fd = fanotify_fid::fanotify_init(
+//! // 1. Create fanotify fd in FID mode
+//! let fan_fd = fanotify_init(
 //!     FAN_CLASS_NOTIF | FAN_CLOEXEC | FAN_NONBLOCK |
 //!     FAN_REPORT_FID | FAN_REPORT_DIR_FID | FAN_REPORT_NAME,
 //!     0,
 //! ).unwrap();
 //!
-//! // 2. Open mount fd for handle resolution
-//! let mount_fd = open_mount_fd("/").unwrap();
-//!
-//! // 3. Read events
-//! let mut buf = Vec::with_capacity(65536);
-//! let events = fanotify_fid::read_fid_events(
+//! // 2. Read events (supply mount fds for handle resolution)
+//! let mut buf: Vec<u8> = Vec::with_capacity(65536);
+//! let events = read_fid_events(
 //!     fan_fd,
-//!     &[mount_fd],
+//!     &[],           // mount fds from open(O_PATH) on monitored mount points
 //!     &mut buf,
-//!     None, // no persistent cache
+//!     None,          // optional persistent cache
 //! ).unwrap();
 //!
 //! for ev in &events {
@@ -61,6 +58,7 @@ pub mod prelude {
     pub use crate::parse::parse_fid_events;
     pub use crate::read::read_fid_events;
     pub use crate::types::{FidEvent, HandleKey, FanMetadata, FanInfoHeader};
+    pub use crate::{fanotify_init, fanotify_mark};
 }
 
 /// Thin safe wrapper around `fanotify_init` (raw syscall).
