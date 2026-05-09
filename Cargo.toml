@@ -8,7 +8,7 @@ documentation = "https://docs.rs/fanotify-fid"
 repository = "https://github.com/lenitain/fanotify-fid"
 readme = "README.md"
 keywords = ["filesystem", "syscall", "linux", "fanotify"]
-categories = ["os::linux-apis", "os::filesystem"]
+categories = ["os::linux-apis", "filesystem"]
 authors = ["lenitain <xt.zhu@qq.com>"]
 
 include = [
