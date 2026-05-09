@@ -125,3 +125,63 @@ impl FidEvent {
         crate::consts::mask_to_event_names(self.mask)
     }
 }
+
+// ── Legacy (non-FID) event ──
+
+/// A parsed legacy (non-FID) fanotify event.
+///
+/// Legacy events carry an open file descriptor for the accessed file.
+/// The fd is automatically closed when this event is dropped (RAII).
+/// If you need the fd to outlive the event, use `libc::dup(ev.fd)` to
+/// obtain a copy.
+#[derive(Debug)]
+pub struct LegacyEvent {
+    /// Event mask (one or more of `FAN_ACCESS`, `FAN_MODIFY`, etc.).
+    pub mask: u64,
+    /// Open file descriptor for the object being accessed.
+    /// Automatically closed on drop.
+    pub fd: i32,
+    /// PID of the process that triggered the event.
+    pub pid: i32,
+    /// Resolved path (via `readlink("/proc/self/fd/N")`).
+    ///
+    /// This is best-effort; may be empty if resolution fails.
+    pub path: PathBuf,
+}
+
+impl Drop for LegacyEvent {
+    fn drop(&mut self) {
+        if self.fd >= 0 {
+            unsafe { libc::close(self.fd); }
+        }
+    }
+}
+
+impl LegacyEvent {
+    /// Returns `true` if this event indicates a queue overflow.
+    pub fn is_overflow(&self) -> bool {
+        self.mask & crate::consts::FAN_Q_OVERFLOW != 0
+    }
+
+    /// Human-readable event names from the mask.
+    pub fn event_names(&self) -> Vec<&'static str> {
+        crate::consts::mask_to_event_names(self.mask)
+    }
+}
+
+// ── Permission response ──
+
+/// A response to a permission event (`FAN_OPEN_PERM`, `FAN_ACCESS_PERM`,
+/// `FAN_OPEN_EXEC_PERM`).
+///
+/// Write this to the fanotify fd after receiving a permission event to
+/// grant or deny the operation.  The `fd` field should be copied from the
+/// [`LegacyEvent`] that triggered the permission check.
+#[derive(Debug, Clone)]
+pub struct FanotifyResponse {
+    /// The file descriptor from the `LegacyEvent` that triggered the
+    /// permission check.
+    pub fd: i32,
+    /// `FAN_ALLOW` to grant, `FAN_DENY` to deny.
+    pub response: u32,
+}
