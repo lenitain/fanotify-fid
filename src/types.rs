@@ -1,5 +1,6 @@
 //! Kernel data structures and parsed event types for fanotify FID mode.
 
+use std::collections::HashMap;
 use std::mem;
 use std::path::PathBuf;
 
@@ -73,6 +74,15 @@ pub struct FanInfoHeader {
 /// lookup key when caching handle → path mappings to recover paths for
 /// events on deleted directories.
 pub type HandleKey = Vec<u8>;
+
+/// Persistent cache mapping file handle keys to resolved paths.
+///
+/// Used to recover paths for events whose directories were deleted
+/// concurrently with event delivery.
+///
+/// Update with successfully-resolved [`FidEvent`]s before calling
+/// [`resolve_with_cache`](crate::parse::resolve_with_cache).
+pub type HandleCache = HashMap<HandleKey, PathBuf>;
 
 // ── Parsed event ──
 

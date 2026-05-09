@@ -23,7 +23,9 @@
 //! └──────────────────────────────┘
 //! ```
 
+#[cfg(test)]
 use std::collections::HashMap;
+use std::os::fd::OwnedFd;
 use std::path::PathBuf;
 use std::ptr;
 
@@ -32,8 +34,8 @@ use crate::consts::{
 };
 use crate::handle::resolve_file_handle;
 use crate::types::{
-    FanInfoHeader, FanMetadata, FidEvent, HandleKey, FSID_SIZE, FH_HDR_SIZE, INFO_HDR_SIZE,
-    META_SIZE,
+    FanInfoHeader, FanMetadata, FidEvent, HandleCache, HandleKey, FSID_SIZE, FH_HDR_SIZE,
+    INFO_HDR_SIZE, META_SIZE,
 };
 
 /// Parse a buffer of raw fanotify FID events into a [`Vec<FidEvent>`].
@@ -47,9 +49,9 @@ use crate::types::{
 ///
 /// * `buf` — A byte buffer containing one or more fanotify events (as returned
 ///   by `read()` from a fanotify fd initialized with FID flags).
-/// * `mount_fds` — Open file descriptors for mount points on the filesystems
-///   being monitored.  Used by [`resolve_file_handle`] to convert file handles
-///   back to paths.
+/// * `mount_fds` — Open [`OwnedFd`]s for mount points on the filesystems being
+///   monitored (obtained via [`open_mount`](crate::open_mount) with `O_PATH`).
+///   Used by [`resolve_file_handle`] to convert file handles back to paths.
 ///
 /// # Path resolution caveat
 ///
@@ -58,7 +60,7 @@ use crate::types::{
 /// `FidEvent.path` will be empty.  To recover these paths, maintain a
 /// persistent cache and call [`resolve_with_cache`] after updating it with
 /// successfully-resolved events.
-pub fn parse_fid_events(buf: &[u8], mount_fds: &[i32]) -> Vec<FidEvent> {
+pub fn parse_fid_events(buf: &[u8], mount_fds: &[OwnedFd]) -> Vec<FidEvent> {
     let n = buf.len();
     let mut events = Vec::new();
     let mut offset = 0;
@@ -152,11 +154,12 @@ pub fn parse_fid_events(buf: &[u8], mount_fds: &[i32]) -> Vec<FidEvent> {
 ///
 /// ```rust,no_run
 /// use std::collections::HashMap;
+/// use std::os::fd::OwnedFd;
 /// use fanotify_fid::parse::{parse_fid_events, resolve_with_cache};
 /// use fanotify_fid::types::HandleKey;
 ///
 /// let buf: &[u8] = &[];
-/// let mount_fds: &[i32] = &[];
+/// let mount_fds: &[OwnedFd] = &[];
 /// let mut cache: HashMap<HandleKey, std::path::PathBuf> = HashMap::new();
 ///
 /// let mut events = parse_fid_events(buf, mount_fds);
@@ -165,7 +168,7 @@ pub fn parse_fid_events(buf: &[u8], mount_fds: &[i32]) -> Vec<FidEvent> {
 /// ```
 pub fn resolve_with_cache(
     events: &mut [FidEvent],
-    cache: &HashMap<HandleKey, PathBuf>,
+    cache: &HandleCache,
 ) -> bool {
     let mut made_progress = false;
 
@@ -211,7 +214,7 @@ fn extract_dfid_name(
     buf: &[u8],
     info_off: usize,
     info_len: usize,
-    mount_fds: &[i32],
+    mount_fds: &[OwnedFd],
 ) -> Option<(HandleKey, String, Option<PathBuf>)> {
     let fsid_off = info_off + INFO_HDR_SIZE;
     let fh_off = fsid_off + FSID_SIZE;
@@ -258,7 +261,7 @@ fn extract_fid(
     buf: &[u8],
     info_off: usize,
     info_len: usize,
-    mount_fds: &[i32],
+    mount_fds: &[OwnedFd],
 ) -> Option<(HandleKey, Option<PathBuf>)> {
     let fsid_off = info_off + INFO_HDR_SIZE;
     let fh_off = fsid_off + FSID_SIZE;

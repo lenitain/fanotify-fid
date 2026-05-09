@@ -141,13 +141,13 @@ pub fn open_by_handle_at(mount_fd: i32, fh_data: &[u8]) -> io::Result<OwnedFd> {
 ///
 /// This is a best-effort function: on a busy system, the file may be deleted
 /// between resolution and path read.
-pub fn resolve_file_handle(mount_fds: &[i32], fh_data: &[u8]) -> Option<PathBuf> {
+pub fn resolve_file_handle(mount_fds: &[OwnedFd], fh_data: &[u8]) -> Option<PathBuf> {
     if fh_data.len() < FH_HDR_SIZE {
         return None;
     }
 
-    for &mfd in mount_fds {
-        match open_by_handle_at(mfd, fh_data) {
+    for mfd in mount_fds {
+        match open_by_handle_at(mfd.as_raw_fd(), fh_data) {
             Ok(fd) => {
                 let result = fs::read_link(format!("/proc/self/fd/{}", fd.as_raw_fd()));
                 // fd is closed by OwnedFd::drop

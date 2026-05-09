@@ -3,11 +3,11 @@
 //! Combines `read` from a fanotify file descriptor with FID event parsing
 //! and optional cache-based path recovery.
 
-use std::collections::HashMap;
-use std::io;
+use std::os::fd::OwnedFd;
 
 use crate::parse::{parse_fid_events, resolve_with_cache};
-use crate::types::{FidEvent, HandleKey};
+use crate::types::{FidEvent, HandleCache};
+use crate::FanotifyError;
 
 /// Read and parse FID-format events from a fanotify file descriptor.
 ///
@@ -21,9 +21,10 @@ use crate::types::{FidEvent, HandleKey};
 /// * `fan_fd` — The fanotify file descriptor, as returned by
 ///   [`fanotify_init`](crate::fanotify_init) with `FAN_REPORT_FID` (and
 ///   optionally `FAN_REPORT_DIR_FID` / `FAN_REPORT_NAME`).
-/// * `mount_fds` — Open file descriptors for mount points on the filesystems
-///   under monitoring.  These are needed to resolve file handles to paths via
-///   [`open_by_handle_at`](crate::handle::open_by_handle_at).
+/// * `mount_fds` — Open [`OwnedFd`]s for mount points on the filesystems under
+///   monitoring.  These are needed to resolve file handles to paths via
+///   [`open_by_handle_at`](crate::handle::open_by_handle_at).  Obtain them
+///   with [`open_mount`](crate::open_mount).
 /// * `buf` — A mutable byte buffer, reused across calls to avoid repeated
 ///   allocation.  It will be grown to at least 64 KiB on first use.
 /// * `cache` — An optional persistent cache mapping handle keys to resolved
@@ -47,46 +48,50 @@ use crate::types::{FidEvent, HandleKey};
 ///
 /// # Errors
 ///
-/// Returns `io::Error` if `read` on the fanotify fd fails (e.g. the fd is
-/// invalid or was closed).
+/// Returns [`FanotifyError::Read`] if `read` on the fanotify fd fails, or
+/// [`FanotifyError::Io`] for internal I/O errors.
 ///
 /// # Example
 ///
 /// ```rust,no_run
 /// use fanotify_fid::read::read_fid_events;
+/// use std::os::fd::{FromRawFd, OwnedFd};
 ///
-/// let fan_fd = 3; // from fanotify_init
-/// let mount_fds = &[4]; // from open(O_PATH)
+/// let fan_fd = unsafe { OwnedFd::from_raw_fd(3) }; // from fanotify_init
+/// let mount_fds = vec![unsafe { OwnedFd::from_raw_fd(4) }]; // from open(O_PATH)
 /// let mut buf = Vec::with_capacity(65536);
 ///
-/// let events = read_fid_events(fan_fd, mount_fds, &mut buf, None).unwrap();
+/// let events = read_fid_events(&fan_fd, &mount_fds, &mut buf, None).unwrap();
 /// for ev in &events {
 ///     println!("pid={} {:?} {}", ev.pid, ev.event_names(), ev.path.display());
 /// }
 /// ```
 pub fn read_fid_events(
-    fan_fd: i32,
-    mount_fds: &[i32],
+    fan_fd: &OwnedFd,
+    mount_fds: &[OwnedFd],
     buf: &mut Vec<u8>,
-    mut cache: Option<&mut HashMap<HandleKey, std::path::PathBuf>>,
-) -> io::Result<Vec<FidEvent>> {
+    mut cache: Option<&mut HandleCache>,
+) -> Result<Vec<FidEvent>, FanotifyError> {
+    use std::os::fd::AsRawFd;
+
     // Ensure buffer is large enough
     if buf.capacity() < 65536 {
         buf.reserve(65536 - buf.capacity());
     }
 
     // SAFETY: `read` on a fanotify fd is safe as long as fd is valid.
-    // The buffer is a valid mutable byte slice.
     let n = unsafe {
         libc::read(
-            fan_fd,
+            fan_fd.as_raw_fd(),
             buf.as_mut_ptr() as *mut libc::c_void,
             buf.capacity(),
         )
     };
 
     if n < 0 {
-        return Err(io::Error::last_os_error());
+        return Err(FanotifyError::Read(
+            std::io::Error::last_os_error().raw_os_error().unwrap_or(0),
+        ));
     }
     if n == 0 {
         return Ok(Vec::new());
