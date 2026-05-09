@@ -1,0 +1,1 @@
+window.SIDEBAR_ITEMS = {"constant":["FH_HDR_SIZE","FSID_SIZE","INFO_HDR_SIZE","META_SIZE"],"struct":["FanInfoHeader","FanMetadata","FidEvent"],"type":["HandleKey"]};

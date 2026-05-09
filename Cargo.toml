@@ -1,0 +1,15 @@
+[package]
+name = "fanotify-fid"
+version = "0.1.0"
+edition = "2024"
+license = "MIT"
+description = "Linux fanotify FID (File Identifier) mode event parser and file handle utilities"
+repository = "https://github.com/lenitain/fanotify-fid"
+readme = "README.md"
+
+[lib]
+name = "fanotify_fid"
+path = "src/lib.rs"
+
+[dependencies]
+libc = "0.2"
