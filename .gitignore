@@ -1,0 +1,14 @@
+# Build output
+/target/
+
+# Library crates should not commit Cargo.lock
+# (it's only for applications to pin exact versions)
+/Cargo.lock
+
+# Editor/IDE
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+.DS_Store
