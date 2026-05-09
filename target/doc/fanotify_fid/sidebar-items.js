@@ -1,1 +1,0 @@
-window.SIDEBAR_ITEMS = {"fn":["fanotify_init","fanotify_mark"],"mod":["consts","handle","parse","prelude","read","types"]};

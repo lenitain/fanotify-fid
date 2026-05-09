@@ -1,1 +1,0 @@
-window.SIDEBAR_ITEMS = {"fn":["name_to_handle_at","open_by_handle_at","resolve_file_handle"]};
