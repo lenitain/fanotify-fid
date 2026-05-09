@@ -33,23 +33,41 @@ This crate works standalone (it includes its own `fanotify_init`/`fanotify_mark`
 
 ## Quick example
 
-```rust
+```rust,no_run
 use fanotify_fid::prelude::*;
+use std::os::fd::OwnedFd;
 
-let fan_fd = fanotify_init(
-    FAN_CLASS_NOTIF | FAN_CLOEXEC | FAN_NONBLOCK |
-    FAN_REPORT_FID | FAN_REPORT_DIR_FID | FAN_REPORT_NAME,
-    0,
+// 1. Create fanotify group in FID mode
+let fan = Fanotify::new()
+    .nonblock()
+    .report_fid()
+    .report_dir_fid()
+    .report_name()
+    .init()
+    .unwrap();
+
+// 2. Add marks (whole filesystem)
+fan.mark(
+    FAN_MARK_ADD | FAN_MARK_FILESYSTEM,
+    FAN_CREATE | FAN_DELETE | FAN_MODIFY,
+    "/",
 ).unwrap();
 
+// 3. Open mount fds for handle resolution
+let mount_fds: Vec<OwnedFd> = vec![open_mount("/").unwrap()];
+
+// 4. Read events
 let mut buf = Vec::with_capacity(65536);
-let mount_fd = /* open a mount fd on the same filesystem */;
-let events = read_fid_events(fan_fd, &[mount_fd], &mut buf, None).unwrap();
+let events = fan.read_events(&mount_fds, &mut buf, None).unwrap();
 
 for ev in &events {
-    println!("[{:?}] {}", ev.event_names(), ev.path.display());
+    println!("{:?} {:?}", ev.event_names(), ev.path);
 }
 ```
+
+> **Note**: Alternatively, use the free functions [`fanotify_init`] and
+> [`read_fid_events`] directly if you prefer not to use the `Fanotify`
+> wrapper.
 
 ---
 
