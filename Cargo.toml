@@ -4,8 +4,19 @@ version = "0.1.0"
 edition = "2024"
 license = "MIT"
 description = "Linux fanotify FID (File Identifier) mode event parser and file handle utilities"
+documentation = "https://docs.rs/fanotify-fid"
 repository = "https://github.com/lenitain/fanotify-fid"
 readme = "README.md"
+keywords = ["filesystem", "syscall", "linux", "fanotify"]
+categories = ["filesystem", "syscall", "linux", "fanotify"]
+authors = ["lenitain <xt.zhu@qq.com>"]
+
+include = [
+    "Cargo.toml",
+    "LICENSE",
+    "README.md",
+    "src/",
+]
 
 [lib]
 name = "fanotify_fid"
