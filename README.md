@@ -20,6 +20,51 @@ The crate compiles on any platform, but all runtime operations require a Linux
 kernel with `CONFIG_FANOTIFY` enabled.  Non-Linux platforms will fail at runtime
 with `FanotifyError::Init(ENOSYS)`.
 
+## Testing
+
+### Normal tests (no privileges needed)
+
+```bash
+cargo test
+```
+
+63 unit tests covering all parsing logic, builder flags, error formatting,
+cache resolution, and edge cases (empty buffers, truncated data, garbage
+input, etc.).  These run without `CAP_SYS_ADMIN`.
+
+### Integration tests (require root)
+
+7 additional tests verify end-to-end behavior against a real Linux kernel.
+Build as normal user, run the binary under `sudo`:
+
+```bash
+cargo test --test integration --no-run
+sudo ./target/debug/deps/integration-* --ignored
+```
+
+Or with `sudo -E` (preserves your PATH and rustup environment):
+
+```bash
+sudo -E ~/.cargo/bin/cargo test --test integration -- --ignored
+```
+
+Coverage:
+
+| Test | What it checks |
+|------|----------------|
+| `test_fid_event_on_single_file` | FID init → mark file → modify → read event |
+| `test_legacy_event_lifecycle` | Legacy init → mark file → open → read event |
+| `test_permission_event_response` | Permission event → `FAN_ALLOW` response → file access granted |
+| `test_name_to_handle_at_real_path` | `name_to_handle_at` on `/tmp` |
+| `test_open_by_handle_at_resolve` | `open_by_handle_at` (skips if FS doesn't support it) |
+| `test_resolve_file_handle` | `resolve_file_handle` end-to-end (skips if unsupported) |
+| `test_cache_recovers_deleted_path` | `HandleCache` recovery for deleted directories |
+
+Handle-dependent tests (`open_by_handle_at`, `resolve_file_handle`, cache)
+check for system support at runtime and skip gracefully if the filesystem
+doesn't support file handles (e.g., tmpfs, FUSE, containers without
+`CAP_DAC_READ_SEARCH`).
+
 ---
 
 ## About this crate
