@@ -39,10 +39,7 @@ Build as normal user, run the binary under `sudo`:
 
 ```bash
 cargo test --test integration --no-run
-sudo ./target/debug/deps/integration-* --ignored
 ```
-
-Or with `sudo -E` (preserves your PATH and rustup environment):
 
 ```bash
 sudo -E ~/.cargo/bin/cargo test --test integration -- --ignored
