@@ -2,6 +2,24 @@
 
 Linux fanotify **FID (File Identifier) mode** event parser and file handle utilities.
 
+## Installation
+
+```bash
+cargo add fanotify-fid
+```
+
+Minimum supported Rust version: **1.75** (edition 2024).
+
+## Requirements
+
+- Linux kernel **≥ 5.1** for FID mode (`FAN_REPORT_FID`)
+- Linux kernel **≥ 5.15** for `FAN_REPORT_TARGET_FID`
+- **`CAP_SYS_ADMIN`** capability (run as root or with `cap_sys_admin+ep`)
+
+The crate compiles on any platform, but all runtime operations require a Linux
+kernel with `CONFIG_FANOTIFY` enabled.  Non-Linux platforms will fail at runtime
+with `FanotifyError::Init(ENOSYS)`.
+
 ---
 
 ## About this crate
@@ -16,18 +34,6 @@ Linux fanotify has two event formats:
 Existing fanotify crates cover the legacy mode. This crate covers FID mode: it reads variable-length events correctly (using each event's `event_len` field rather than fixed-size steps), parses file handles from info records, and resolves them to paths.
 
 It also provides safe wrappers for `name_to_handle_at()` and `open_by_handle_at()`, the syscalls needed to convert file handles back to paths.
-
----
-
-## Related crates
-
-| Crate | Scope |
-|-------|-------|
-| [`fanotify-rs`](https://crates.io/crates/fanotify-rs) | Legacy (non-FID) mode: safe `init`/`mark` wrappers, event reading |
-| **fanotify-fid** (this crate) | FID mode: event parsing, file handle resolution |
-| [`name-to-handle-at`](https://crates.io/crates/name-to-handle-at) | `name_to_handle_at` / `open_by_handle_at` only |
-
-This crate works standalone (it includes its own `fanotify_init`/`fanotify_mark` wrappers) or alongside `fanotify-rs`.
 
 ---
 
@@ -80,6 +86,22 @@ for ev in &events {
 | `handle` | `name_to_handle_at()`, `open_by_handle_at()`, `resolve_file_handle()` |
 | `parse` | `parse_fid_events()`, `resolve_with_cache()` |
 | `read` | `read_fid_events()` — read + parse + optional cache |
+
+## Error handling
+
+All operations return `Result<T, FanotifyError>`.  Each error variant carries the
+raw errno and a **man-page-level description** explaining the cause, common
+pitfalls, and troubleshooting steps:
+
+```rust,no_run
+use fanotify_fid::FanotifyError;
+
+let e = FanotifyError::Init(libc::EPERM);
+println!("{}", e);
+// Prints: fanotify_init failed (errno=1): ...
+//   The operation is not permitted because the caller lacks
+//   the CAP_SYS_ADMIN capability...
+```
 
 ---
 

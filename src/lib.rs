@@ -8,6 +8,18 @@
 //! `fanotify_init`, you **must** use this crate (or equivalent code) to
 //! correctly parse the variable-length events.
 //!
+//! ## Requirements
+//!
+//! - Linux kernel **≥ 5.1** (FID mode), **≥ 5.15** (`FAN_REPORT_TARGET_FID`)
+//! - **`CAP_SYS_ADMIN`** capability (run as root)
+//! - Minimum Rust version: **1.75** (edition 2024)
+//!
+//! ## Error handling
+//!
+//! All operations return [`Result<T, FanotifyError>`].  Each error variant
+//! includes the raw errno and a **man-page-level description** explaining
+//! the cause, common pitfalls, and how to fix it.
+//!
 //! ## Quick start
 //!
 //! ```rust,no_run
@@ -48,6 +60,7 @@ pub mod parse;
 pub mod read;
 pub mod types;
 
+use std::borrow::Cow;
 use std::ffi::OsStr;
 use std::fmt;
 use std::io;
@@ -72,6 +85,12 @@ pub mod prelude {
 ///
 /// Carries semantics: you can match on the variant to know which operation
 /// failed, and get the raw OS error code and a human-readable description.
+///
+/// Each variant's `Display` implementation includes a multi-paragraph
+/// man-page-level explanation of the error cause, common pitfalls, and
+/// troubleshooting steps.
+///
+/// This type is `Send + Sync`.
 #[derive(Debug)]
 pub enum FanotifyError {
     /// `fanotify_init` failed.
@@ -107,47 +126,194 @@ impl From<io::Error> for FanotifyError {
     }
 }
 
-fn errno_desc_init(code: i32) -> &'static str {
+fn errno_desc_init(code: i32) -> Cow<'static, str> {
     match code {
-        libc::EINVAL => "invalid flags or event_f_flags",
-        libc::EMFILE => "too many fanotify groups for this user (max 128)",
-        libc::ENOMEM => "out of memory",
-        libc::ENOSYS => "kernel does not support fanotify (CONFIG_FANOTIFY missing)",
-        libc::EPERM => "need CAP_SYS_ADMIN capability",
-        _ => "unknown error",
+        libc::EINVAL => Cow::Borrowed(concat!(
+            "An invalid value was passed in flags or event_f_flags.\n",
+            "  Common mistakes:\n",
+            "  - Using FAN_REPORT_NAME without FAN_REPORT_DIR_FID\n",
+            "  - Combining FAN_REPORT_FID with legacy-only flags\n",
+            "  - Setting reserved or unsupported bits in event_f_flags\n",
+            "  Check man fanotify_init(2) for all allowable bits."
+        )),
+        libc::EMFILE => Cow::Borrowed(concat!(
+            "Too many fanotify groups for this user.\n",
+            "  The per-user limit is 128 groups.  Each init() call creates\n",
+            "  a new notification group.  Check if previous groups are still\n",
+            "  open (forgeting to close an OwnedFd can leak groups)."
+        )),
+        libc::ENOMEM => Cow::Borrowed(concat!(
+            "Out of memory.\n",
+            "  The kernel could not allocate memory for the notification\n",
+            "  group's internal data structures.  Try reducing the event\n",
+            "  queue size or closing other fanotify groups."
+        )),
+        libc::ENOSYS => Cow::Borrowed(concat!(
+            "This kernel does not support fanotify.\n",
+            "  The fanotify API is available only if the kernel was\n",
+            "  configured with CONFIG_FANOTIFY.  Most distro kernels\n",
+            "  include this by default.  Custom or container-optimized\n",
+            "  kernels may omit it.  Check /proc/config.gz or\n",
+            "  /boot/config-$(uname -r) for CONFIG_FANOTIFY=y."
+        )),
+        libc::EPERM => Cow::Borrowed(concat!(
+            "Need CAP_SYS_ADMIN capability.\n",
+            "  Creating a fanotify group requires elevated privileges.\n",
+            "  Run as root, or add the capability via:\n",
+            "    sudo setcap cap_sys_admin+ep /path/to/binary\n",
+            "  Or run the process under a user namespace with\n",
+            "  CAP_SYS_ADMIN mapped."
+        )),
+        _ => Cow::Owned(format!("Unknown error (errno={}).  See fanotify_init(2) for details.", code)),
     }
 }
 
-fn errno_desc_mark(code: i32) -> &'static str {
+fn errno_desc_mark(code: i32) -> Cow<'static, str> {
     match code {
-        libc::EBADF => "invalid file descriptor",
-        libc::EINVAL => "invalid flags or mask, or wrong notification class",
-        libc::ENOENT => "path does not exist",
-        libc::ENOMEM => "out of memory",
-        libc::ENOSPC => "too many marks (exceeded 8192 limit)",
-        libc::ENOTDIR => "FAN_MARK_ONLYDIR but path is not a directory",
-        _ => "unknown error",
+        libc::EBADF => Cow::Borrowed(concat!(
+            "Invalid file descriptor.\n",
+            "  Either the fanotify fd is invalid, or pathname is relative\n",
+            "  but dirfd is neither AT_FDCWD nor a valid fd.\n",
+            "  Check that fanotify_init succeeded and the fd hasn't been\n",
+            "  closed or moved into another process."
+        )),
+        libc::EINVAL => Cow::Borrowed(concat!(
+            "Invalid flags or mask, or wrong notification class.\n",
+            "  Common causes:\n",
+            "  - The fanotify group was created with FAN_CLASS_NOTIF but\n",
+            "    mask contains permission events (FAN_OPEN_PERM or\n",
+            "    FAN_ACCESS_PERM).  Permission events require\n",
+            "    FAN_CLASS_CONTENT or FAN_CLASS_PRE_CONTENT.\n",
+            "  - An invalid combination of mark flags was passed.\n",
+            "  - In FID mode, some mask flags are incompatible."
+        )),
+        libc::ENODEV => Cow::Borrowed(concat!(
+            "Filesystem does not support fsid.\n",
+            "  The filesystem indicated by pathname is not associated with\n",
+            "  a filesystem that supports fsid (e.g., tmpfs).  This error\n",
+            "  can occur only with a fanotify group that identifies objects\n",
+            "  by file handles (FID mode)."
+        )),
+        libc::ENOENT => Cow::Borrowed(concat!(
+            "Path does not exist.\n",
+            "  The filesystem object indicated by dirfd and pathname does\n",
+            "  not exist.  This also occurs when trying to remove a mark\n",
+            "  from an object which is not marked.\n",
+            "  Tip: use FAN_MARK_DONT_FOLLOW if pathname is a dangling\n",
+            "  symlink, or check that the path exists before marking."
+        )),
+        libc::ENOMEM => Cow::Borrowed(concat!(
+            "Out of memory.\n",
+            "  The kernel could not allocate memory to store the mark.\n",
+            "  Try reducing the number of marks or closing other groups."
+        )),
+        libc::ENOSPC => Cow::Borrowed(concat!(
+            "Too many marks (exceeded 8192 limit).\n",
+            "  The default mark limit is 8192 per group.  Either:\n",
+            "  - Use FAN_MARK_FILESYSTEM instead of marking individual\n",
+            "    paths to reduce mark count.\n",
+            "  - Pass FAN_UNLIMITED_MARKS to init() if you have\n",
+            "    CAP_SYS_ADMIN and genuinely need more marks.\n",
+            "  - Remove unused marks with FAN_MARK_REMOVE."
+        )),
+        libc::ENOSYS => Cow::Borrowed(concat!(
+            "This kernel does not implement fanotify_mark.\n",
+            "  CONFIG_FANOTIFY is likely missing from the kernel config."
+        )),
+        libc::ENOTDIR => Cow::Borrowed(concat!(
+            "FAN_MARK_ONLYDIR specified but path is not a directory.\n",
+            "  Remove FAN_MARK_ONLYDIR if you intended to mark a regular\n",
+            "  file, or point the path to a directory."
+        )),
+        libc::EOPNOTSUPP => Cow::Borrowed(concat!(
+            "Filesystem does not support file handles.\n",
+            "  The object is on a filesystem that does not support the\n",
+            "  encoding of file handles (e.g., some FUSE filesystems,\n",
+            "  network filesystems without export support).  This error\n",
+            "  can occur only with a fanotify group in FID mode."
+        )),
+        libc::EXDEV => Cow::Borrowed(concat!(
+            "Filesystem subvolume uses a different fsid.\n",
+            "  The object resides within a filesystem subvolume (e.g.,\n",
+            "  btrfs subvolume) which uses a different fsid than its root\n",
+            "  superblock.  Try marking the subvolume's mount point,\n",
+            "  or use FAN_MARK_FILESYSTEM on the subvolume directly."
+        )),
+        _ => Cow::Owned(format!("Unknown error (errno={}).  See fanotify_mark(2) for details.", code)),
     }
 }
 
-fn errno_desc_read(code: i32) -> &'static str {
+fn errno_desc_read(code: i32) -> Cow<'static, str> {
     match code {
-        libc::EAGAIN => "no events available (non-blocking fd)",
-        libc::EBADF => "invalid file descriptor",
-        libc::EINTR => "interrupted by signal",
-        libc::ENOMEM => "out of memory",
-        _ => "unknown error",
+        libc::EAGAIN => Cow::Borrowed(concat!(
+            "No events available (non-blocking fd).\n",
+            "  The fanotify fd was created with FAN_NONBLOCK and no events\n",
+            "  are currently pending.  This is not an error — retry later\n",
+            "  using epoll/poll/select to wait for readability, or switch\n",
+            "  to blocking mode (remove FAN_NONBLOCK)."
+        )),
+        libc::EBADF => Cow::Borrowed(concat!(
+            "Invalid file descriptor.\n",
+            "  The fanotify fd is not a valid open file descriptor or\n",
+            "  was not opened for reading.  Check that fanotify_init()\n",
+            "  succeeded and the fd hasn't been closed."
+        )),
+        libc::EINTR => Cow::Borrowed(concat!(
+            "Interrupted by signal.\n",
+            "  The read call was interrupted by a signal before any data\n",
+            "  was read.  Retry the read (EINTR is transient)."
+        )),
+        libc::ENOMEM => Cow::Borrowed(concat!(
+            "Out of memory.\n",
+            "  Cannot allocate memory for the read buffer.  Try reducing\n",
+            "  the buffer size or closing other memory-intensive\n",
+            "  applications."
+        )),
+        _ => Cow::Owned(format!("Unknown error (errno={}).  See fanotify_read(2) for details.", code)),
     }
 }
 
-fn errno_desc_handle(code: i32) -> &'static str {
+fn errno_desc_handle(code: i32) -> Cow<'static, str> {
     match code {
-        libc::EBADF => "invalid mount file descriptor",
-        libc::ENOENT => "file or directory does not exist (may have been deleted)",
-        libc::EINVAL => "invalid handle or flags",
-        libc::EOVERFLOW => "handle buffer too small",
-        libc::EOPNOTSUPP => "filesystem does not support file handles",
-        _ => "unknown error",
+        libc::EBADF => Cow::Borrowed(concat!(
+            "Invalid mount file descriptor.\n",
+            "  The mount_fd passed to open_by_handle_at is not a valid\n",
+            "  open file descriptor.  Make sure open_mount() succeeded\n",
+            "  and the fd hasn't been closed.  The mount_fd must belong\n",
+            "  to a mount point on the same filesystem as the handle."
+        )),
+        libc::ENOENT => Cow::Borrowed(concat!(
+            "File or directory does not exist.\n",
+            "  The file identified by the handle has been deleted.  In\n",
+            "  fanotify FID mode this is expected when events are\n",
+            "  delivered concurrently with deletions.  Use a persistent\n",
+            "  HandleCache to recover paths in later read cycles.\n",
+            "  See parse::resolve_with_cache for details."
+        )),
+        libc::EINVAL => Cow::Borrowed(concat!(
+            "Invalid handle or flags.\n",
+            "  The file handle data is malformed or the flags passed to\n",
+            "  open_by_handle_at are invalid.  This may indicate a kernel\n",
+            "  bug or corrupted handle data."
+        )),
+        libc::EOVERFLOW => Cow::Borrowed(concat!(
+            "Handle buffer too small.\n",
+            "  The initial buffer passed to name_to_handle_at was too\n",
+            "  small.  This is handled automatically by retrying with\n",
+            "  the correct size, but if you see this error it means the\n",
+            "  retry also failed.  Try using a larger initial buffer."
+        )),
+        libc::EOPNOTSUPP => Cow::Borrowed(concat!(
+            "Filesystem does not support file handles.\n",
+            "  The filesystem does not support name_to_handle_at or\n",
+            "  open_by_handle_at.  Common examples:\n",
+            "  - tmpfs (only supports handles for directories)\n",
+            "  - Some FUSE filesystems\n",
+            "  - Network filesystems without export support\n",
+            "  Try using open_mount() on a different path backed by a\n",
+            "  filesystem that supports handles (e.g., ext4, xfs, btrfs)."
+        )),
+        _ => Cow::Owned(format!("Unknown error (errno={}).  See name_to_handle_at(2) for details.", code)),
     }
 }
 
@@ -161,6 +327,9 @@ pub type Result<T> = std::result::Result<T, FanotifyError>;
 /// methods.
 ///
 /// The underlying `OwnedFd` is automatically closed on `Drop`.
+///
+/// `Fanotify` is `Send + Sync` (delegates to `OwnedFd` which is also
+/// `Send + Sync`).  You may share it across threads safely.
 ///
 /// Use [`FanotifyBuilder`] (via [`Fanotify::new`]) for ergonomic construction:
 ///
@@ -184,6 +353,7 @@ impl Fanotify {
     /// (`FAN_CLASS_NOTIF | FAN_CLOEXEC`).
     ///
     /// Call `.init()` on the builder to create the fanotify group.
+    #[allow(clippy::new_ret_no_self)]
     pub fn new() -> FanotifyBuilder {
         FanotifyBuilder {
             flags: consts::FAN_CLASS_NOTIF | consts::FAN_CLOEXEC,
@@ -392,7 +562,9 @@ impl FanotifyBuilder {
         self
     }
 
-    /// Report dirent target id.
+    /// Report dirent target id (requires Linux ≥ 5.15).
+    ///
+    /// Requires both `FAN_REPORT_DFID_NAME` and `FAN_REPORT_FID`.
     pub fn report_target_fid(mut self) -> Self {
         self.flags |= crate::consts::FAN_REPORT_TARGET_FID;
         self
@@ -428,15 +600,23 @@ impl Default for FanotifyBuilder {
 ///
 /// Returns an `OwnedFd` that will be automatically closed on drop.
 ///
+/// Requires Linux **≥ 5.1** for FID mode flags (`FAN_REPORT_FID`,
+/// `FAN_REPORT_DIR_FID`, `FAN_REPORT_NAME`).  Some flags like
+/// `FAN_REPORT_TARGET_FID` require newer kernels (≥ 5.15).
+///
 /// Provided for convenience when you prefer free functions over the
 /// [`Fanotify`] struct.
 pub fn fanotify_init(flags: u32, event_f_flags: u32) -> std::result::Result<OwnedFd, FanotifyError> {
-    // SAFETY: trivially safe — just passes flags to the kernel.
+    // SAFETY: `fanotify_init` is a pure kernel syscall with no memory-safety
+    // requirements beyond passing correctly-typed integer flags.  The kernel
+    // validates all flag combinations and returns EINVAL on error.
     let fd = unsafe { libc::fanotify_init(flags as libc::c_uint, event_f_flags as libc::c_uint) };
     if fd < 0 {
         return Err(FanotifyError::Init(io::Error::last_os_error().raw_os_error().unwrap_or(0)));
     }
-    // SAFETY: we just successfully created this fd and it is owned.
+    // SAFETY: `fd` was just returned by a successful `fanotify_init` call and
+    // is therefore a valid, owned file descriptor.  `OwnedFd::from_raw_fd`
+    // takes ownership; it will be closed on drop.
     Ok(unsafe { <OwnedFd as FromRawFd>::from_raw_fd(fd) })
 }
 
@@ -453,10 +633,12 @@ pub fn fanotify_mark<P: AsRef<OsStr> + ?Sized>(
     let mut raw = path.as_ref().as_bytes().to_vec();
     raw.push(0); // null-terminate
 
-    // SAFETY: trivially safe — passes validated args to the kernel.
+    // SAFETY: `fanotify_mark` is a pure kernel syscall.  `path` has been
+    // null-terminated and `fanotify_fd` is a valid `OwnedFd`.  The kernel
+    // validates all arguments internally.
     let ret = unsafe {
         libc::fanotify_mark(
-            fanotify_fd.as_raw_fd() as i32,
+            fanotify_fd.as_raw_fd(),
             flags as libc::c_uint,
             mask,
             dirfd,
@@ -577,9 +759,10 @@ mod integration_tests {
     #[test]
     fn test_builder_default_flags() {
         let builder = FanotifyBuilder::default();
-        // Default should be NOTIF + CLOEXEC
-        assert!(builder.flags & consts::FAN_CLASS_NOTIF == consts::FAN_CLASS_NOTIF
-            || builder.flags & 0x0C == 0); // NOTIF = 0
+        // Default should be NOTIF (0) + CLOEXEC
+        // NOTIF=0 means the class bits (0x0C) are clear
+        assert!(builder.flags & 0x0C == 0, "class bits should be NOTIF");
+        assert!(builder.flags & consts::FAN_CLOEXEC != 0, "CLOEXEC should be set by default");
         assert!(builder.flags & consts::FAN_CLOEXEC != 0);
     }
 

@@ -64,6 +64,7 @@ pub fn name_to_handle_at(path: &Path) -> io::Result<HandleKey> {
             let mut buf = vec![0u8; needed + 64];
             let payload_bytes = (buf.len() - 8) as u32;
             buf[0..4].copy_from_slice(&payload_bytes.to_ne_bytes());
+            // SAFETY: same as above — valid C string, buffer sized per kernel's request.
             let ret = unsafe {
                 libc::name_to_handle_at(
                     libc::AT_FDCWD,
@@ -112,8 +113,10 @@ pub fn open_by_handle_at(mount_fd: i32, fh_data: &[u8]) -> io::Result<OwnedFd> {
         ));
     }
 
-    // SAFETY: `open_by_handle_at` is a pure syscall; mount_fd must be a valid
-    // fd referencing a mount point on the same filesystem as the handle.
+    // SAFETY: `open_by_handle_at` is a pure kernel syscall.  `mount_fd` must
+    // be a valid fd referencing a mount point on the same filesystem as the
+    // handle.  The caller guarantees this by providing the mount fd from
+    // `open_mount()` or similar.  The kernel validates internally.
     let fd = unsafe {
         libc::open_by_handle_at(
             mount_fd,
@@ -126,7 +129,8 @@ pub fn open_by_handle_at(mount_fd: i32, fh_data: &[u8]) -> io::Result<OwnedFd> {
         return Err(io::Error::last_os_error());
     }
 
-    // SAFETY: we just successfully opened fd, and OwnedFd takes ownership.
+    // SAFETY: `fd` was just returned by a successful `open_by_handle_at` call
+    // and is therefore a valid, owned file descriptor.
     Ok(unsafe { OwnedFd::from_raw_fd(fd) })
 }
 
