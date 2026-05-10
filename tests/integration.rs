@@ -108,7 +108,9 @@ fn test_permission_event_response() {
     fs::write(&f, b"t").unwrap();
 
     let fan = Fanotify::new().class_content().init().unwrap();
-    fan.mark(FAN_MARK_ADD, FAN_OPEN_PERM, dir.path()).unwrap();
+    // FAN_EVENT_ON_CHILD: without it, marking a directory only catches
+    // events on the directory itself, not on files inside it.
+    fan.mark(FAN_MARK_ADD, FAN_OPEN_PERM | FAN_EVENT_ON_CHILD, dir.path()).unwrap();
 
     let fc = f.clone();
     let rdr = thread::spawn(move || {
