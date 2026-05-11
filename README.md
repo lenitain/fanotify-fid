@@ -1,5 +1,8 @@
 # fanotify-fid
 
+[![Crates.io](https://img.shields.io/crates/v/fanotify-fid.svg)](https://crates.io/crates/fanotify-fid)
+[![Docs.rs](https://docs.rs/fanotify-fid/badge.svg)](https://docs.rs/fanotify-fid)
+
 Linux fanotify **FID (File Identifier) mode** event parser and file handle utilities.
 
 ## Installation
