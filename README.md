@@ -151,4 +151,4 @@ println!("{}", e);
 
 ## License
 
-MIT
+[MIT License](./LICENSE)
