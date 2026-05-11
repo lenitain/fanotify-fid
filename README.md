@@ -121,13 +121,15 @@ for ev in &events {
 
 ## Modules
 
-| Module | Key items |
-|--------|-----------|
-| `consts` | All FAN_* constants for FID mode |
-| `types` | `FidEvent`, `FanMetadata`, `HandleKey` |
-| `handle` | `name_to_handle_at()`, `open_by_handle_at()`, `resolve_file_handle()` |
-| `parse` | `parse_fid_events()`, `resolve_with_cache()` |
-| `read` | `read_fid_events()` — read + parse + optional cache |
+```
+src/
+├── consts.rs   # FAN_* constants (FAN_REPORT_FID, FAN_CREATE, ...)
+├── types.rs    # FidEvent, FanMetadata, HandleKey
+├── handle.rs   # name_to_handle_at(), open_by_handle_at(), resolve_file_handle()
+├── parse.rs    # parse_fid_events(), resolve_with_cache()
+├── read.rs     # read_fid_events() — read + parse + optional cache
+└── lib.rs      # Fanotify (Builder + top-level API), re-exports
+```
 
 ## Error handling
 
