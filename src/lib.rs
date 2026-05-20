@@ -495,13 +495,13 @@ impl FanotifyBuilder {
 
     /// Set notification class to `FAN_CLASS_CONTENT` (for permission events).
     pub fn class_content(mut self) -> Self {
-        self.flags = (self.flags & !0x0C) | 0x0000_0004;
+        self.flags = (self.flags & !0x0C) | consts::FAN_CLASS_CONTENT;
         self
     }
 
     /// Set notification class to `FAN_CLASS_PRE_CONTENT`.
     pub fn class_pre_content(mut self) -> Self {
-        self.flags = (self.flags & !0x0C) | 0x0000_0008;
+        self.flags = (self.flags & !0x0C) | consts::FAN_CLASS_PRE_CONTENT;
         self
     }
 
@@ -525,19 +525,19 @@ impl FanotifyBuilder {
 
     /// Report thread ID instead of process ID.
     pub fn report_tid(mut self) -> Self {
-        self.flags |= 0x0000_0100;
+        self.flags |= consts::FAN_REPORT_TID;
         self
     }
 
     /// Remove event queue size limit (needs `CAP_SYS_ADMIN`).
     pub fn unlimited_queue(mut self) -> Self {
-        self.flags |= 0x0000_0010;
+        self.flags |= consts::FAN_UNLIMITED_QUEUE;
         self
     }
 
     /// Remove mark count limit (needs `CAP_SYS_ADMIN`).
     pub fn unlimited_marks(mut self) -> Self {
-        self.flags |= 0x0000_0020;
+        self.flags |= consts::FAN_UNLIMITED_MARKS;
         self
     }
 

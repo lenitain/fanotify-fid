@@ -11,7 +11,7 @@ Linux fanotify **FID (File Identifier) mode** event parser and file handle utili
 cargo add fanotify-fid
 ```
 
-Minimum supported Rust version: **1.75** (edition 2024).
+Minimum supported Rust version: **1.85** (edition 2024).
 
 ## Requirements
 
