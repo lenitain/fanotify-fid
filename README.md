@@ -152,6 +152,24 @@ println!("{}", e);
 
 ---
 
+## Design notes
+
+### io-uring
+
+io-uring (`IORING_OP_READ`) was evaluated as a replacement for
+`libc::read()` in the event reading path.  In theory it can eliminate the
+syscall overhead for fd reads.
+
+**Not used** because for a fanotify fd that is driven by epoll / tokio
+`AsyncFd`, the `read()` syscall returns immediately (~50–100 ns).  This is
+negligible next to the subsequent `open_by_handle_at()` calls (1–5 µs) and
+event parsing — well below the noise floor of the overall pipeline.
+
+If a future workload moves the bottleneck to the read path (e.g.
+sub‑microsecond event handlers with very high fanotify event rates),
+switching to io-uring would be straightforward — `read()` is the only
+syscall that needs replacement.
+
 ## License
 
 [MIT License](./LICENSE)
