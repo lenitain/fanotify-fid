@@ -5,7 +5,7 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
-## [Unreleased]
+## [0.2.4] - 2026-05-26
 
 ### Changed
 
@@ -15,7 +15,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   from userspace before any syscall (previously would reach the kernel).
 - Removed internal `use std::os::unix::ffi::OsStrExt` import (no longer needed).
 
-## [0.2.3] - 2025-03-28
+## [0.2.3] - 2026-03-28
 
 ### Added
 
@@ -31,13 +31,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 - Various README improvements: crates.io link, license link, source tree diagram.
 
-## [0.2.2] - 2025-03-20
+## [0.2.2] - 2026-03-20
 
 ### Added
 
 - README with source tree diagram, crates.io and license links.
 
-## [0.2.1] - 2025-03-15
+## [0.2.1] - 2026-03-15
 
 ### Changed
 
@@ -50,7 +50,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 - README example fixed to use correct API.
 
-## [0.2.0] - 2025-03-10
+## [0.2.0] - 2026-03-10
 
 ### Added
 
@@ -69,7 +69,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   mark flags (`FAN_MARK_FILESYSTEM`, `FAN_MARK_EVICTABLE`),
   O_* flags for `event_f_flags`.
 
-## [0.1.0] - 2025-02-01
+## [0.1.0] - 2026-02-01
 
 ### Added
 
