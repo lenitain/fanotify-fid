@@ -61,11 +61,10 @@ pub mod read;
 pub mod types;
 
 use std::borrow::Cow;
-use std::ffi::OsStr;
+use std::ffi::{CString, OsStr};
 use std::fmt;
 use std::io;
 use std::os::fd::{AsFd, AsRawFd, BorrowedFd, FromRawFd, OwnedFd};
-use std::os::unix::ffi::OsStrExt;
 
 use crate::types::HandleCache;
 
@@ -630,19 +629,22 @@ pub fn fanotify_mark<P: AsRef<OsStr> + ?Sized>(
     dirfd: i32,
     path: &P,
 ) -> std::result::Result<(), FanotifyError> {
-    let mut raw = path.as_ref().as_bytes().to_vec();
-    raw.push(0); // null-terminate
+    // `as_encoded_bytes()` is zero-cost on Linux (OsStr == [u8]).
+    // `CString::new` handles null-termination in a single allocation
+    // and rejects interior null bytes, which the kernel would also reject.
+    let raw = CString::new(path.as_ref().as_encoded_bytes())
+        .map_err(|_| FanotifyError::Mark(libc::EINVAL))?;
 
-    // SAFETY: `fanotify_mark` is a pure kernel syscall.  `path` has been
-    // null-terminated and `fanotify_fd` is a valid `OwnedFd`.  The kernel
-    // validates all arguments internally.
+    // SAFETY: `fanotify_mark` is a pure kernel syscall.  `raw` is a
+    // properly null-terminated CString and `fanotify_fd` is a valid
+    // `OwnedFd`.  The kernel validates all arguments internally.
     let ret = unsafe {
         libc::fanotify_mark(
             fanotify_fd.as_raw_fd(),
             flags as libc::c_uint,
             mask,
             dirfd,
-            raw.as_ptr() as *const libc::c_char,
+            raw.as_ptr(),
         )
     };
     if ret < 0 {
