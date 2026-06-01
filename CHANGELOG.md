@@ -5,6 +5,14 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [Unreleased]
+
+### Added
+
+- GitHub Actions CI workflow (build + test + fmt + clippy)
+
+- GitHub Actions CI workflow (build + test + fmt + clippy)
+
 ## [0.2.4] - 2026-05-26
 
 ### Changed
@@ -18,6 +26,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ## [0.2.3] - 2026-03-28
 
 ### Added
+
+- GitHub Actions CI workflow (build + test + fmt + clippy)
 
 - Comprehensive integration tests for `FanotifyBuilder` flag chains and class mode exclusivity.
 - Doc-tests for `name_to_handle_at`, `read_fid_events`, `read_legacy`, `write_response`.
@@ -34,6 +44,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ## [0.2.2] - 2026-03-20
 
 ### Added
+
+- GitHub Actions CI workflow (build + test + fmt + clippy)
 
 - README with source tree diagram, crates.io and license links.
 
@@ -54,6 +66,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- GitHub Actions CI workflow (build + test + fmt + clippy)
+
 - **Legacy event reading** (`read_legacy`, `read_legacy_do`): support for non-FID
   fanotify events, including callback mode and configurable buffer via `SmallVec`.
 - **Permission event handling**: `write_response` and `FanotifyResponse` type for
@@ -72,6 +86,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ## [0.1.0] - 2026-02-01
 
 ### Added
+
+- GitHub Actions CI workflow (build + test + fmt + clippy)
 
 - Initial release of `fanotify-fid`.
 - `fanotify_init` / `fanotify_mark` safe wrappers.
