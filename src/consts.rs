@@ -46,7 +46,8 @@ pub const FAN_CLASS_PRE_CONTENT: u32 = 0x0000_0008;
 /// Convenience: `FAN_REPORT_DIR_FID | FAN_REPORT_NAME`.
 pub const FAN_REPORT_DFID_NAME: u32 = FAN_REPORT_DIR_FID | FAN_REPORT_NAME;
 /// Convenience: all FID flags for full name + target ID reporting.
-pub const FAN_REPORT_DFID_NAME_TARGET: u32 = FAN_REPORT_DFID_NAME | FAN_REPORT_FID | FAN_REPORT_TARGET_FID;
+pub const FAN_REPORT_DFID_NAME_TARGET: u32 =
+    FAN_REPORT_DFID_NAME | FAN_REPORT_FID | FAN_REPORT_TARGET_FID;
 
 // ── fanotify_mark flags ──
 
@@ -180,13 +181,18 @@ pub const FAN_ALL_CLASS_BITS: u32 = FAN_CLASS_NOTIF | FAN_CLASS_CONTENT | FAN_CL
 
 #[allow(deprecated)]
 #[deprecated(note = "use individual init flags instead")]
-pub const FAN_ALL_INIT_FLAGS: u32 = FAN_CLOEXEC | FAN_NONBLOCK | FAN_ALL_CLASS_BITS
-    | FAN_UNLIMITED_QUEUE | FAN_UNLIMITED_MARKS;
+pub const FAN_ALL_INIT_FLAGS: u32 =
+    FAN_CLOEXEC | FAN_NONBLOCK | FAN_ALL_CLASS_BITS | FAN_UNLIMITED_QUEUE | FAN_UNLIMITED_MARKS;
 
 #[deprecated(note = "use individual mark flags instead")]
-pub const FAN_ALL_MARK_FLAGS: u32 = FAN_MARK_ADD | FAN_MARK_REMOVE | FAN_MARK_DONT_FOLLOW
-    | FAN_MARK_ONLYDIR | FAN_MARK_MOUNT | FAN_MARK_IGNORED_MASK
-    | FAN_MARK_IGNORED_SURV_MODIFY | FAN_MARK_FLUSH;
+pub const FAN_ALL_MARK_FLAGS: u32 = FAN_MARK_ADD
+    | FAN_MARK_REMOVE
+    | FAN_MARK_DONT_FOLLOW
+    | FAN_MARK_ONLYDIR
+    | FAN_MARK_MOUNT
+    | FAN_MARK_IGNORED_MASK
+    | FAN_MARK_IGNORED_SURV_MODIFY
+    | FAN_MARK_FLUSH;
 
 #[deprecated(note = "use individual event masks instead")]
 pub const FAN_ALL_EVENTS: u64 = FAN_ACCESS | FAN_MODIFY | FAN_CLOSE | FAN_OPEN;

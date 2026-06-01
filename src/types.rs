@@ -152,7 +152,9 @@ pub struct LegacyEvent {
 impl Drop for LegacyEvent {
     fn drop(&mut self) {
         if self.fd >= 0 {
-            unsafe { libc::close(self.fd); }
+            unsafe {
+                libc::close(self.fd);
+            }
         }
     }
 }

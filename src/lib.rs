@@ -73,9 +73,14 @@ pub mod prelude {
     pub use crate::consts::*;
     pub use crate::handle::{name_to_handle_at, open_by_handle_at, resolve_file_handle};
     pub use crate::parse::parse_fid_events;
-    pub use crate::read::{read_fid_events, read_legacy, read_legacy_do, write_response, legacy_buffer_events, set_legacy_buffer_events};
-    pub use crate::types::{FidEvent, HandleCache, HandleKey, LegacyEvent, FanotifyResponse};
-    pub use crate::{fanotify_init, fanotify_mark, open_mount, Fanotify, FanotifyBuilder, FanotifyError};
+    pub use crate::read::{
+        legacy_buffer_events, read_fid_events, read_legacy, read_legacy_do,
+        set_legacy_buffer_events, write_response,
+    };
+    pub use crate::types::{FanotifyResponse, FidEvent, HandleCache, HandleKey, LegacyEvent};
+    pub use crate::{
+        Fanotify, FanotifyBuilder, FanotifyError, fanotify_init, fanotify_mark, open_mount,
+    };
 }
 
 // ── Error type ──
@@ -108,10 +113,30 @@ pub enum FanotifyError {
 impl fmt::Display for FanotifyError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
-            Self::Init(code) => write!(f, "fanotify_init failed (errno={}): {}", code, errno_desc_init(*code)),
-            Self::Mark(code) => write!(f, "fanotify_mark failed (errno={}): {}", code, errno_desc_mark(*code)),
-            Self::Read(code) => write!(f, "fanotify_read failed (errno={}): {}", code, errno_desc_read(*code)),
-            Self::Handle(code) => write!(f, "file_handle operation failed (errno={}): {}", code, errno_desc_handle(*code)),
+            Self::Init(code) => write!(
+                f,
+                "fanotify_init failed (errno={}): {}",
+                code,
+                errno_desc_init(*code)
+            ),
+            Self::Mark(code) => write!(
+                f,
+                "fanotify_mark failed (errno={}): {}",
+                code,
+                errno_desc_mark(*code)
+            ),
+            Self::Read(code) => write!(
+                f,
+                "fanotify_read failed (errno={}): {}",
+                code,
+                errno_desc_read(*code)
+            ),
+            Self::Handle(code) => write!(
+                f,
+                "file_handle operation failed (errno={}): {}",
+                code,
+                errno_desc_handle(*code)
+            ),
             Self::Io(e) => write!(f, "I/O error: {}", e),
         }
     }
@@ -163,7 +188,10 @@ fn errno_desc_init(code: i32) -> Cow<'static, str> {
             "  Or run the process under a user namespace with\n",
             "  CAP_SYS_ADMIN mapped."
         )),
-        _ => Cow::Owned(format!("Unknown error (errno={}).  See fanotify_init(2) for details.", code)),
+        _ => Cow::Owned(format!(
+            "Unknown error (errno={}).  See fanotify_init(2) for details.",
+            code
+        )),
     }
 }
 
@@ -238,7 +266,10 @@ fn errno_desc_mark(code: i32) -> Cow<'static, str> {
             "  superblock.  Try marking the subvolume's mount point,\n",
             "  or use FAN_MARK_FILESYSTEM on the subvolume directly."
         )),
-        _ => Cow::Owned(format!("Unknown error (errno={}).  See fanotify_mark(2) for details.", code)),
+        _ => Cow::Owned(format!(
+            "Unknown error (errno={}).  See fanotify_mark(2) for details.",
+            code
+        )),
     }
 }
 
@@ -268,7 +299,10 @@ fn errno_desc_read(code: i32) -> Cow<'static, str> {
             "  the buffer size or closing other memory-intensive\n",
             "  applications."
         )),
-        _ => Cow::Owned(format!("Unknown error (errno={}).  See fanotify_read(2) for details.", code)),
+        _ => Cow::Owned(format!(
+            "Unknown error (errno={}).  See fanotify_read(2) for details.",
+            code
+        )),
     }
 }
 
@@ -312,7 +346,10 @@ fn errno_desc_handle(code: i32) -> Cow<'static, str> {
             "  Try using open_mount() on a different path backed by a\n",
             "  filesystem that supports handles (e.g., ext4, xfs, btrfs)."
         )),
-        _ => Cow::Owned(format!("Unknown error (errno={}).  See name_to_handle_at(2) for details.", code)),
+        _ => Cow::Owned(format!(
+            "Unknown error (errno={}).  See name_to_handle_at(2) for details.",
+            code
+        )),
     }
 }
 
@@ -429,11 +466,7 @@ impl Fanotify {
     }
 
     /// Add a mark on a mount point (monitor all files under it).
-    pub fn mark_mount<P: AsRef<OsStr> + ?Sized>(
-        &self,
-        mask: u64,
-        path: &P,
-    ) -> Result<()> {
+    pub fn mark_mount<P: AsRef<OsStr> + ?Sized>(&self, mask: u64, path: &P) -> Result<()> {
         fanotify_mark(
             &self.fd,
             crate::consts::FAN_MARK_ADD | crate::consts::FAN_MARK_MOUNT,
@@ -605,13 +638,18 @@ impl Default for FanotifyBuilder {
 ///
 /// Provided for convenience when you prefer free functions over the
 /// [`Fanotify`] struct.
-pub fn fanotify_init(flags: u32, event_f_flags: u32) -> std::result::Result<OwnedFd, FanotifyError> {
+pub fn fanotify_init(
+    flags: u32,
+    event_f_flags: u32,
+) -> std::result::Result<OwnedFd, FanotifyError> {
     // SAFETY: `fanotify_init` is a pure kernel syscall with no memory-safety
     // requirements beyond passing correctly-typed integer flags.  The kernel
     // validates all flag combinations and returns EINVAL on error.
     let fd = unsafe { libc::fanotify_init(flags as libc::c_uint, event_f_flags as libc::c_uint) };
     if fd < 0 {
-        return Err(FanotifyError::Init(io::Error::last_os_error().raw_os_error().unwrap_or(0)));
+        return Err(FanotifyError::Init(
+            io::Error::last_os_error().raw_os_error().unwrap_or(0),
+        ));
     }
     // SAFETY: `fd` was just returned by a successful `fanotify_init` call and
     // is therefore a valid, owned file descriptor.  `OwnedFd::from_raw_fd`
@@ -648,7 +686,9 @@ pub fn fanotify_mark<P: AsRef<OsStr> + ?Sized>(
         )
     };
     if ret < 0 {
-        return Err(FanotifyError::Mark(io::Error::last_os_error().raw_os_error().unwrap_or(0)));
+        return Err(FanotifyError::Mark(
+            io::Error::last_os_error().raw_os_error().unwrap_or(0),
+        ));
     }
     Ok(())
 }
@@ -664,7 +704,9 @@ pub fn fanotify_mark<P: AsRef<OsStr> + ?Sized>(
 ///
 /// Returns `FanotifyError::Io` if the path cannot be opened (permissions,
 /// does not exist, etc.).
-pub fn open_mount<P: AsRef<OsStr> + ?Sized>(path: &P) -> std::result::Result<OwnedFd, FanotifyError> {
+pub fn open_mount<P: AsRef<OsStr> + ?Sized>(
+    path: &P,
+) -> std::result::Result<OwnedFd, FanotifyError> {
     use std::os::unix::fs::OpenOptionsExt;
     let file = std::fs::OpenOptions::new()
         .custom_flags(libc::O_PATH | libc::O_CLOEXEC)
@@ -680,8 +722,8 @@ pub fn open_mount<P: AsRef<OsStr> + ?Sized>(path: &P) -> std::result::Result<Own
 #[cfg(test)]
 mod integration_tests {
     use super::*;
+    use crate::types::{FanotifyResponse, FidEvent, HandleCache, LegacyEvent};
     use std::path::PathBuf;
-    use crate::types::{FidEvent, LegacyEvent, FanotifyResponse, HandleCache};
 
     // ── Constants tests ──
 
@@ -737,7 +779,7 @@ mod integration_tests {
     #[test]
     fn test_mask_to_event_names_includes_new() {
         let names = consts::mask_to_event_names(
-            consts::FAN_OPEN_PERM | consts::FAN_RENAME | consts::FAN_FS_ERROR
+            consts::FAN_OPEN_PERM | consts::FAN_RENAME | consts::FAN_FS_ERROR,
         );
         assert!(names.contains(&"OPEN_PERM"));
         assert!(names.contains(&"RENAME"));
@@ -753,7 +795,10 @@ mod integration_tests {
         assert_eq!(mv, consts::FAN_MOVED_FROM | consts::FAN_MOVED_TO);
 
         let dfid_name = consts::FAN_REPORT_DFID_NAME;
-        assert_eq!(dfid_name, consts::FAN_REPORT_DIR_FID | consts::FAN_REPORT_NAME);
+        assert_eq!(
+            dfid_name,
+            consts::FAN_REPORT_DIR_FID | consts::FAN_REPORT_NAME
+        );
     }
 
     // ── Builder tests ──
@@ -764,7 +809,10 @@ mod integration_tests {
         // Default should be NOTIF (0) + CLOEXEC
         // NOTIF=0 means the class bits (0x0C) are clear
         assert!(builder.flags & 0x0C == 0, "class bits should be NOTIF");
-        assert!(builder.flags & consts::FAN_CLOEXEC != 0, "CLOEXEC should be set by default");
+        assert!(
+            builder.flags & consts::FAN_CLOEXEC != 0,
+            "CLOEXEC should be set by default"
+        );
         assert!(builder.flags & consts::FAN_CLOEXEC != 0);
     }
 
@@ -958,13 +1006,23 @@ mod integration_tests {
             let _ = crate::prelude::Fanotify::new();
             let _ = crate::prelude::FanotifyBuilder::default();
             let _ = crate::prelude::FidEvent {
-                mask: 0, pid: 0, path: PathBuf::new(),
-                dfid_name_handle: None, dfid_name_filename: None, self_handle: None,
+                mask: 0,
+                pid: 0,
+                path: PathBuf::new(),
+                dfid_name_handle: None,
+                dfid_name_filename: None,
+                self_handle: None,
             };
             let _ = crate::prelude::LegacyEvent {
-                mask: 0, fd: -1, pid: 0, path: PathBuf::new(),
+                mask: 0,
+                fd: -1,
+                pid: 0,
+                path: PathBuf::new(),
             };
-            let _ = crate::prelude::FanotifyResponse { fd: -1, response: 0 };
+            let _ = crate::prelude::FanotifyResponse {
+                fd: -1,
+                response: 0,
+            };
         }
 
         _check_free_fns();

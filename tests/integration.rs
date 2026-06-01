@@ -9,8 +9,8 @@
 //! sudo ./target/debug/deps/integration-* --ignored
 //! ```
 
-use fanotify_fid::prelude::*;
 use fanotify_fid::parse::resolve_with_cache;
+use fanotify_fid::prelude::*;
 use std::os::fd::AsRawFd;
 use std::path::Path;
 use std::time::{Duration, Instant};
@@ -67,7 +67,11 @@ fn test_fid_event_on_single_file() {
     let mut buf = Vec::with_capacity(65536);
 
     let evts = retry(
-        || read_fid_events(fan.as_fd(), mnt, &mut buf, None).ok().filter(|e| !e.is_empty()),
+        || {
+            read_fid_events(fan.as_fd(), mnt, &mut buf, None)
+                .ok()
+                .filter(|e| !e.is_empty())
+        },
         Duration::from_secs(2),
     )
     .expect("MODIFY event within 2s");
@@ -110,7 +114,8 @@ fn test_permission_event_response() {
     let fan = Fanotify::new().class_content().init().unwrap();
     // FAN_EVENT_ON_CHILD: without it, marking a directory only catches
     // events on the directory itself, not on files inside it.
-    fan.mark(FAN_MARK_ADD, FAN_OPEN_PERM | FAN_EVENT_ON_CHILD, dir.path()).unwrap();
+    fan.mark(FAN_MARK_ADD, FAN_OPEN_PERM | FAN_EVENT_ON_CHILD, dir.path())
+        .unwrap();
 
     let fc = f.clone();
     let rdr = thread::spawn(move || {
@@ -125,10 +130,15 @@ fn test_permission_event_response() {
 
     // Blocking read — waits until kernel delivers the permission event
     let evts = fan.read_legacy().expect("read perm event");
-    let ev = evts.first().filter(|e| e.mask & FAN_OPEN_PERM != 0)
+    let ev = evts
+        .first()
+        .filter(|e| e.mask & FAN_OPEN_PERM != 0)
         .expect("first event should be FAN_OPEN_PERM");
-    fan.send_response(&FanotifyResponse { fd: ev.fd, response: FAN_ALLOW })
-        .expect("send FAN_ALLOW");
+    fan.send_response(&FanotifyResponse {
+        fd: ev.fd,
+        response: FAN_ALLOW,
+    })
+    .expect("send FAN_ALLOW");
 
     assert_eq!(rdr.join().expect("reader"), "t");
 }
@@ -195,8 +205,12 @@ fn test_cache_recovers_deleted_path() {
     cache.insert(h.clone(), r);
 
     let mut evts = vec![FidEvent {
-        mask: FAN_DELETE_SELF, pid: 1, path: Path::new("").to_path_buf(),
-        dfid_name_handle: None, dfid_name_filename: None, self_handle: Some(h),
+        mask: FAN_DELETE_SELF,
+        pid: 1,
+        path: Path::new("").to_path_buf(),
+        dfid_name_handle: None,
+        dfid_name_filename: None,
+        self_handle: Some(h),
     }];
     resolve_with_cache(&mut evts, &cache);
     assert!(!evts[0].path.as_os_str().is_empty());

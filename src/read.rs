@@ -6,9 +6,9 @@
 use std::os::fd::OwnedFd;
 use std::path::PathBuf;
 
+use crate::FanotifyError;
 use crate::parse::{parse_fid_events, resolve_with_cache};
 use crate::types::{FanotifyResponse, FidEvent, HandleCache, LegacyEvent};
-use crate::FanotifyError;
 
 /// Read and parse FID-format events from a fanotify file descriptor.
 ///
@@ -114,9 +114,7 @@ pub fn read_fid_events(
                     continue;
                 }
                 if let Some(ref key) = ev.self_handle {
-                    cache
-                        .entry(key.clone())
-                        .or_insert_with(|| ev.path.clone());
+                    cache.entry(key.clone()).or_insert_with(|| ev.path.clone());
                 }
                 if let (Some(key), Some(filename)) = (&ev.dfid_name_handle, &ev.dfid_name_filename)
                 {
@@ -158,7 +156,10 @@ static LEGACY_BUF_EVENTS: Mutex<usize> = Mutex::new(DEFAULT_LEGACY_EVENTS);
 
 /// Get the current legacy event buffer size (in event count).
 pub fn legacy_buffer_events() -> usize {
-    LEGACY_BUF_EVENTS.lock().map(|g| *g).unwrap_or(DEFAULT_LEGACY_EVENTS)
+    LEGACY_BUF_EVENTS
+        .lock()
+        .map(|g| *g)
+        .unwrap_or(DEFAULT_LEGACY_EVENTS)
 }
 
 /// Set the legacy event buffer size (in event count).
@@ -195,13 +196,14 @@ pub fn set_legacy_buffer_events(n: usize) {
 ///     println!("pid={} {:?} {}", ev.pid, ev.event_names(), ev.path.display());
 /// }
 /// ```
-pub fn read_legacy(
-    fan_fd: &OwnedFd,
-) -> Result<Vec<LegacyEvent>, FanotifyError> {
+pub fn read_legacy(fan_fd: &OwnedFd) -> Result<Vec<LegacyEvent>, FanotifyError> {
     use crate::types::FanMetadata;
     use std::os::fd::AsRawFd;
 
-    let event_count = LEGACY_BUF_EVENTS.lock().map(|g| *g).unwrap_or(DEFAULT_LEGACY_EVENTS);
+    let event_count = LEGACY_BUF_EVENTS
+        .lock()
+        .map(|g| *g)
+        .unwrap_or(DEFAULT_LEGACY_EVENTS);
     let buf_size = 24 * event_count;
     // SmallVec: 4800 bytes on stack (default 200 ev), spills to heap if > 200.
     let mut buf: SmallVec<[u8; 4800]> = SmallVec::new();
@@ -231,9 +233,8 @@ pub fn read_legacy(
 
     while offset + 24 <= n {
         // SAFETY: bounds verified above.
-        let meta = unsafe {
-            std::ptr::read_unaligned(buf.as_ptr().add(offset) as *const FanMetadata)
-        };
+        let meta =
+            unsafe { std::ptr::read_unaligned(buf.as_ptr().add(offset) as *const FanMetadata) };
         let event_len = meta.event_len as usize;
         if event_len < 24 || offset + event_len > n {
             break;
@@ -278,10 +279,7 @@ pub fn read_legacy(
 ///     println!("pid={} {:?}", ev.pid, ev.event_names());
 /// }).unwrap();
 /// ```
-pub fn read_legacy_do<F>(
-    fan_fd: &OwnedFd,
-    mut callback: F,
-) -> Result<(), FanotifyError>
+pub fn read_legacy_do<F>(fan_fd: &OwnedFd, mut callback: F) -> Result<(), FanotifyError>
 where
     F: FnMut(&LegacyEvent),
 {
@@ -316,10 +314,7 @@ where
 /// let resp = FanotifyResponse { fd: 5, response: 0x01 }; // FAN_ALLOW
 /// write_response(&fan_fd, &resp).unwrap();
 /// ```
-pub fn write_response(
-    fan_fd: &OwnedFd,
-    response: &FanotifyResponse,
-) -> Result<(), FanotifyError> {
+pub fn write_response(fan_fd: &OwnedFd, response: &FanotifyResponse) -> Result<(), FanotifyError> {
     use std::os::fd::AsRawFd;
 
     // SAFETY: fanotify_response is a plain-old-data struct.
@@ -433,7 +428,8 @@ mod tests {
         assert_eq!(meta1.pid, 10);
         // event 2 offset
         let off2 = meta1.event_len as usize;
-        let meta2: FanMetadata = unsafe { std::ptr::read_unaligned(combined.as_ptr().add(off2) as *const _) };
+        let meta2: FanMetadata =
+            unsafe { std::ptr::read_unaligned(combined.as_ptr().add(off2) as *const _) };
         assert_eq!(meta2.mask, 0x0000_0002);
         assert_eq!(meta2.pid, 20);
     }

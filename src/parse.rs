@@ -34,7 +34,7 @@ use crate::consts::{
 };
 use crate::handle::resolve_file_handle;
 use crate::types::{
-    FanInfoHeader, FanMetadata, FidEvent, HandleCache, HandleKey, FSID_SIZE, FH_HDR_SIZE,
+    FH_HDR_SIZE, FSID_SIZE, FanInfoHeader, FanMetadata, FidEvent, HandleCache, HandleKey,
     INFO_HDR_SIZE, META_SIZE,
 };
 
@@ -85,7 +85,8 @@ pub fn parse_fid_events(buf: &[u8], mount_fds: &[OwnedFd]) -> Vec<FidEvent> {
 
         while info_off + INFO_HDR_SIZE <= event_end {
             // SAFETY: bounds verified above; read_unaligned for the same reason.
-            let hdr = unsafe { ptr::read_unaligned(buf.as_ptr().add(info_off) as *const FanInfoHeader) };
+            let hdr =
+                unsafe { ptr::read_unaligned(buf.as_ptr().add(info_off) as *const FanInfoHeader) };
             let info_len = hdr.len as usize;
 
             if info_len < INFO_HDR_SIZE || info_off + info_len > event_end {
@@ -108,9 +109,10 @@ pub fn parse_fid_events(buf: &[u8], mount_fds: &[OwnedFd]) -> Vec<FidEvent> {
                     if let Some((key, resolved)) = extract_fid(buf, info_off, info_len, mount_fds) {
                         self_handle = Some(key);
                         if path.as_os_str().is_empty()
-                            && let Some(p) = resolved {
-                                path = p;
-                            }
+                            && let Some(p) = resolved
+                        {
+                            path = p;
+                        }
                     }
                 }
                 _ => {}
@@ -166,10 +168,7 @@ pub fn parse_fid_events(buf: &[u8], mount_fds: &[OwnedFd]) -> Vec<FidEvent> {
 /// // Update cache from successfully-resolved events...
 /// resolve_with_cache(&mut events, &cache);
 /// ```
-pub fn resolve_with_cache(
-    events: &mut [FidEvent],
-    cache: &HandleCache,
-) -> bool {
+pub fn resolve_with_cache(events: &mut [FidEvent], cache: &HandleCache) -> bool {
     let mut made_progress = false;
 
     for ev in events.iter_mut() {
@@ -179,22 +178,24 @@ pub fn resolve_with_cache(
 
         // Try DFID_NAME: parent directory handle → cached dir path + filename
         if let (Some(key), Some(filename)) = (&ev.dfid_name_handle, &ev.dfid_name_filename)
-            && let Some(dir_path) = cache.get(key) {
-                ev.path = if filename.is_empty() {
-                    dir_path.clone()
-                } else {
-                    dir_path.join(filename)
-                };
-                made_progress = true;
-            }
+            && let Some(dir_path) = cache.get(key)
+        {
+            ev.path = if filename.is_empty() {
+                dir_path.clone()
+            } else {
+                dir_path.join(filename)
+            };
+            made_progress = true;
+        }
 
         // Try self handle → cached path
         if ev.path.as_os_str().is_empty()
             && let Some(ref key) = ev.self_handle
-                && let Some(cached_path) = cache.get(key) {
-                    ev.path = cached_path.clone();
-                    made_progress = true;
-                }
+            && let Some(cached_path) = cache.get(key)
+        {
+            ev.path = cached_path.clone();
+            made_progress = true;
+        }
     }
 
     made_progress
@@ -658,16 +659,14 @@ mod tests {
 
     #[test]
     fn test_resolve_with_cache_noop_when_all_resolved() {
-        let mut events = vec![
-            FidEvent {
-                mask: 0,
-                pid: 0,
-                path: "/tmp/foo".into(),
-                dfid_name_handle: None,
-                dfid_name_filename: None,
-                self_handle: None,
-            },
-        ];
+        let mut events = vec![FidEvent {
+            mask: 0,
+            pid: 0,
+            path: "/tmp/foo".into(),
+            dfid_name_handle: None,
+            dfid_name_filename: None,
+            self_handle: None,
+        }];
         let cache = HashMap::new();
         assert!(!resolve_with_cache(&mut events, &cache));
         assert_eq!(events[0].path.to_str(), Some("/tmp/foo"));
@@ -676,16 +675,14 @@ mod tests {
     #[test]
     fn test_resolve_with_cache_dfid_name() {
         let dir_handle = HandleKey::from(b"dir_handle" as &[u8]);
-        let mut events = vec![
-            FidEvent {
-                mask: 0,
-                pid: 0,
-                path: PathBuf::new(),
-                dfid_name_handle: Some(dir_handle.clone()),
-                dfid_name_filename: Some("bar.txt".into()),
-                self_handle: None,
-            },
-        ];
+        let mut events = vec![FidEvent {
+            mask: 0,
+            pid: 0,
+            path: PathBuf::new(),
+            dfid_name_handle: Some(dir_handle.clone()),
+            dfid_name_filename: Some("bar.txt".into()),
+            self_handle: None,
+        }];
         let mut cache = HashMap::new();
         cache.insert(dir_handle, "/tmp/mydir".into());
 
@@ -696,16 +693,14 @@ mod tests {
     #[test]
     fn test_resolve_with_cache_dfid_name_empty_filename() {
         let dir_handle = HandleKey::from(b"dir_handle" as &[u8]);
-        let mut events = vec![
-            FidEvent {
-                mask: 0,
-                pid: 0,
-                path: PathBuf::new(),
-                dfid_name_handle: Some(dir_handle.clone()),
-                dfid_name_filename: Some(String::new()),
-                self_handle: None,
-            },
-        ];
+        let mut events = vec![FidEvent {
+            mask: 0,
+            pid: 0,
+            path: PathBuf::new(),
+            dfid_name_handle: Some(dir_handle.clone()),
+            dfid_name_filename: Some(String::new()),
+            self_handle: None,
+        }];
         let mut cache = HashMap::new();
         cache.insert(dir_handle, "/tmp/mydir".into());
 
@@ -716,16 +711,14 @@ mod tests {
     #[test]
     fn test_resolve_with_cache_self_handle() {
         let handle = HandleKey::from(b"self_key" as &[u8]);
-        let mut events = vec![
-            FidEvent {
-                mask: 0,
-                pid: 0,
-                path: PathBuf::new(),
-                dfid_name_handle: None,
-                dfid_name_filename: None,
-                self_handle: Some(handle.clone()),
-            },
-        ];
+        let mut events = vec![FidEvent {
+            mask: 0,
+            pid: 0,
+            path: PathBuf::new(),
+            dfid_name_handle: None,
+            dfid_name_filename: None,
+            self_handle: Some(handle.clone()),
+        }];
         let mut cache = HashMap::new();
         cache.insert(handle, "/cached/path.txt".into());
 
@@ -736,16 +729,14 @@ mod tests {
     #[test]
     fn test_resolve_with_cache_no_match() {
         let handle = HandleKey::from(b"unknown" as &[u8]);
-        let mut events = vec![
-            FidEvent {
-                mask: 0,
-                pid: 0,
-                path: PathBuf::new(),
-                dfid_name_handle: Some(handle),
-                dfid_name_filename: Some("x.txt".into()),
-                self_handle: None,
-            },
-        ];
+        let mut events = vec![FidEvent {
+            mask: 0,
+            pid: 0,
+            path: PathBuf::new(),
+            dfid_name_handle: Some(handle),
+            dfid_name_filename: Some("x.txt".into()),
+            self_handle: None,
+        }];
         let cache = HashMap::new(); // empty cache
         assert!(!resolve_with_cache(&mut events, &cache));
         assert!(events[0].path.as_os_str().is_empty());
@@ -755,16 +746,14 @@ mod tests {
     fn test_resolve_with_cache_prefers_dfid_name_over_self() {
         let dir_handle = HandleKey::from(b"dir" as &[u8]);
         let self_handle = HandleKey::from(b"self" as &[u8]);
-        let mut events = vec![
-            FidEvent {
-                mask: 0,
-                pid: 0,
-                path: PathBuf::new(),
-                dfid_name_handle: Some(dir_handle.clone()),
-                dfid_name_filename: Some("name.txt".into()),
-                self_handle: Some(self_handle),
-            },
-        ];
+        let mut events = vec![FidEvent {
+            mask: 0,
+            pid: 0,
+            path: PathBuf::new(),
+            dfid_name_handle: Some(dir_handle.clone()),
+            dfid_name_filename: Some("name.txt".into()),
+            self_handle: Some(self_handle),
+        }];
         let mut cache = HashMap::new();
         cache.insert(dir_handle, "/dirpath".into());
 
@@ -781,13 +770,17 @@ mod tests {
         let dh2 = HandleKey::from(b"dir2" as &[u8]);
         let mut events = vec![
             FidEvent {
-                mask: 0, pid: 1, path: PathBuf::new(),
+                mask: 0,
+                pid: 1,
+                path: PathBuf::new(),
                 dfid_name_handle: Some(dh1.clone()),
                 dfid_name_filename: Some("a.txt".into()),
                 self_handle: None,
             },
             FidEvent {
-                mask: 0, pid: 2, path: PathBuf::new(),
+                mask: 0,
+                pid: 2,
+                path: PathBuf::new(),
                 dfid_name_handle: Some(dh2.clone()),
                 dfid_name_filename: Some("b.txt".into()),
                 self_handle: None,
@@ -805,14 +798,14 @@ mod tests {
     #[test]
     fn test_resolve_with_cache_does_not_overwrite_existing() {
         let dh = HandleKey::from(b"dir" as &[u8]);
-        let mut events = vec![
-            FidEvent {
-                mask: 0, pid: 0, path: "/existing/path".into(),
-                dfid_name_handle: Some(dh.clone()),
-                dfid_name_filename: Some("new.txt".into()),
-                self_handle: None,
-            },
-        ];
+        let mut events = vec![FidEvent {
+            mask: 0,
+            pid: 0,
+            path: "/existing/path".into(),
+            dfid_name_handle: Some(dh.clone()),
+            dfid_name_filename: Some("new.txt".into()),
+            self_handle: None,
+        }];
         let mut cache = HashMap::new();
         cache.insert(dh, "/cached/dir".into());
 

@@ -9,7 +9,7 @@ use std::io;
 use std::os::fd::{AsRawFd, FromRawFd, OwnedFd};
 use std::path::{Path, PathBuf};
 
-use crate::types::{HandleKey, FH_HDR_SIZE};
+use crate::types::{FH_HDR_SIZE, HandleKey};
 
 /// Look up the file handle for a path.
 ///
