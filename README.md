@@ -76,7 +76,7 @@ Linux fanotify has two event formats:
 | **Legacy** | default | Fixed (24 bytes) | Via `metadata.fd` |
 | **FID** | `FAN_REPORT_FID` / `FAN_REPORT_DIR_FID` / `FAN_REPORT_NAME` | Variable (each event may include extra info records) | Via `file_handle` → `open_by_handle_at()` |
 
-Existing fanotify crates cover the legacy mode. This crate covers FID mode: it reads variable-length events correctly (using each event's `event_len` field rather than fixed-size steps), parses file handles from info records, and resolves them to paths.
+This crate covers both Legacy and FID mode: it reads variable-length events correctly (using each event's `event_len` field rather than fixed-size steps), parses file handles from info records, and resolves them to paths.
 
 It also provides safe wrappers for `name_to_handle_at()` and `open_by_handle_at()`, the syscalls needed to convert file handles back to paths.
 
