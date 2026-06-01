@@ -11,8 +11,6 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 - GitHub Actions CI workflow (build + test + fmt + clippy)
 
-- GitHub Actions CI workflow (build + test + fmt + clippy)
-
 ## [0.2.4] - 2026-05-26
 
 ### Changed
