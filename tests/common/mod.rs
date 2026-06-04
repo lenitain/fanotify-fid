@@ -3,8 +3,8 @@
 #![allow(dead_code)]
 
 use std::path::Path;
-use std::time::{Duration, Instant};
 use std::thread;
+use std::time::{Duration, Instant};
 
 use fanotify_fid::prelude::*;
 
