@@ -126,28 +126,26 @@ for ev in &events {
 
 ```
 src/
-├── consts.rs   # FAN_* constants (FAN_REPORT_FID, FAN_CREATE, ...)
-├── types.rs    # FidEvent, FanMetadata, HandleKey
-├── handle.rs   # name_to_handle_at(), open_by_handle_at(), resolve_file_handle()
-├── parse.rs    # parse_fid_events(), resolve_with_cache()
-├── read.rs     # read_fid_events() — read + parse + optional cache
-└── lib.rs      # Fanotify (Builder + top-level API), re-exports
+├── consts.rs      # FAN_* constants (FAN_REPORT_FID, FAN_CREATE, ...)
+├── types.rs       # FidEvent, FanMetadata, HandleKey
+├── handle.rs      # name_to_handle_at(), open_by_handle_at(), resolve_file_handle()
+├── parse.rs       # parse_fid_events(), resolve_with_cache()
+├── read.rs        # read_fid_events() — read + parse + optional cache
+├── error_desc.rs  # Error description helpers (errno → diagnostic string)
+└── lib.rs         # Fanotify (Builder + top-level API), re-exports
 ```
 
 ## Error handling
 
 All operations return `Result<T, FanotifyError>`.  Each error variant carries the
-raw errno and a **man-page-level description** explaining the cause, common
-pitfalls, and troubleshooting steps:
+raw errno and a **concise diagnostic message** explaining the cause:
 
 ```rust,no_run
 use fanotify_fid::FanotifyError;
 
 let e = FanotifyError::Init(libc::EPERM);
 println!("{}", e);
-// Prints: fanotify_init failed (errno=1): ...
-//   The operation is not permitted because the caller lacks
-//   the CAP_SYS_ADMIN capability...
+// Prints: fanotify_init failed (errno=1): Need CAP_SYS_ADMIN capability
 ```
 
 ---
