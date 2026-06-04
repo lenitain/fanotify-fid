@@ -19,6 +19,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - Simplified error descriptions from multi-paragraph man-page style to concise
   1-2 line diagnostic messages (e.g., "Invalid flags — check FAN_REPORT_NAME
   requires FAN_REPORT_DIR_FID" instead of 5-10 line explanations).
+- Split integration tests into separate modules:
+  - `tests/fid.rs`: FID mode tests
+  - `tests/legacy.rs`: Legacy mode tests
+  - `tests/permission.rs`: Permission event tests
+  - `tests/handle.rs`: File handle tests
+  - `tests/common/mod.rs`: Shared test utilities
 
 ## [0.2.4] - 2026-05-26
 

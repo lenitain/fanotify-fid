@@ -38,27 +38,27 @@ input, etc.).  These run without `CAP_SYS_ADMIN`.
 ### Integration tests (require root)
 
 7 additional tests verify end-to-end behavior against a real Linux kernel.
-Build as normal user, run the binary under `sudo`:
+Tests are organized by functionality in separate modules:
 
 ```bash
-cargo test --test integration --no-run
+cargo test --test fid --test legacy --test permission --test handle --no-run
 ```
 
 ```bash
-sudo -E ~/.cargo/bin/cargo test --test integration -- --ignored
+sudo -E ~/.cargo/bin/cargo test --test fid --test legacy --test permission --test handle -- --ignored
 ```
 
 Coverage:
 
-| Test | What it checks |
-|------|----------------|
-| `test_fid_event_on_single_file` | FID init → mark file → modify → read event |
-| `test_legacy_event_lifecycle` | Legacy init → mark file → open → read event |
-| `test_permission_event_response` | Permission event → `FAN_ALLOW` response → file access granted |
-| `test_name_to_handle_at_real_path` | `name_to_handle_at` on `/tmp` |
-| `test_open_by_handle_at_resolve` | `open_by_handle_at` (skips if FS doesn't support it) |
-| `test_resolve_file_handle` | `resolve_file_handle` end-to-end (skips if unsupported) |
-| `test_cache_recovers_deleted_path` | `HandleCache` recovery for deleted directories |
+| Module | Tests | What it checks |
+|--------|-------|----------------|
+| `tests/fid.rs` | `test_fid_event_on_single_file` | FID init → mark file → modify → read event |
+| `tests/legacy.rs` | `test_legacy_event_lifecycle` | Legacy init → mark file → open → read event |
+| `tests/permission.rs` | `test_permission_event_response` | Permission event → `FAN_ALLOW` response → file access granted |
+| `tests/handle.rs` | `test_name_to_handle_at_real_path` | `name_to_handle_at` on `/tmp` |
+| `tests/handle.rs` | `test_open_by_handle_at_resolve` | `open_by_handle_at` (skips if FS doesn't support it) |
+| `tests/handle.rs` | `test_resolve_file_handle` | `resolve_file_handle` end-to-end (skips if unsupported) |
+| `tests/handle.rs` | `test_cache_recovers_deleted_path` | `HandleCache` recovery for deleted directories |
 
 Handle-dependent tests (`open_by_handle_at`, `resolve_file_handle`, cache)
 check for system support at runtime and skip gracefully if the filesystem
