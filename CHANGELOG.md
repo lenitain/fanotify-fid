@@ -11,6 +11,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 - GitHub Actions CI workflow (build + test + fmt + clippy)
 
+### Changed
+
+- Extracted error description functions (`errno_desc_init`, `errno_desc_mark`,
+  `errno_desc_read`, `errno_desc_handle`) from `lib.rs` into new `error_desc.rs`
+  module, reducing `lib.rs` from 1031 to 828 lines.
+- Simplified error descriptions from multi-paragraph man-page style to concise
+  1-2 line diagnostic messages (e.g., "Invalid flags — check FAN_REPORT_NAME
+  requires FAN_REPORT_DIR_FID" instead of 5-10 line explanations).
+
 ## [0.2.4] - 2026-05-26
 
 ### Changed
