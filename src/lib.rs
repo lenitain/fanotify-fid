@@ -55,12 +55,12 @@
 //! ```
 
 pub mod consts;
+pub mod error_desc;
 pub mod handle;
 pub mod parse;
 pub mod read;
 pub mod types;
 
-use std::borrow::Cow;
 use std::ffi::{CString, OsStr};
 use std::fmt;
 use std::io;
@@ -117,25 +117,25 @@ impl fmt::Display for FanotifyError {
                 f,
                 "fanotify_init failed (errno={}): {}",
                 code,
-                errno_desc_init(*code)
+                error_desc::errno_desc_init(*code)
             ),
             Self::Mark(code) => write!(
                 f,
                 "fanotify_mark failed (errno={}): {}",
                 code,
-                errno_desc_mark(*code)
+                error_desc::errno_desc_mark(*code)
             ),
             Self::Read(code) => write!(
                 f,
                 "fanotify_read failed (errno={}): {}",
                 code,
-                errno_desc_read(*code)
+                error_desc::errno_desc_read(*code)
             ),
             Self::Handle(code) => write!(
                 f,
                 "file_handle operation failed (errno={}): {}",
                 code,
-                errno_desc_handle(*code)
+                error_desc::errno_desc_handle(*code)
             ),
             Self::Io(e) => write!(f, "I/O error: {}", e),
         }
@@ -147,209 +147,6 @@ impl std::error::Error for FanotifyError {}
 impl From<io::Error> for FanotifyError {
     fn from(e: io::Error) -> Self {
         Self::Io(e)
-    }
-}
-
-fn errno_desc_init(code: i32) -> Cow<'static, str> {
-    match code {
-        libc::EINVAL => Cow::Borrowed(concat!(
-            "An invalid value was passed in flags or event_f_flags.\n",
-            "  Common mistakes:\n",
-            "  - Using FAN_REPORT_NAME without FAN_REPORT_DIR_FID\n",
-            "  - Combining FAN_REPORT_FID with legacy-only flags\n",
-            "  - Setting reserved or unsupported bits in event_f_flags\n",
-            "  Check man fanotify_init(2) for all allowable bits."
-        )),
-        libc::EMFILE => Cow::Borrowed(concat!(
-            "Too many fanotify groups for this user.\n",
-            "  The per-user limit is 128 groups.  Each init() call creates\n",
-            "  a new notification group.  Check if previous groups are still\n",
-            "  open (forgeting to close an OwnedFd can leak groups)."
-        )),
-        libc::ENOMEM => Cow::Borrowed(concat!(
-            "Out of memory.\n",
-            "  The kernel could not allocate memory for the notification\n",
-            "  group's internal data structures.  Try reducing the event\n",
-            "  queue size or closing other fanotify groups."
-        )),
-        libc::ENOSYS => Cow::Borrowed(concat!(
-            "This kernel does not support fanotify.\n",
-            "  The fanotify API is available only if the kernel was\n",
-            "  configured with CONFIG_FANOTIFY.  Most distro kernels\n",
-            "  include this by default.  Custom or container-optimized\n",
-            "  kernels may omit it.  Check /proc/config.gz or\n",
-            "  /boot/config-$(uname -r) for CONFIG_FANOTIFY=y."
-        )),
-        libc::EPERM => Cow::Borrowed(concat!(
-            "Need CAP_SYS_ADMIN capability.\n",
-            "  Creating a fanotify group requires elevated privileges.\n",
-            "  Run as root, or add the capability via:\n",
-            "    sudo setcap cap_sys_admin+ep /path/to/binary\n",
-            "  Or run the process under a user namespace with\n",
-            "  CAP_SYS_ADMIN mapped."
-        )),
-        _ => Cow::Owned(format!(
-            "Unknown error (errno={}).  See fanotify_init(2) for details.",
-            code
-        )),
-    }
-}
-
-fn errno_desc_mark(code: i32) -> Cow<'static, str> {
-    match code {
-        libc::EBADF => Cow::Borrowed(concat!(
-            "Invalid file descriptor.\n",
-            "  Either the fanotify fd is invalid, or pathname is relative\n",
-            "  but dirfd is neither AT_FDCWD nor a valid fd.\n",
-            "  Check that fanotify_init succeeded and the fd hasn't been\n",
-            "  closed or moved into another process."
-        )),
-        libc::EINVAL => Cow::Borrowed(concat!(
-            "Invalid flags or mask, or wrong notification class.\n",
-            "  Common causes:\n",
-            "  - The fanotify group was created with FAN_CLASS_NOTIF but\n",
-            "    mask contains permission events (FAN_OPEN_PERM or\n",
-            "    FAN_ACCESS_PERM).  Permission events require\n",
-            "    FAN_CLASS_CONTENT or FAN_CLASS_PRE_CONTENT.\n",
-            "  - An invalid combination of mark flags was passed.\n",
-            "  - In FID mode, some mask flags are incompatible."
-        )),
-        libc::ENODEV => Cow::Borrowed(concat!(
-            "Filesystem does not support fsid.\n",
-            "  The filesystem indicated by pathname is not associated with\n",
-            "  a filesystem that supports fsid (e.g., tmpfs).  This error\n",
-            "  can occur only with a fanotify group that identifies objects\n",
-            "  by file handles (FID mode)."
-        )),
-        libc::ENOENT => Cow::Borrowed(concat!(
-            "Path does not exist.\n",
-            "  The filesystem object indicated by dirfd and pathname does\n",
-            "  not exist.  This also occurs when trying to remove a mark\n",
-            "  from an object which is not marked.\n",
-            "  Tip: use FAN_MARK_DONT_FOLLOW if pathname is a dangling\n",
-            "  symlink, or check that the path exists before marking."
-        )),
-        libc::ENOMEM => Cow::Borrowed(concat!(
-            "Out of memory.\n",
-            "  The kernel could not allocate memory to store the mark.\n",
-            "  Try reducing the number of marks or closing other groups."
-        )),
-        libc::ENOSPC => Cow::Borrowed(concat!(
-            "Too many marks (exceeded 8192 limit).\n",
-            "  The default mark limit is 8192 per group.  Either:\n",
-            "  - Use FAN_MARK_FILESYSTEM instead of marking individual\n",
-            "    paths to reduce mark count.\n",
-            "  - Pass FAN_UNLIMITED_MARKS to init() if you have\n",
-            "    CAP_SYS_ADMIN and genuinely need more marks.\n",
-            "  - Remove unused marks with FAN_MARK_REMOVE."
-        )),
-        libc::ENOSYS => Cow::Borrowed(concat!(
-            "This kernel does not implement fanotify_mark.\n",
-            "  CONFIG_FANOTIFY is likely missing from the kernel config."
-        )),
-        libc::ENOTDIR => Cow::Borrowed(concat!(
-            "FAN_MARK_ONLYDIR specified but path is not a directory.\n",
-            "  Remove FAN_MARK_ONLYDIR if you intended to mark a regular\n",
-            "  file, or point the path to a directory."
-        )),
-        libc::EOPNOTSUPP => Cow::Borrowed(concat!(
-            "Filesystem does not support file handles.\n",
-            "  The object is on a filesystem that does not support the\n",
-            "  encoding of file handles (e.g., some FUSE filesystems,\n",
-            "  network filesystems without export support).  This error\n",
-            "  can occur only with a fanotify group in FID mode."
-        )),
-        libc::EXDEV => Cow::Borrowed(concat!(
-            "Filesystem subvolume uses a different fsid.\n",
-            "  The object resides within a filesystem subvolume (e.g.,\n",
-            "  btrfs subvolume) which uses a different fsid than its root\n",
-            "  superblock.  Try marking the subvolume's mount point,\n",
-            "  or use FAN_MARK_FILESYSTEM on the subvolume directly."
-        )),
-        _ => Cow::Owned(format!(
-            "Unknown error (errno={}).  See fanotify_mark(2) for details.",
-            code
-        )),
-    }
-}
-
-fn errno_desc_read(code: i32) -> Cow<'static, str> {
-    match code {
-        libc::EAGAIN => Cow::Borrowed(concat!(
-            "No events available (non-blocking fd).\n",
-            "  The fanotify fd was created with FAN_NONBLOCK and no events\n",
-            "  are currently pending.  This is not an error — retry later\n",
-            "  using epoll/poll/select to wait for readability, or switch\n",
-            "  to blocking mode (remove FAN_NONBLOCK)."
-        )),
-        libc::EBADF => Cow::Borrowed(concat!(
-            "Invalid file descriptor.\n",
-            "  The fanotify fd is not a valid open file descriptor or\n",
-            "  was not opened for reading.  Check that fanotify_init()\n",
-            "  succeeded and the fd hasn't been closed."
-        )),
-        libc::EINTR => Cow::Borrowed(concat!(
-            "Interrupted by signal.\n",
-            "  The read call was interrupted by a signal before any data\n",
-            "  was read.  Retry the read (EINTR is transient)."
-        )),
-        libc::ENOMEM => Cow::Borrowed(concat!(
-            "Out of memory.\n",
-            "  Cannot allocate memory for the read buffer.  Try reducing\n",
-            "  the buffer size or closing other memory-intensive\n",
-            "  applications."
-        )),
-        _ => Cow::Owned(format!(
-            "Unknown error (errno={}).  See fanotify_read(2) for details.",
-            code
-        )),
-    }
-}
-
-fn errno_desc_handle(code: i32) -> Cow<'static, str> {
-    match code {
-        libc::EBADF => Cow::Borrowed(concat!(
-            "Invalid mount file descriptor.\n",
-            "  The mount_fd passed to open_by_handle_at is not a valid\n",
-            "  open file descriptor.  Make sure open_mount() succeeded\n",
-            "  and the fd hasn't been closed.  The mount_fd must belong\n",
-            "  to a mount point on the same filesystem as the handle."
-        )),
-        libc::ENOENT => Cow::Borrowed(concat!(
-            "File or directory does not exist.\n",
-            "  The file identified by the handle has been deleted.  In\n",
-            "  fanotify FID mode this is expected when events are\n",
-            "  delivered concurrently with deletions.  Use a persistent\n",
-            "  HandleCache to recover paths in later read cycles.\n",
-            "  See parse::resolve_with_cache for details."
-        )),
-        libc::EINVAL => Cow::Borrowed(concat!(
-            "Invalid handle or flags.\n",
-            "  The file handle data is malformed or the flags passed to\n",
-            "  open_by_handle_at are invalid.  This may indicate a kernel\n",
-            "  bug or corrupted handle data."
-        )),
-        libc::EOVERFLOW => Cow::Borrowed(concat!(
-            "Handle buffer too small.\n",
-            "  The initial buffer passed to name_to_handle_at was too\n",
-            "  small.  This is handled automatically by retrying with\n",
-            "  the correct size, but if you see this error it means the\n",
-            "  retry also failed.  Try using a larger initial buffer."
-        )),
-        libc::EOPNOTSUPP => Cow::Borrowed(concat!(
-            "Filesystem does not support file handles.\n",
-            "  The filesystem does not support name_to_handle_at or\n",
-            "  open_by_handle_at.  Common examples:\n",
-            "  - tmpfs (only supports handles for directories)\n",
-            "  - Some FUSE filesystems\n",
-            "  - Network filesystems without export support\n",
-            "  Try using open_mount() on a different path backed by a\n",
-            "  filesystem that supports handles (e.g., ext4, xfs, btrfs)."
-        )),
-        _ => Cow::Owned(format!(
-            "Unknown error (errno={}).  See name_to_handle_at(2) for details.",
-            code
-        )),
     }
 }
 
