@@ -7,10 +7,6 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [0.2.5] - 2026-06-05
 
-### Added
-
-- GitHub Actions CI workflow (build + test + fmt + clippy)
-
 ### Changed
 
 - Extracted error description functions (`errno_desc_init`, `errno_desc_mark`,
