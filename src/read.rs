@@ -350,6 +350,7 @@ mod tests {
 
     #[test]
     fn test_buffer_config_default() {
+        set_legacy_buffer_events(200); // reset to default
         assert_eq!(legacy_buffer_events(), 200);
     }
 
