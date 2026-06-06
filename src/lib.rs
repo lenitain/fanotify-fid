@@ -216,9 +216,9 @@ impl Fanotify {
 
     /// Read and parse FID-format events from the fanotify file descriptor.
     ///
-    /// Convenience wrapper around [`read_fid_events`] that takes `&self`.
+    /// Convenience wrapper around [`read_fid_events`](crate::read::read_fid_events) that takes `&self`.
     ///
-    /// See [`read_fid_events`] for full documentation.
+    /// See [`read_fid_events`](crate::read::read_fid_events) for full documentation.
     pub fn read_events(
         &self,
         mount_fds: &[OwnedFd],
@@ -493,7 +493,8 @@ pub fn fanotify_mark<P: AsRef<OsStr> + ?Sized>(
 /// Open a path with `O_PATH` to obtain a mount fd for handle resolution.
 ///
 /// The returned `OwnedFd` is opened with `O_PATH | O_CLOEXEC`, and can be
-/// used with [`resolve_file_handle`] and [`read_fid_events`].
+/// used with [`resolve_file_handle`](crate::handle::resolve_file_handle) and
+/// [`read_fid_events`](crate::read::read_fid_events).
 ///
 /// This is equivalent to `open(path, O_PATH | O_CLOEXEC)`.
 ///

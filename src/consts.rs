@@ -176,14 +176,43 @@ pub const FAN_NOFD: i32 = -1;
 
 // ── Deprecated constants (do not use in new code) ──
 
+/// Bitmask combining all three notification classes.
+///
+/// Combines [`FAN_CLASS_NOTIF`], [`FAN_CLASS_CONTENT`], and [`FAN_CLASS_PRE_CONTENT`]
+/// into a single mask.  Useful when you need to match against any class bit.
+///
+/// **Deprecated**: use the individual class constants instead for clarity.
+///
+/// # Example
+///
+/// ```rust
+/// use fanotify_fid::consts::*;
+/// // Check whether any class bit is set in a flags word
+/// # #[allow(deprecated)]
+/// let has_class = (flags_from_somewhere() & FAN_ALL_CLASS_BITS) != 0;
+/// # fn flags_from_somewhere() -> u32 { FAN_CLASS_CONTENT }
+/// ```
 #[deprecated(note = "use FAN_CLASS_NOTIF / FAN_CLASS_CONTENT / FAN_CLASS_PRE_CONTENT instead")]
 pub const FAN_ALL_CLASS_BITS: u32 = FAN_CLASS_NOTIF | FAN_CLASS_CONTENT | FAN_CLASS_PRE_CONTENT;
 
+/// Bitmask combining all `fanotify_init` flags.
+///
+/// Union of [`FAN_CLOEXEC`], [`FAN_NONBLOCK`], [`FAN_ALL_CLASS_BITS`],
+/// [`FAN_UNLIMITED_QUEUE`], and [`FAN_UNLIMITED_MARKS`].
+///
+/// **Deprecated**: use individual init flags instead for precision and readability.
 #[allow(deprecated)]
 #[deprecated(note = "use individual init flags instead")]
 pub const FAN_ALL_INIT_FLAGS: u32 =
     FAN_CLOEXEC | FAN_NONBLOCK | FAN_ALL_CLASS_BITS | FAN_UNLIMITED_QUEUE | FAN_UNLIMITED_MARKS;
 
+/// Bitmask combining all `fanotify_mark` flags.
+///
+/// Union of [`FAN_MARK_ADD`], [`FAN_MARK_REMOVE`], [`FAN_MARK_DONT_FOLLOW`],
+/// [`FAN_MARK_ONLYDIR`], [`FAN_MARK_MOUNT`], [`FAN_MARK_IGNORED_MASK`],
+/// [`FAN_MARK_IGNORED_SURV_MODIFY`], and [`FAN_MARK_FLUSH`].
+///
+/// **Deprecated**: use individual mark flags instead for precision and readability.
 #[deprecated(note = "use individual mark flags instead")]
 pub const FAN_ALL_MARK_FLAGS: u32 = FAN_MARK_ADD
     | FAN_MARK_REMOVE
@@ -194,12 +223,29 @@ pub const FAN_ALL_MARK_FLAGS: u32 = FAN_MARK_ADD
     | FAN_MARK_IGNORED_SURV_MODIFY
     | FAN_MARK_FLUSH;
 
+/// Bitmask combining all non-permission event types.
+///
+/// Union of [`FAN_ACCESS`], [`FAN_MODIFY`], [`FAN_CLOSE`], and [`FAN_OPEN`].
+///
+/// **Deprecated**: use individual event masks instead to subscribe only to
+/// the events you actually need.
 #[deprecated(note = "use individual event masks instead")]
 pub const FAN_ALL_EVENTS: u64 = FAN_ACCESS | FAN_MODIFY | FAN_CLOSE | FAN_OPEN;
 
+/// Bitmask combining all permission event types.
+///
+/// Union of [`FAN_OPEN_PERM`] and [`FAN_ACCESS_PERM`].  Use these to receive
+/// permission events that require a `FAN_ALLOW` / `FAN_DENY` response.
+///
+/// **Deprecated**: use individual permission masks instead.
 #[deprecated(note = "use individual permission masks instead")]
 pub const FAN_ALL_PERM_EVENTS: u64 = FAN_OPEN_PERM | FAN_ACCESS_PERM;
 
+/// Bitmask combining all outgoing event types (events + permissions + overflow).
+///
+/// Union of [`FAN_ALL_EVENTS`], [`FAN_ALL_PERM_EVENTS`], and [`FAN_Q_OVERFLOW`].
+///
+/// **Deprecated**: use individual event masks instead for clarity.
 #[allow(deprecated)]
 #[deprecated(note = "use individual event masks instead")]
 pub const FAN_ALL_OUTGOING_EVENTS: u64 = FAN_ALL_EVENTS | FAN_ALL_PERM_EVENTS | FAN_Q_OVERFLOW;
