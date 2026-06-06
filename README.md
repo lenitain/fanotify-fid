@@ -2,6 +2,8 @@
 
 [![Crates.io](https://img.shields.io/crates/v/fanotify-fid.svg)](https://crates.io/crates/fanotify-fid)
 [![Docs.rs](https://docs.rs/fanotify-fid/badge.svg)](https://docs.rs/fanotify-fid)
+[![License: MIT](https://img.shields.io/badge/license-MIT-blue.svg)](LICENSE)
+[![CI](https://github.com/lenitain/fanotify-fid/actions/workflows/ci.yml/badge.svg)](https://github.com/lenitain/fanotify-fid/actions/workflows/ci.yml)
 
 Linux fanotify **FID (File Identifier) mode** event parser and file handle utilities.
 
