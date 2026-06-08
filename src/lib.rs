@@ -85,5 +85,3 @@ pub mod prelude {
         Fanotify, FanotifyBuilder, FanotifyError, fanotify_init, fanotify_mark, open_mount,
     };
 }
-
-

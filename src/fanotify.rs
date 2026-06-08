@@ -97,7 +97,10 @@ impl Fanotify {
     /// Write a permission response.
     ///
     /// Convenience wrapper around [`write_response`](crate::read::write_response).
-    pub fn send_response(&self, response: &crate::types::FanotifyResponse) -> crate::error::Result<()> {
+    pub fn send_response(
+        &self,
+        response: &crate::types::FanotifyResponse,
+    ) -> crate::error::Result<()> {
         crate::read::write_response(&self.fd, response)
     }
 
@@ -112,7 +115,11 @@ impl Fanotify {
     }
 
     /// Add a mark on a mount point (monitor all files under it).
-    pub fn mark_mount<P: AsRef<OsStr> + ?Sized>(&self, mask: u64, path: &P) -> crate::error::Result<()> {
+    pub fn mark_mount<P: AsRef<OsStr> + ?Sized>(
+        &self,
+        mask: u64,
+        path: &P,
+    ) -> crate::error::Result<()> {
         fanotify_mark(
             &self.fd,
             consts::FAN_MARK_ADD | consts::FAN_MARK_MOUNT,
