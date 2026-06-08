@@ -77,21 +77,22 @@ impl Fanotify {
         crate::read::read_fid_events(&self.fd, mount_fds, buf, cache)
     }
 
-    /// Read legacy (non-FID) events.
+    /// Read legacy (non-FID) events with default settings.
     ///
     /// The fanotify fd must NOT have been initialized with `FAN_REPORT_FID`.
+    /// For custom buffer size, use [`LegacyReader`](crate::read::LegacyReader) directly.
     pub fn read_legacy(&self) -> crate::error::Result<Vec<crate::types::LegacyEvent>> {
-        crate::read::read_legacy(&self.fd)
+        crate::read::LegacyReader::new().read(&self.fd)
     }
 
     /// Read legacy events with a callback.
     ///
-    /// Convenience wrapper around [`read_legacy_do`](crate::read::read_legacy_do).
+    /// Convenience wrapper around [`LegacyReader::read_do`](crate::read::LegacyReader::read_do).
     pub fn read_legacy_do<F>(&self, callback: F) -> crate::error::Result<()>
     where
         F: FnMut(&crate::types::LegacyEvent),
     {
-        crate::read::read_legacy_do(&self.fd, callback)
+        crate::read::LegacyReader::new().read_do(&self.fd, callback)
     }
 
     /// Write a permission response.

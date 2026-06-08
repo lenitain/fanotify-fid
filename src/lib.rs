@@ -69,6 +69,7 @@ pub mod types;
 pub use builder::FanotifyBuilder;
 pub use error::{FanotifyError, Result};
 pub use fanotify::Fanotify;
+pub use read::LegacyReader;
 pub use sys::{fanotify_init, fanotify_mark, open_mount};
 
 /// Convenience re-exports for the most common types and constants.
@@ -76,10 +77,7 @@ pub mod prelude {
     pub use crate::consts::*;
     pub use crate::handle::{name_to_handle_at, open_by_handle_at, resolve_file_handle};
     pub use crate::parse::parse_fid_events;
-    pub use crate::read::{
-        legacy_buffer_events, read_fid_events, read_legacy, read_legacy_do,
-        set_legacy_buffer_events, write_response,
-    };
+    pub use crate::read::{read_fid_events, write_response, LegacyReader};
     pub use crate::types::{FanotifyResponse, FidEvent, HandleCache, HandleKey, LegacyEvent};
     pub use crate::{
         Fanotify, FanotifyBuilder, FanotifyError, fanotify_init, fanotify_mark, open_mount,

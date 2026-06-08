@@ -141,153 +141,144 @@ pub fn read_fid_events(
 // ── Legacy event reading ──
 
 use smallvec::SmallVec;
-use std::sync::Mutex;
 
 /// Default number of legacy events per read (200 events × 24 bytes = 4800 bytes
 /// on stack via `SmallVec`, zero heap allocation at this size).
 const DEFAULT_LEGACY_EVENTS: usize = 200;
 
-/// Global configuration for the number of legacy events to read per syscall.
+/// Builder for reading legacy (non-FID) fanotify events.
 ///
-/// Defaults to 200 (4800 bytes on stack).  Increase for workloads that produce
-/// many events per read cycle.  The buffer uses `SmallVec`, so it stays on
-/// stack at the default size and only spills to heap when configured larger.
-static LEGACY_BUF_EVENTS: Mutex<usize> = Mutex::new(DEFAULT_LEGACY_EVENTS);
-
-/// Get the current legacy event buffer size (in event count).
-pub fn legacy_buffer_events() -> usize {
-    LEGACY_BUF_EVENTS
-        .lock()
-        .map(|g| *g)
-        .unwrap_or(DEFAULT_LEGACY_EVENTS)
-}
-
-/// Set the legacy event buffer size (in event count).
-///
-/// The buffer is `SmallVec<[u8; 4800]>` (4800 = 24 bytes × 200 events).  At
-/// the default of 200, zero heap allocation.  Values > 200 spill to heap.
-pub fn set_legacy_buffer_events(n: usize) {
-    let n = n.max(1); // at least 1 event
-    *LEGACY_BUF_EVENTS.lock().unwrap() = n;
-}
-
-/// Read and parse legacy (non-FID) events from a fanotify file descriptor.
-///
-/// The fanotify fd must NOT have been created with `FAN_REPORT_FID` flags.
-/// Each returned [`LegacyEvent`] carries an open file descriptor that is
-/// automatically closed when the event is dropped (RAII).
-///
-/// Buffer size is configured via [`set_legacy_buffer_events`]; default is
-/// 200 events (4800 bytes on stack, zero heap allocation).
-///
-/// # Errors
-///
-/// Returns [`FanotifyError::Read`] if the `read` syscall fails.
+/// Configures buffer size and provides [`read`](Self::read) / [`read_do`](Self::read_do)
+/// methods.  Default buffer is 200 events (4800 bytes on stack, zero heap allocation).
 ///
 /// # Example
 ///
-/// ```rust,no_run
-/// use fanotify_fid::read::read_legacy;
+/// ```rust,ignore
+/// use fanotify_fid::read::LegacyReader;
 /// use std::os::fd::{FromRawFd, OwnedFd};
 ///
 /// let fan_fd = unsafe { OwnedFd::from_raw_fd(3) };
-/// let events = read_legacy(&fan_fd).unwrap();
-/// for ev in &events {
-///     println!("pid={} {:?} {}", ev.pid, ev.event_names(), ev.path.display());
-/// }
+/// let events = LegacyReader::new().read(&fan_fd).unwrap();
+///
+/// // Or with custom buffer size:
+/// let events = LegacyReader::new().event_count(500).read(&fan_fd).unwrap();
 /// ```
-pub fn read_legacy(fan_fd: &OwnedFd) -> Result<Vec<LegacyEvent>, FanotifyError> {
-    use crate::types::FanMetadata;
-    use std::os::fd::AsRawFd;
+#[derive(Debug, Clone)]
+pub struct LegacyReader {
+    event_count: usize,
+}
 
-    let event_count = LEGACY_BUF_EVENTS
-        .lock()
-        .map(|g| *g)
-        .unwrap_or(DEFAULT_LEGACY_EVENTS);
-    let buf_size = 24 * event_count;
-    // SmallVec: 4800 bytes on stack (default 200 ev), spills to heap if > 200.
-    let mut buf: SmallVec<[u8; 4800]> = SmallVec::new();
-    buf.resize(buf_size, 0);
-
-    // SAFETY: buf is a valid mutable byte slice of known size.
-    let n = unsafe {
-        libc::read(
-            fan_fd.as_raw_fd(),
-            buf.as_mut_ptr() as *mut libc::c_void,
-            buf_size,
-        )
-    };
-
-    if n < 0 {
-        return Err(FanotifyError::Read(
-            std::io::Error::last_os_error().raw_os_error().unwrap_or(0),
-        ));
-    }
-    if n == 0 {
-        return Ok(Vec::new());
-    }
-
-    let n = n as usize;
-    let mut events = Vec::new();
-    let mut offset = 0;
-
-    while offset + 24 <= n {
-        // SAFETY: bounds verified above.
-        let meta =
-            unsafe { std::ptr::read_unaligned(buf.as_ptr().add(offset) as *const FanMetadata) };
-        let event_len = meta.event_len as usize;
-        if event_len < 24 || offset + event_len > n {
-            break;
+impl LegacyReader {
+    /// Create a new reader with default settings (200 events).
+    pub fn new() -> Self {
+        Self {
+            event_count: DEFAULT_LEGACY_EVENTS,
         }
+    }
 
-        let path = if meta.fd >= 0 {
-            std::fs::read_link(format!("/proc/self/fd/{}", meta.fd)).unwrap_or_default()
-        } else {
-            PathBuf::new()
+    /// Set the number of events to read per syscall.
+    ///
+    /// Buffer size is `event_count × 24 bytes`.  At the default of 200,
+    /// the buffer stays on stack (4800 bytes via `SmallVec`).  Values > 200
+    /// spill to heap.
+    pub fn event_count(mut self, n: usize) -> Self {
+        self.event_count = n.max(1);
+        self
+    }
+
+    /// Read and parse legacy events from a fanotify file descriptor.
+    ///
+    /// The fanotify fd must NOT have been created with `FAN_REPORT_FID` flags.
+    /// Each returned [`LegacyEvent`] carries an open file descriptor that is
+    /// automatically closed when the event is dropped (RAII).
+    ///
+    /// # Errors
+    ///
+    /// Returns [`FanotifyError::Read`] if the `read` syscall fails.
+    pub fn read(&self, fan_fd: &OwnedFd) -> Result<Vec<LegacyEvent>, FanotifyError> {
+        use crate::types::FanMetadata;
+        use std::os::fd::AsRawFd;
+
+        let buf_size = 24 * self.event_count;
+        // SmallVec: 4800 bytes on stack (default 200 ev), spills to heap if > 200.
+        let mut buf: SmallVec<[u8; 4800]> = SmallVec::new();
+        buf.resize(buf_size, 0);
+
+        // SAFETY: buf is a valid mutable byte slice of known size.
+        let n = unsafe {
+            libc::read(
+                fan_fd.as_raw_fd(),
+                buf.as_mut_ptr() as *mut libc::c_void,
+                buf_size,
+            )
         };
 
-        events.push(LegacyEvent {
-            mask: meta.mask,
-            fd: meta.fd,
-            pid: meta.pid,
-            path,
-        });
+        if n < 0 {
+            return Err(FanotifyError::Read(
+                std::io::Error::last_os_error().raw_os_error().unwrap_or(0),
+            ));
+        }
+        if n == 0 {
+            return Ok(Vec::new());
+        }
 
-        offset += event_len;
+        let n = n as usize;
+        let mut events = Vec::new();
+        let mut offset = 0;
+
+        while offset + 24 <= n {
+            // SAFETY: bounds verified above.
+            let meta = unsafe {
+                std::ptr::read_unaligned(buf.as_ptr().add(offset) as *const FanMetadata)
+            };
+            let event_len = meta.event_len as usize;
+            if event_len < 24 || offset + event_len > n {
+                break;
+            }
+
+            let path = if meta.fd >= 0 {
+                std::fs::read_link(format!("/proc/self/fd/{}", meta.fd)).unwrap_or_default()
+            } else {
+                PathBuf::new()
+            };
+
+            events.push(LegacyEvent {
+                mask: meta.mask,
+                fd: meta.fd,
+                pid: meta.pid,
+                path,
+            });
+
+            offset += event_len;
+        }
+
+        Ok(events)
     }
 
-    Ok(events)
+    /// Read legacy events and apply a callback to each.
+    ///
+    /// Like [`read`](Self::read) but processes events via `callback` as they
+    /// are parsed, without collecting into a `Vec` first.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`FanotifyError::Read`] if the `read` syscall fails.
+    pub fn read_do<F>(&self, fan_fd: &OwnedFd, mut callback: F) -> Result<(), FanotifyError>
+    where
+        F: FnMut(&LegacyEvent),
+    {
+        let events = self.read(fan_fd)?;
+        for ev in &events {
+            callback(ev);
+        }
+        Ok(())
+    }
 }
 
-/// Read legacy events and apply a callback to each.
-///
-/// Like [`read_legacy`] but processes events via `callback` as they are
-/// parsed, without collecting into a `Vec` first.
-///
-/// # Errors
-///
-/// Returns [`FanotifyError::Read`] if the `read` syscall fails.
-///
-/// # Example
-///
-/// ```rust,no_run
-/// use fanotify_fid::read::read_legacy_do;
-/// use std::os::fd::{FromRawFd, OwnedFd};
-///
-/// let fan_fd = unsafe { OwnedFd::from_raw_fd(3) };
-/// read_legacy_do(&fan_fd, |ev| {
-///     println!("pid={} {:?}", ev.pid, ev.event_names());
-/// }).unwrap();
-/// ```
-pub fn read_legacy_do<F>(fan_fd: &OwnedFd, mut callback: F) -> Result<(), FanotifyError>
-where
-    F: FnMut(&LegacyEvent),
-{
-    let events = read_legacy(fan_fd)?;
-    for ev in &events {
-        callback(ev);
+impl Default for LegacyReader {
+    fn default() -> Self {
+        Self::new()
     }
-    Ok(())
 }
 
 /// Write a permission response to the fanotify fd.
@@ -346,40 +337,36 @@ mod tests {
     use super::*;
     use crate::types::FanMetadata;
 
-    // ── Buffer config tests ──
+    // ── LegacyReader tests ──
 
     #[test]
-    fn test_buffer_config_default() {
-        set_legacy_buffer_events(200); // reset to default
-        assert_eq!(legacy_buffer_events(), 200);
+    fn test_legacy_reader_default() {
+        let reader = LegacyReader::new();
+        assert_eq!(reader.event_count, 200);
     }
 
     #[test]
-    fn test_buffer_config_set_and_get() {
-        set_legacy_buffer_events(50);
-        assert_eq!(legacy_buffer_events(), 50);
-        set_legacy_buffer_events(200); // reset
+    fn test_legacy_reader_custom_event_count() {
+        let reader = LegacyReader::new().event_count(50);
+        assert_eq!(reader.event_count, 50);
     }
 
     #[test]
-    fn test_buffer_config_min_one() {
-        set_legacy_buffer_events(0);
-        assert_eq!(legacy_buffer_events(), 1);
-        set_legacy_buffer_events(200); // reset
+    fn test_legacy_reader_min_one() {
+        let reader = LegacyReader::new().event_count(0);
+        assert_eq!(reader.event_count, 1);
     }
 
     #[test]
-    fn test_buffer_config_large_spills_to_heap() {
-        // Setting to 1000 events = 24000 bytes, way beyond SmallVec's inline 4800
-        set_legacy_buffer_events(1000);
-        assert_eq!(legacy_buffer_events(), 1000);
+    fn test_legacy_reader_large_spills_to_heap() {
+        // 1000 events = 24000 bytes, way beyond SmallVec's inline 4800
+        let reader = LegacyReader::new().event_count(1000);
         // Reading /dev/null with large buffer still works (returns empty)
         let fd = std::fs::File::open("/dev/null").unwrap();
         let owned: OwnedFd = fd.into();
-        let result = read_legacy(&owned);
+        let result = reader.read(&owned);
         assert!(result.is_ok());
         assert!(result.unwrap().is_empty());
-        set_legacy_buffer_events(200); // reset
     }
 
     // ── Legacy read/parse tests ──
@@ -412,7 +399,7 @@ mod tests {
         // read_legacy should return Ok(empty vec) for 0 bytes read.
         let fd = std::fs::File::open("/dev/null").unwrap();
         let owned: OwnedFd = fd.into();
-        let result = read_legacy(&owned);
+        let result = LegacyReader::new().read(&owned);
         assert!(result.is_ok());
         assert!(result.unwrap().is_empty());
     }
