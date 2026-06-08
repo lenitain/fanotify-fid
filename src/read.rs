@@ -153,7 +153,7 @@ const DEFAULT_LEGACY_EVENTS: usize = 200;
 ///
 /// # Example
 ///
-/// ```rust,ignore
+/// ```rust,no_run
 /// use fanotify_fid::LegacyReader;
 /// use std::os::fd::{FromRawFd, OwnedFd};
 ///
