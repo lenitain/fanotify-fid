@@ -34,14 +34,9 @@ use crate::consts::{
 };
 use crate::handle::resolve_file_handle;
 use crate::types::{
-    FanInfoHeader, FanMetadata, FidEvent, HandleCache, HandleKey,
+    FH_HDR_SIZE, FSID_SIZE, FanInfoHeader, FanMetadata, FidEvent, HandleCache, HandleKey,
+    INFO_HDR_SIZE, META_SIZE,
 };
-
-// Internal size constants (not part of public API)
-const META_SIZE: usize = std::mem::size_of::<FanMetadata>();
-const INFO_HDR_SIZE: usize = std::mem::size_of::<FanInfoHeader>();
-const FSID_SIZE: usize = 8;
-const FH_HDR_SIZE: usize = 8;
 
 /// Parse a buffer of raw fanotify FID events into a [`Vec<FidEvent>`].
 ///
