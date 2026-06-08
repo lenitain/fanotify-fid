@@ -60,7 +60,7 @@ mod fanotify;
 mod sys;
 
 pub mod consts;
-pub mod error_desc;
+mod error_desc;
 pub mod handle;
 pub mod parse;
 pub mod read;

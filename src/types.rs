@@ -1,21 +1,7 @@
 //! Kernel data structures and parsed event types for fanotify FID mode.
 
 use std::collections::HashMap;
-use std::mem;
 use std::path::PathBuf;
-
-/// Size of [`FanMetadata`] (`sizeof(struct fanotify_event_metadata)`).
-pub const META_SIZE: usize = mem::size_of::<FanMetadata>();
-
-/// Size of [`FanInfoHeader`] (`sizeof(struct fanotify_event_info_header)`).
-pub const INFO_HDR_SIZE: usize = mem::size_of::<FanInfoHeader>();
-
-/// Size of `__kernel_fsid_t` (two `i32` values).
-pub const FSID_SIZE: usize = 8;
-
-/// Size of the fixed portion of `struct file_handle`:
-/// `handle_bytes` (u32) + `handle_type` (i32).
-pub const FH_HDR_SIZE: usize = 8;
 
 // ── Kernel structure definitions ──
 

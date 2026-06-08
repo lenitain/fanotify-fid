@@ -104,16 +104,6 @@ impl Fanotify {
         crate::read::write_response(&self.fd, response)
     }
 
-    /// Get the legacy buffer size (event count).
-    pub fn legacy_buffer_events() -> usize {
-        crate::read::legacy_buffer_events()
-    }
-
-    /// Set the legacy buffer size (event count).
-    pub fn set_legacy_buffer_events(n: usize) {
-        crate::read::set_legacy_buffer_events(n)
-    }
-
     /// Add a mark on a mount point (monitor all files under it).
     pub fn mark_mount<P: AsRef<OsStr> + ?Sized>(
         &self,

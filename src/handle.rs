@@ -9,7 +9,10 @@ use std::io;
 use std::os::fd::{AsRawFd, FromRawFd, OwnedFd};
 use std::path::{Path, PathBuf};
 
-use crate::types::{FH_HDR_SIZE, HandleKey};
+use crate::types::HandleKey;
+
+// Internal size constant (not part of public API)
+const FH_HDR_SIZE: usize = 8;
 
 /// Look up the file handle for a path.
 ///
