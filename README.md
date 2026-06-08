@@ -128,13 +128,42 @@ for ev in &events {
 
 ```
 src/
+├── lib.rs         # Re-exports + prelude (85 lines)
+├── builder.rs     # FanotifyBuilder struct and methods
+├── error.rs       # FanotifyError enum and Display impl
+├── fanotify.rs    # Fanotify RAII wrapper
+├── sys.rs         # Low-level syscall wrappers
 ├── consts.rs      # FAN_* constants (FAN_REPORT_FID, FAN_CREATE, ...)
-├── types.rs       # FidEvent, FanMetadata, HandleKey
+├── types.rs       # FidEvent, LegacyEvent, FanMetadata (internal)
 ├── handle.rs      # name_to_handle_at(), open_by_handle_at(), resolve_file_handle()
 ├── parse.rs       # parse_fid_events(), resolve_with_cache()
-├── read.rs        # read_fid_events() — read + parse + optional cache
-├── error_desc.rs  # Error description helpers (errno → diagnostic string)
-└── lib.rs         # Fanotify (Builder + top-level API), re-exports
+└── read.rs        # read_fid_events(), LegacyReader
+```
+
+## Legacy Event Reading
+
+For non-FID fanotify events, use the `LegacyReader` builder:
+
+```rust,no_run
+use fanotify_fid::LegacyReader;
+use std::os::fd::{FromRawFd, OwnedFd};
+
+# let fan_fd = unsafe { OwnedFd::from_raw_fd(3) };
+// Basic usage (default buffer: 200 events)
+let events = LegacyReader::new().read(&fan_fd).unwrap();
+
+// Custom buffer size
+let events = LegacyReader::new()
+    .event_count(500)
+    .read(&fan_fd)
+    .unwrap();
+
+// Callback mode
+LegacyReader::new()
+    .read_do(&fan_fd, |ev| {
+        println!("pid={} {:?}", ev.pid, ev.event_names());
+    })
+    .unwrap();
 ```
 
 ## Error handling

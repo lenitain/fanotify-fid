@@ -5,6 +5,73 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.3.0] - 2026-06-09
+
+### Breaking Changes
+
+- **Removed global state**: Deleted `legacy_buffer_events()` and `set_legacy_buffer_events()` functions.
+  These were global configuration functions that affected all callers, causing potential issues with:
+  - Cross-thread interference
+  - Test isolation
+  - Unexpected behavior for library users
+
+- **Replaced free functions with `LegacyReader` builder**:
+  - Removed: `read_legacy(fan_fd)` → Use `LegacyReader::new().read(fan_fd)`
+  - Removed: `read_legacy_do(fan_fd, callback)` → Use `LegacyReader::new().read_do(fan_fd, callback)`
+
+- **Hidden internal types from public API**:
+  - `FanMetadata`: `pub` → `pub(crate)` (kernel ABI struct, not for external use)
+  - `FanInfoHeader`: `pub` → `pub(crate)` (kernel ABI struct, not for external use)
+  - `error_desc` module: `pub mod` → `mod` (internal implementation detail)
+
+### Added
+
+- `LegacyReader` struct with builder pattern for reading legacy fanotify events:
+  ```rust
+  // Basic usage
+  let events = LegacyReader::new().read(&fan_fd)?;
+  
+  // Custom buffer size (default: 200 events)
+  let events = LegacyReader::new().event_count(500).read(&fan_fd)?;
+  
+  // Callback mode
+  LegacyReader::new().read_do(&fan_fd, |ev| { ... })?;
+  ```
+
+### Changed
+
+- **Code organization**: Split `lib.rs` (829 lines) into focused modules:
+  - `builder.rs`: `FanotifyBuilder` struct and methods
+  - `error.rs`: `FanotifyError` enum and Display impl
+  - `fanotify.rs`: `Fanotify` RAII wrapper
+  - `sys.rs`: Low-level syscall wrappers (`fanotify_init`, `fanotify_mark`, `open_mount`)
+  - `lib.rs`: Now only 85 lines (docs + module declarations + re-exports)
+
+- **Test organization**: Extracted 23 tests from `lib.rs` to `tests/` directory:
+  - `tests/consts.rs`: Constant accessibility tests
+  - `tests/error.rs`: Error type tests
+  - `tests/types.rs`: Event type tests
+  - `tests/api.rs`: Public API and prelude tests
+
+- **Internal constants**: Moved size constants (`META_SIZE`, `INFO_HDR_SIZE`, `FSID_SIZE`, `FH_HDR_SIZE`) to `pub(crate)` visibility.
+
+### Migration Guide
+
+```rust
+// Before (v0.2.x)
+use fanotify_fid::read::{read_legacy, set_legacy_buffer_events};
+
+set_legacy_buffer_events(500);
+let events = read_legacy(&fan_fd)?;
+read_legacy_do(&fan_fd, |ev| { ... })?;
+
+// After (v0.3.0)
+use fanotify_fid::LegacyReader;
+
+let events = LegacyReader::new().event_count(500).read(&fan_fd)?;
+LegacyReader::new().read_do(&fan_fd, |ev| { ... })?;
+```
+
 ## [0.2.5] - 2026-06-05
 
 ### Changed
