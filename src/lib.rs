@@ -77,7 +77,7 @@ pub mod prelude {
     pub use crate::consts::*;
     pub use crate::handle::{name_to_handle_at, open_by_handle_at, resolve_file_handle};
     pub use crate::parse::parse_fid_events;
-    pub use crate::read::{read_fid_events, write_response, LegacyReader};
+    pub use crate::read::{LegacyReader, read_fid_events, write_response};
     pub use crate::types::{FanotifyResponse, FidEvent, HandleCache, HandleKey, LegacyEvent};
     pub use crate::{
         Fanotify, FanotifyBuilder, FanotifyError, fanotify_init, fanotify_mark, open_mount,

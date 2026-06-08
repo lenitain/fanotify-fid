@@ -228,9 +228,8 @@ impl LegacyReader {
 
         while offset + 24 <= n {
             // SAFETY: bounds verified above.
-            let meta = unsafe {
-                std::ptr::read_unaligned(buf.as_ptr().add(offset) as *const FanMetadata)
-            };
+            let meta =
+                unsafe { std::ptr::read_unaligned(buf.as_ptr().add(offset) as *const FanMetadata) };
             let event_len = meta.event_len as usize;
             if event_len < 24 || offset + event_len > n {
                 break;
