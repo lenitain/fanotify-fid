@@ -133,3 +133,58 @@ impl Default for FanotifyBuilder {
         }
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_builder_default_flags() {
+        let builder = FanotifyBuilder::default();
+        // Default should be NOTIF (0) + CLOEXEC
+        // NOTIF=0 means the class bits (0x0C) are clear
+        assert!(builder.flags & 0x0C == 0, "class bits should be NOTIF");
+        assert!(
+            builder.flags & consts::FAN_CLOEXEC != 0,
+            "CLOEXEC should be set by default"
+        );
+        assert!(builder.flags & consts::FAN_CLOEXEC != 0);
+    }
+
+    #[test]
+    fn test_builder_chain_all_flags() {
+        let builder = FanotifyBuilder::default()
+            .cloexec()
+            .nonblock()
+            .class_content()
+            .report_fid()
+            .report_dir_fid()
+            .report_name()
+            .report_tid()
+            .report_pidfd()
+            .report_target_fid()
+            .unlimited_queue()
+            .unlimited_marks()
+            .enable_audit()
+            .event_flags(consts::O_CLOEXEC)
+            .raw_flags(0x1000);
+        // Builder should have accumulated flags
+        assert!(builder.flags & consts::FAN_NONBLOCK != 0);
+        assert!(builder.flags & consts::FAN_REPORT_FID != 0);
+        assert!(builder.flags & consts::FAN_REPORT_TID != 0);
+        assert!(builder.flags & consts::FAN_UNLIMITED_QUEUE != 0);
+        assert!(builder.flags & 0x1000 != 0);
+        assert_eq!(builder.event_f_flags, consts::O_CLOEXEC);
+    }
+
+    #[test]
+    fn test_builder_class_modes_are_exclusive() {
+        // Setting class_pre_content should clear class_content bits
+        let b = FanotifyBuilder::default().class_content();
+        assert!(b.flags & 0x0C == consts::FAN_CLASS_CONTENT || (b.flags & 0x0C) == 0x04);
+
+        let b = b.class_pre_content();
+        // 0x08 should be set, 0x04 should not
+        assert_eq!(b.flags & 0x0C, consts::FAN_CLASS_PRE_CONTENT);
+    }
+}

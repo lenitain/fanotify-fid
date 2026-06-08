@@ -1,14 +1,15 @@
-# lib.rs 重构计划
+# 测试迁移计划
 
 ## 目标
-将 lib.rs 从 829 行拆分为模块化结构，参照 proc-connector / sizefilter / timefilter 风格。
+将 lib.rs 中 23 个测试移到 tests/ 目录或子模块，参照其他项目风格。
 
 ## 步骤
 
-- [x] 1. 创建 `src/error.rs` — FanotifyError 枚举 + Display + From
-- [x] 2. 创建 `src/sys.rs` — fanotify_init / fanotify_mark / open_mount 底层函数
-- [x] 3. 创建 `src/builder.rs` — FanotifyBuilder 结构体 + 方法
-- [x] 4. 创建 `src/fanotify.rs` — Fanotify 结构体 + 方法
-- [x] 5. 精简 `src/lib.rs` — 只保留文档 + mod 声明 + pub use + 集成测试
-- [x] 6. 运行测试验证 ✅ 63 tests passed
-- [ ] 7. 提交代码
+- [x] 1. 创建 tests/consts.rs — 常量测试 (4 tests)
+- [x] 2. 创建 tests/error.rs — 错误类型测试 (6 tests)
+- [x] 3. 创建 tests/types.rs — 类型测试 (6 tests)
+- [x] 4. 创建 tests/api.rs — prelude 和 API 签名测试 (4 tests)
+- [x] 5. 将 Builder 私有字段测试移到 src/builder.rs (3 tests)
+- [x] 6. 精简 lib.rs — 删除所有测试
+- [x] 7. 运行测试验证 ✅ 82 tests passed (44 unit + 24 integration + 12 doctest + 2 ignored)
+- [ ] 8. 提交代码
