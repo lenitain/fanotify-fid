@@ -29,7 +29,7 @@ pub(crate) const FH_HDR_SIZE: usize = 8;
 /// filenames.  Use `event_len` to advance to the next event in a buffer.
 #[repr(C)]
 #[derive(Debug, Clone)]
-pub struct FanMetadata {
+pub(crate) struct FanMetadata {
     /// Total byte length of this event (header + all info records).
     /// Use this (not `META_SIZE`) to skip to the next event.
     pub event_len: u32,
@@ -56,7 +56,7 @@ pub struct FanMetadata {
 /// - `DFID_NAME`: fsid + file_handle + null-terminated filename + padding
 #[repr(C)]
 #[derive(Debug, Clone)]
-pub struct FanInfoHeader {
+pub(crate) struct FanInfoHeader {
     /// Info type: one of [`FAN_EVENT_INFO_TYPE_FID`](crate::consts::FAN_EVENT_INFO_TYPE_FID),
     /// [`DFID`](crate::consts::FAN_EVENT_INFO_TYPE_DFID), or
     /// [`DFID_NAME`](crate::consts::FAN_EVENT_INFO_TYPE_DFID_NAME).
