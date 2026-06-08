@@ -124,22 +124,6 @@ for ev in &events {
 
 ---
 
-## Modules
-
-```
-src/
-├── lib.rs         # Re-exports + prelude (85 lines)
-├── builder.rs     # FanotifyBuilder struct and methods
-├── error.rs       # FanotifyError enum and Display impl
-├── fanotify.rs    # Fanotify RAII wrapper
-├── sys.rs         # Low-level syscall wrappers
-├── consts.rs      # FAN_* constants (FAN_REPORT_FID, FAN_CREATE, ...)
-├── types.rs       # FidEvent, LegacyEvent, FanMetadata (internal)
-├── handle.rs      # name_to_handle_at(), open_by_handle_at(), resolve_file_handle()
-├── parse.rs       # parse_fid_events(), resolve_with_cache()
-└── read.rs        # read_fid_events(), LegacyReader
-```
-
 ## Legacy Event Reading
 
 For non-FID fanotify events, use the `LegacyReader` builder:
