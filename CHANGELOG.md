@@ -22,7 +22,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - **Hidden internal types from public API**:
   - `FanMetadata`: `pub` → `pub(crate)` (kernel ABI struct, not for external use)
   - `FanInfoHeader`: `pub` → `pub(crate)` (kernel ABI struct, not for external use)
-  - `error_desc` module: `pub mod` → `mod` (internal implementation detail)
+  - `error_desc` module: merged into `error.rs` (no longer a separate module)
 
 ### Added
 
@@ -42,7 +42,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 - **Code organization**: Split `lib.rs` (829 lines) into focused modules:
   - `builder.rs`: `FanotifyBuilder` struct and methods
-  - `error.rs`: `FanotifyError` enum and Display impl
+  - `error.rs`: `FanotifyError` enum, Display impl, and error description helpers (merged from `error_desc.rs`)
   - `fanotify.rs`: `Fanotify` RAII wrapper
   - `sys.rs`: Low-level syscall wrappers (`fanotify_init`, `fanotify_mark`, `open_mount`)
   - `lib.rs`: Now only 85 lines (docs + module declarations + re-exports)
@@ -52,6 +52,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   - `tests/error.rs`: Error type tests
   - `tests/types.rs`: Event type tests
   - `tests/api.rs`: Public API and prelude tests
+  - `tests/common.rs`: Shared test utilities (flat file, not module directory)
 
 - **Internal constants**: Moved size constants (`META_SIZE`, `INFO_HDR_SIZE`, `FSID_SIZE`, `FH_HDR_SIZE`) to `pub(crate)` visibility.
 
