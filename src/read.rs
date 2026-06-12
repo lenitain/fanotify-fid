@@ -8,7 +8,7 @@ use std::path::PathBuf;
 
 use crate::FanotifyError;
 use crate::parse::{parse_fid_events, resolve_with_cache};
-use crate::types::{FanotifyResponse, FidEvent, HandleCache, FdEvent};
+use crate::types::{FanotifyResponse, FdEvent, FidEvent, HandleCache};
 
 /// Read and parse FID-format events from a fanotify file descriptor.
 ///
