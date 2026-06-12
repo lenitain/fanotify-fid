@@ -8,7 +8,7 @@ use std::path::PathBuf;
 
 use crate::FanotifyError;
 use crate::parse::{parse_fid_events, resolve_with_cache};
-use crate::types::{FanotifyResponse, FidEvent, HandleCache, LegacyEvent};
+use crate::types::{FanotifyResponse, FidEvent, HandleCache, FdEvent};
 
 /// Read and parse FID-format events from a fanotify file descriptor.
 ///
@@ -138,15 +138,15 @@ pub fn read_fid_events(
     Ok(events)
 }
 
-// ── Legacy event reading ──
+// ── fd-based event reading ──
 
 use smallvec::SmallVec;
 
-/// Default number of legacy events per read (200 events × 24 bytes = 4800 bytes
+/// Default number of fd-based events per read (200 events × 24 bytes = 4800 bytes
 /// on stack via `SmallVec`, zero heap allocation at this size).
-const DEFAULT_LEGACY_EVENTS: usize = 200;
+const DEFAULT_FD_EVENTS: usize = 200;
 
-/// Builder for reading legacy (non-FID) fanotify events.
+/// Builder for reading fd-based (non-FID) fanotify events.
 ///
 /// Configures buffer size and provides [`read`](Self::read) / [`read_do`](Self::read_do)
 /// methods.  Default buffer is 200 events (4800 bytes on stack, zero heap allocation).
@@ -154,25 +154,25 @@ const DEFAULT_LEGACY_EVENTS: usize = 200;
 /// # Example
 ///
 /// ```rust,no_run
-/// use fanotify_fid::LegacyReader;
+/// use fanotify_fid::FdReader;
 /// use std::os::fd::{FromRawFd, OwnedFd};
 ///
 /// let fan_fd = unsafe { OwnedFd::from_raw_fd(3) };
-/// let events = LegacyReader::new().read(&fan_fd).unwrap();
+/// let events = FdReader::new().read(&fan_fd).unwrap();
 ///
 /// // Or with custom buffer size:
-/// let events = LegacyReader::new().event_count(500).read(&fan_fd).unwrap();
+/// let events = FdReader::new().event_count(500).read(&fan_fd).unwrap();
 /// ```
 #[derive(Debug, Clone)]
-pub struct LegacyReader {
+pub struct FdReader {
     event_count: usize,
 }
 
-impl LegacyReader {
+impl FdReader {
     /// Create a new reader with default settings (200 events).
     pub fn new() -> Self {
         Self {
-            event_count: DEFAULT_LEGACY_EVENTS,
+            event_count: DEFAULT_FD_EVENTS,
         }
     }
 
@@ -186,16 +186,16 @@ impl LegacyReader {
         self
     }
 
-    /// Read and parse legacy events from a fanotify file descriptor.
+    /// Read and parse fd-based events from a fanotify file descriptor.
     ///
     /// The fanotify fd must NOT have been created with `FAN_REPORT_FID` flags.
-    /// Each returned [`LegacyEvent`] carries an open file descriptor that is
+    /// Each returned [`FdEvent`] carries an open file descriptor that is
     /// automatically closed when the event is dropped (RAII).
     ///
     /// # Errors
     ///
     /// Returns [`FanotifyError::Read`] if the `read` syscall fails.
-    pub fn read(&self, fan_fd: &OwnedFd) -> Result<Vec<LegacyEvent>, FanotifyError> {
+    pub fn read(&self, fan_fd: &OwnedFd) -> Result<Vec<FdEvent>, FanotifyError> {
         use crate::types::FanMetadata;
         use std::os::fd::AsRawFd;
 
@@ -241,7 +241,7 @@ impl LegacyReader {
                 PathBuf::new()
             };
 
-            events.push(LegacyEvent {
+            events.push(FdEvent {
                 mask: meta.mask,
                 fd: meta.fd,
                 pid: meta.pid,
@@ -254,7 +254,7 @@ impl LegacyReader {
         Ok(events)
     }
 
-    /// Read legacy events and apply a callback to each.
+    /// Read fd-based events and apply a callback to each.
     ///
     /// Like [`read`](Self::read) but processes events via `callback` as they
     /// are parsed, without collecting into a `Vec` first.
@@ -264,7 +264,7 @@ impl LegacyReader {
     /// Returns [`FanotifyError::Read`] if the `read` syscall fails.
     pub fn read_do<F>(&self, fan_fd: &OwnedFd, mut callback: F) -> Result<(), FanotifyError>
     where
-        F: FnMut(&LegacyEvent),
+        F: FnMut(&FdEvent),
     {
         let events = self.read(fan_fd)?;
         for ev in &events {
@@ -274,7 +274,7 @@ impl LegacyReader {
     }
 }
 
-impl Default for LegacyReader {
+impl Default for FdReader {
     fn default() -> Self {
         Self::new()
     }
@@ -286,7 +286,7 @@ impl Default for LegacyReader {
 /// `FAN_ACCESS_PERM`, or `FAN_OPEN_EXEC_PERM`) to grant or deny the
 /// operation.
 ///
-/// The `response.fd` should be copied from the [`LegacyEvent`] that
+/// The `response.fd` should be copied from the [`FdEvent`] that
 /// triggered the permission check.
 ///
 /// # Errors
@@ -336,30 +336,30 @@ mod tests {
     use super::*;
     use crate::types::FanMetadata;
 
-    // ── LegacyReader tests ──
+    // ── FdReader tests ──
 
     #[test]
-    fn test_legacy_reader_default() {
-        let reader = LegacyReader::new();
+    fn test_fd_reader_default() {
+        let reader = FdReader::new();
         assert_eq!(reader.event_count, 200);
     }
 
     #[test]
-    fn test_legacy_reader_custom_event_count() {
-        let reader = LegacyReader::new().event_count(50);
+    fn test_fd_reader_custom_event_count() {
+        let reader = FdReader::new().event_count(50);
         assert_eq!(reader.event_count, 50);
     }
 
     #[test]
-    fn test_legacy_reader_min_one() {
-        let reader = LegacyReader::new().event_count(0);
+    fn test_fd_reader_min_one() {
+        let reader = FdReader::new().event_count(0);
         assert_eq!(reader.event_count, 1);
     }
 
     #[test]
-    fn test_legacy_reader_large_spills_to_heap() {
+    fn test_fd_reader_large_spills_to_heap() {
         // 1000 events = 24000 bytes, way beyond SmallVec's inline 4800
-        let reader = LegacyReader::new().event_count(1000);
+        let reader = FdReader::new().event_count(1000);
         // Reading /dev/null with large buffer still works (returns empty)
         let fd = std::fs::File::open("/dev/null").unwrap();
         let owned: OwnedFd = fd.into();
@@ -368,9 +368,9 @@ mod tests {
         assert!(result.unwrap().is_empty());
     }
 
-    // ── Legacy read/parse tests ──
+    // ── fd-based read/parse tests ──
 
-    fn build_legacy_raw(mask: u64, pid: i32, fd: i32, event_len: u32) -> Vec<u8> {
+    fn build_fd_raw(mask: u64, pid: i32, fd: i32, event_len: u32) -> Vec<u8> {
         let mut buf = Vec::with_capacity(24);
         buf.extend_from_slice(&event_len.to_ne_bytes());
         buf.push(3); // vers = FANOTIFY_METADATA_VERSION
@@ -383,8 +383,8 @@ mod tests {
     }
 
     #[test]
-    fn test_legacy_parse_single_event() {
-        let raw = build_legacy_raw(0x0000_0001, 1234, 5, 24);
+    fn test_fd_parse_single_event() {
+        let raw = build_fd_raw(0x0000_0001, 1234, 5, 24);
         let meta: FanMetadata = unsafe { std::ptr::read_unaligned(raw.as_ptr() as *const _) };
         assert_eq!(meta.mask, 0x0000_0001);
         assert_eq!(meta.pid, 1234);
@@ -393,20 +393,20 @@ mod tests {
     }
 
     #[test]
-    fn test_legacy_dev_null_read_empty() {
+    fn test_fd_dev_null_read_empty() {
         // Opening /dev/null and reading from it gives EOF (0 bytes).
-        // read_legacy should return Ok(empty vec) for 0 bytes read.
+        // FdReader::read should return Ok(empty vec) for 0 bytes read.
         let fd = std::fs::File::open("/dev/null").unwrap();
         let owned: OwnedFd = fd.into();
-        let result = LegacyReader::new().read(&owned);
+        let result = FdReader::new().read(&owned);
         assert!(result.is_ok());
         assert!(result.unwrap().is_empty());
     }
 
     #[test]
-    fn test_legacy_parse_multiple_raw_events() {
-        let ev1 = build_legacy_raw(0x0000_0001, 10, 3, 24);
-        let ev2 = build_legacy_raw(0x0000_0002, 20, 4, 30); // larger event_len
+    fn test_fd_parse_multiple_raw_events() {
+        let ev1 = build_fd_raw(0x0000_0001, 10, 3, 24);
+        let ev2 = build_fd_raw(0x0000_0002, 20, 4, 30); // larger event_len
         let combined = [ev1, ev2].concat();
 
         // Manually parse: event 1
@@ -422,8 +422,8 @@ mod tests {
     }
 
     #[test]
-    fn test_legacy_overflow_flag() {
-        let ev = LegacyEvent {
+    fn test_fd_overflow_flag() {
+        let ev = FdEvent {
             mask: crate::consts::FAN_Q_OVERFLOW,
             fd: -1,
             pid: 0,
@@ -433,8 +433,8 @@ mod tests {
     }
 
     #[test]
-    fn test_legacy_event_names() {
-        let ev = LegacyEvent {
+    fn test_fd_event_names() {
+        let ev = FdEvent {
             mask: crate::consts::FAN_CREATE | crate::consts::FAN_MODIFY,
             fd: -1,
             pid: 0,
@@ -445,10 +445,10 @@ mod tests {
     }
 
     #[test]
-    fn test_legacy_drop_closes_fd() {
+    fn test_fd_drop_closes_fd() {
         // We can't easily test real fd close without opening a real fd,
         // but we can verify the Drop impl doesn't crash on invalid fd.
-        let ev = LegacyEvent {
+        let ev = FdEvent {
             mask: 0,
             fd: -1, // FAN_NOFD — should be safely ignored by Drop
             pid: 0,

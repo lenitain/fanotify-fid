@@ -5,6 +5,18 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.3.1] - 2026-06-12
+
+### Breaking Changes
+
+- **Renamed `Legacy*` to `Fd*`**: The "legacy" naming was misleading — fd-based and FID-based
+  fanotify modes are both actively maintained, parallel interfaces in the Linux kernel.
+  - `LegacyEvent` → `FdEvent`
+  - `LegacyReader` → `FdReader`
+  - `read_legacy()` → `read_fd_events()`
+  - `read_legacy_do()` → `read_fd_events_do()`
+  - `tests/legacy.rs` → `tests/fd.rs`
+
 ## [0.3.0] - 2026-06-09
 
 ### Breaking Changes
@@ -15,9 +27,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   - Test isolation
   - Unexpected behavior for library users
 
-- **Replaced free functions with `LegacyReader` builder**:
-  - Removed: `read_legacy(fan_fd)` → Use `LegacyReader::new().read(fan_fd)`
-  - Removed: `read_legacy_do(fan_fd, callback)` → Use `LegacyReader::new().read_do(fan_fd, callback)`
+- **Replaced free functions with `FdReader` builder**:
+  - Removed: `read_legacy(fan_fd)` → Use `FdReader::new().read(fan_fd)`
+  - Removed: `read_legacy_do(fan_fd, callback)` → Use `FdReader::new().read_do(fan_fd, callback)`
 
 - **Hidden internal types from public API**:
   - `FanMetadata`: `pub` → `pub(crate)` (kernel ABI struct, not for external use)
@@ -26,16 +38,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
-- `LegacyReader` struct with builder pattern for reading legacy fanotify events:
+- `FdReader` struct with builder pattern for reading fd-based fanotify events:
   ```rust
   // Basic usage
-  let events = LegacyReader::new().read(&fan_fd)?;
+  let events = FdReader::new().read(&fan_fd)?;
   
   // Custom buffer size (default: 200 events)
-  let events = LegacyReader::new().event_count(500).read(&fan_fd)?;
+  let events = FdReader::new().event_count(500).read(&fan_fd)?;
   
   // Callback mode
-  LegacyReader::new().read_do(&fan_fd, |ev| { ... })?;
+  FdReader::new().read_do(&fan_fd, |ev| { ... })?;
   ```
 
 ### Changed
@@ -67,10 +79,10 @@ let events = read_legacy(&fan_fd)?;
 read_legacy_do(&fan_fd, |ev| { ... })?;
 
 // After (v0.3.0)
-use fanotify_fid::LegacyReader;
+use fanotify_fid::FdReader;
 
-let events = LegacyReader::new().event_count(500).read(&fan_fd)?;
-LegacyReader::new().read_do(&fan_fd, |ev| { ... })?;
+let events = FdReader::new().event_count(500).read(&fan_fd)?;
+FdReader::new().read_do(&fan_fd, |ev| { ... })?;
 ```
 
 ## [0.2.5] - 2026-06-05
@@ -85,7 +97,7 @@ LegacyReader::new().read_do(&fan_fd, |ev| { ... })?;
   requires FAN_REPORT_DIR_FID" instead of 5-10 line explanations).
 - Split integration tests into separate modules:
   - `tests/fid.rs`: FID mode tests
-  - `tests/legacy.rs`: Legacy mode tests
+  - `tests/fd.rs`: fd-based mode tests
   - `tests/permission.rs`: Permission event tests
   - `tests/handle.rs`: File handle tests
   - `tests/common/mod.rs`: Shared test utilities
@@ -107,7 +119,7 @@ LegacyReader::new().read_do(&fan_fd, |ev| { ... })?;
 - GitHub Actions CI workflow (build + test + fmt + clippy)
 
 - Comprehensive integration tests for `FanotifyBuilder` flag chains and class mode exclusivity.
-- Doc-tests for `name_to_handle_at`, `read_fid_events`, `read_legacy`, `write_response`.
+- Doc-tests for `name_to_handle_at`, `read_fid_events`, `FdReader::read`, `write_response`.
 
 ### Fixed
 
@@ -145,7 +157,7 @@ LegacyReader::new().read_do(&fan_fd, |ev| { ... })?;
 
 - GitHub Actions CI workflow (build + test + fmt + clippy)
 
-- **Legacy event reading** (`read_legacy`, `read_legacy_do`): support for non-FID
+- **fd-based event reading** (`FdReader`): support for non-FID
   fanotify events, including callback mode and configurable buffer via `SmallVec`.
 - **Permission event handling**: `write_response` and `FanotifyResponse` type for
   responding to permission-type fanotify events.
@@ -153,7 +165,7 @@ LegacyReader::new().read_do(&fan_fd, |ev| { ... })?;
   `class_content()`, `class_pre_content()`, `report_fid()`, `report_dir_fid()`,
   `report_name()`, `report_target_fid()`, `class_notif()`.
 - **`mark_mount()`**: mark an entire mount point for monitoring.
-- **`LegacyEvent`**: RAII wrapper for legacy event file descriptors.
+- **`FdEvent`**: RAII wrapper for fd-based event file descriptors.
 - **`FanotifyResponse`**: type for permission event responses.
 - 26 comprehensive unit tests for the new functionality.
 - Missing constants: permission events (`FAN_OPEN_PERM`, `FAN_ACCESS_PERM`),

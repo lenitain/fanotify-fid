@@ -46,7 +46,7 @@ fn test_public_api_function_signatures() {
             dfid_name_filename: None,
             self_handle: None,
         };
-        let _ = LegacyEvent {
+        let _ = FdEvent {
             mask: 0,
             fd: -1,
             pid: 0,

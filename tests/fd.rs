@@ -1,6 +1,6 @@
-//! Legacy mode integration tests.
+//! fd-based mode integration tests.
 //!
-//! These tests verify non-FID (legacy) fanotify functionality.
+//! These tests verify non-FID (fd-based) fanotify functionality.
 //! Require `CAP_SYS_ADMIN` (run as root).
 
 mod common;
@@ -12,7 +12,7 @@ use std::time::Duration;
 
 #[test]
 #[ignore]
-fn test_legacy_event_lifecycle() {
+fn test_fd_event_lifecycle() {
     let dir = tmpdir();
     let f = dir.path().join("r.txt");
     fs::write(&f, b"d").unwrap();
@@ -22,7 +22,7 @@ fn test_legacy_event_lifecycle() {
     let _ = fs::read(&f).ok();
 
     let evts = retry(
-        || fan.read_legacy().ok().filter(|e| !e.is_empty()),
+        || fan.read_fd_events().ok().filter(|e| !e.is_empty()),
         Duration::from_secs(2),
     )
     .expect("OPEN event within 2s");

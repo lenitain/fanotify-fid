@@ -128,16 +128,16 @@ impl FidEvent {
     }
 }
 
-// ── Legacy (non-FID) event ──
+// ── fd-based (non-FID) event ──
 
-/// A parsed legacy (non-FID) fanotify event.
+/// A parsed fd-based (non-FID) fanotify event.
 ///
-/// Legacy events carry an open file descriptor for the accessed file.
+/// fd-based events carry an open file descriptor for the accessed file.
 /// The fd is automatically closed when this event is dropped (RAII).
 /// If you need the fd to outlive the event, use `libc::dup(ev.fd)` to
 /// obtain a copy.
 #[derive(Debug)]
-pub struct LegacyEvent {
+pub struct FdEvent {
     /// Event mask (one or more of `FAN_ACCESS`, `FAN_MODIFY`, etc.).
     pub mask: u64,
     /// Open file descriptor for the object being accessed.
@@ -151,7 +151,7 @@ pub struct LegacyEvent {
     pub path: PathBuf,
 }
 
-impl Drop for LegacyEvent {
+impl Drop for FdEvent {
     fn drop(&mut self) {
         if self.fd >= 0 {
             unsafe {
@@ -161,7 +161,7 @@ impl Drop for LegacyEvent {
     }
 }
 
-impl LegacyEvent {
+impl FdEvent {
     /// Returns `true` if this event indicates a queue overflow.
     pub fn is_overflow(&self) -> bool {
         self.mask & crate::consts::FAN_Q_OVERFLOW != 0
@@ -180,10 +180,10 @@ impl LegacyEvent {
 ///
 /// Write this to the fanotify fd after receiving a permission event to
 /// grant or deny the operation.  The `fd` field should be copied from the
-/// [`LegacyEvent`] that triggered the permission check.
+/// [`FdEvent`] that triggered the permission check.
 #[derive(Debug, Clone)]
 pub struct FanotifyResponse {
-    /// The file descriptor from the `LegacyEvent` that triggered the
+    /// The file descriptor from the `FdEvent` that triggered the
     /// permission check.
     pub fd: i32,
     /// `FAN_ALLOW` to grant, `FAN_DENY` to deny.

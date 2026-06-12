@@ -3,7 +3,7 @@
 //! Linux fanotify **FID (File Identifier) mode** event parser and file handle utilities.
 //!
 //! This crate fills the gap left by [`fanotify-rs`](https://crates.io/crates/fanotify-rs),
-//! which only supports non-FID (legacy) event reading.  If you pass
+//! which only supports non-FID (fd-based) event reading.  If you pass
 //! `FAN_REPORT_FID` / `FAN_REPORT_DIR_FID` / `FAN_REPORT_NAME` to
 //! `fanotify_init`, you **must** use this crate (or equivalent code) to
 //! correctly parse the variable-length events.
@@ -68,7 +68,7 @@ pub mod types;
 pub use builder::FanotifyBuilder;
 pub use error::{FanotifyError, Result};
 pub use fanotify::Fanotify;
-pub use read::LegacyReader;
+pub use read::FdReader;
 pub use sys::{fanotify_init, fanotify_mark, open_mount};
 
 /// Convenience re-exports for the most common types and constants.
@@ -76,8 +76,8 @@ pub mod prelude {
     pub use crate::consts::*;
     pub use crate::handle::{name_to_handle_at, open_by_handle_at, resolve_file_handle};
     pub use crate::parse::parse_fid_events;
-    pub use crate::read::{LegacyReader, read_fid_events, write_response};
-    pub use crate::types::{FanotifyResponse, FidEvent, HandleCache, HandleKey, LegacyEvent};
+    pub use crate::read::{FdReader, read_fid_events, write_response};
+    pub use crate::types::{FanotifyResponse, FidEvent, HandleCache, HandleKey, FdEvent};
     pub use crate::{
         Fanotify, FanotifyBuilder, FanotifyError, fanotify_init, fanotify_mark, open_mount,
     };

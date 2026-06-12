@@ -32,9 +32,9 @@ fn test_fid_event_overflow() {
 }
 
 #[test]
-fn test_legacy_event_auto_close_fd() {
-    // LegacyEvent with fd=-1 should not crash on drop
-    let ev = LegacyEvent {
+fn test_fd_event_auto_close_fd() {
+    // FdEvent with fd=-1 should not crash on drop
+    let ev = FdEvent {
         mask: 0,
         fd: -1,
         pid: 0,
@@ -44,8 +44,8 @@ fn test_legacy_event_auto_close_fd() {
 }
 
 #[test]
-fn test_legacy_event_methods() {
-    let ev = LegacyEvent {
+fn test_fd_event_methods() {
+    let ev = FdEvent {
         mask: FAN_CREATE | FAN_MODIFY,
         fd: -1,
         pid: 0,

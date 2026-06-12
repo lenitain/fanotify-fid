@@ -36,7 +36,7 @@ fn test_permission_event_response() {
     });
 
     // Blocking read — waits until kernel delivers the permission event
-    let evts = fan.read_legacy().expect("read perm event");
+    let evts = fan.read_fd_events().expect("read perm event");
     let ev = evts
         .first()
         .filter(|e| e.mask & FAN_OPEN_PERM != 0)

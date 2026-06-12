@@ -43,11 +43,11 @@ input, etc.).  These run without `CAP_SYS_ADMIN`.
 Tests are organized by functionality in separate modules:
 
 ```bash
-cargo test --test fid --test legacy --test permission --test handle --no-run
+cargo test --test fid --test fd --test permission --test handle --no-run
 ```
 
 ```bash
-sudo -E ~/.cargo/bin/cargo test --test fid --test legacy --test permission --test handle -- --ignored
+sudo -E ~/.cargo/bin/cargo test --test fid --test fd --test permission --test handle -- --ignored
 ```
 
 Coverage:
@@ -55,7 +55,7 @@ Coverage:
 | Module | Tests | What it checks |
 |--------|-------|----------------|
 | `tests/fid.rs` | `test_fid_event_on_single_file` | FID init → mark file → modify → read event |
-| `tests/legacy.rs` | `test_legacy_event_lifecycle` | Legacy init → mark file → open → read event |
+| `tests/fd.rs` | `test_fd_event_lifecycle` | fd-based init → mark file → open → read event |
 | `tests/permission.rs` | `test_permission_event_response` | Permission event → `FAN_ALLOW` response → file access granted |
 | `tests/handle.rs` | `test_name_to_handle_at_real_path` | `name_to_handle_at` on `/tmp` |
 | `tests/handle.rs` | `test_open_by_handle_at_resolve` | `open_by_handle_at` (skips if FS doesn't support it) |
@@ -75,10 +75,10 @@ Linux fanotify has two event formats:
 
 | Mode | Init flags | Event size | Path resolution |
 |------|-----------|-----------|-----------------|
-| **Legacy** | default | Fixed (24 bytes) | Via `metadata.fd` |
-| **FID** | `FAN_REPORT_FID` / `FAN_REPORT_DIR_FID` / `FAN_REPORT_NAME` | Variable (each event may include extra info records) | Via `file_handle` → `open_by_handle_at()` |
+| **fd-based** | default | Fixed (24 bytes) | Via `metadata.fd` |
+| **FID-based** | `FAN_REPORT_FID` / `FAN_REPORT_DIR_FID` / `FAN_REPORT_NAME` | Variable (each event may include extra info records) | Via `file_handle` → `open_by_handle_at()` |
 
-This crate covers both Legacy and FID mode: it reads variable-length events correctly (using each event's `event_len` field rather than fixed-size steps), parses file handles from info records, and resolves them to paths.
+This crate covers both fd-based and FID mode: it reads variable-length events correctly (using each event's `event_len` field rather than fixed-size steps), parses file handles from info records, and resolves them to paths.
 
 It also provides safe wrappers for `name_to_handle_at()` and `open_by_handle_at()`, the syscalls needed to convert file handles back to paths.
 
@@ -124,26 +124,26 @@ for ev in &events {
 
 ---
 
-## Legacy Event Reading
+## fd-based Event Reading
 
-For non-FID fanotify events, use the `LegacyReader` builder:
+For non-FID fanotify events, use the `FdReader` builder:
 
 ```rust,no_run
-use fanotify_fid::LegacyReader;
+use fanotify_fid::FdReader;
 use std::os::fd::{FromRawFd, OwnedFd};
 
 # let fan_fd = unsafe { OwnedFd::from_raw_fd(3) };
 // Basic usage (default buffer: 200 events)
-let events = LegacyReader::new().read(&fan_fd).unwrap();
+let events = FdReader::new().read(&fan_fd).unwrap();
 
 // Custom buffer size
-let events = LegacyReader::new()
+let events = FdReader::new()
     .event_count(500)
     .read(&fan_fd)
     .unwrap();
 
 // Callback mode
-LegacyReader::new()
+FdReader::new()
     .read_do(&fan_fd, |ev| {
         println!("pid={} {:?}", ev.pid, ev.event_names());
     })
