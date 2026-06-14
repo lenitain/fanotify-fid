@@ -123,7 +123,9 @@ impl FidEvent {
     }
 
     /// Human-readable event names from the mask (e.g. `["CREATE", "MODIFY"]`).
-    pub fn event_names(&self) -> Vec<&'static str> {
+    ///
+    /// Returns an iterator. Call `.collect()` if you need a `Vec`.
+    pub fn event_names(&self) -> impl Iterator<Item = &'static str> {
         crate::consts::mask_to_event_names(self.mask)
     }
 }
@@ -168,7 +170,9 @@ impl FdEvent {
     }
 
     /// Human-readable event names from the mask.
-    pub fn event_names(&self) -> Vec<&'static str> {
+    ///
+    /// Returns an iterator. Call `.collect()` if you need a `Vec`.
+    pub fn event_names(&self) -> impl Iterator<Item = &'static str> {
         crate::consts::mask_to_event_names(self.mask)
     }
 }

@@ -602,7 +602,6 @@ mod tests {
     #[test]
     fn test_handle_bytes_overflow() {
         // Info header says payload is big enough, but handle_bytes says it needs more
-        let _fake_handle = [0u8; 4];
         let mut info = build_info_header(FAN_EVENT_INFO_TYPE_FID, 20); // says 20 bytes
         info.extend_from_slice(&build_fsid(0, 0));
         // Now write file_handle with handle_bytes = 1000 (way beyond what's available)
@@ -817,21 +816,23 @@ mod tests {
 
     #[test]
     fn test_mask_to_event_names_overflow() {
-        let names = crate::consts::mask_to_event_names(crate::consts::FAN_Q_OVERFLOW);
+        let names: Vec<&str> =
+            crate::consts::mask_to_event_names(crate::consts::FAN_Q_OVERFLOW).collect();
         assert!(names.is_empty()); // FAN_Q_OVERFLOW is not in EVENT_NAMES
     }
 
     #[test]
     fn test_mask_to_event_names_create_modify() {
-        let names = crate::consts::mask_to_event_names(
+        let names: Vec<&str> = crate::consts::mask_to_event_names(
             crate::consts::FAN_CREATE | crate::consts::FAN_MODIFY,
-        );
+        )
+        .collect();
         assert_eq!(names, vec!["MODIFY", "CREATE"]);
     }
 
     #[test]
     fn test_mask_to_event_names_empty() {
-        let names = crate::consts::mask_to_event_names(0);
+        let names: Vec<&str> = crate::consts::mask_to_event_names(0).collect();
         assert!(names.is_empty());
     }
 }

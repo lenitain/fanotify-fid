@@ -14,7 +14,7 @@ fn test_fid_event_methods() {
         self_handle: None,
     };
     assert!(!ev.is_overflow());
-    let names = ev.event_names();
+    let names: Vec<&str> = ev.event_names().collect();
     assert_eq!(names, vec!["MODIFY", "CREATE"]);
 }
 
@@ -52,7 +52,7 @@ fn test_fd_event_methods() {
         path: PathBuf::new(),
     };
     assert!(!ev.is_overflow());
-    let names = ev.event_names();
+    let names: Vec<&str> = ev.event_names().collect();
     assert_eq!(names, vec!["MODIFY", "CREATE"]);
 }
 

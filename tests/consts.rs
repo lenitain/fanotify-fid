@@ -53,9 +53,10 @@ fn test_deprecated_constants_still_compile() {
 
 #[test]
 fn test_mask_to_event_names_includes_new() {
-    let names = consts::mask_to_event_names(
+    let names: Vec<&str> = consts::mask_to_event_names(
         consts::FAN_OPEN_PERM | consts::FAN_RENAME | consts::FAN_FS_ERROR,
-    );
+    )
+    .collect();
     assert!(names.contains(&"OPEN_PERM"));
     assert!(names.contains(&"RENAME"));
     assert!(names.contains(&"FS_ERROR"));

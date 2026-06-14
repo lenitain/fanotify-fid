@@ -274,19 +274,21 @@ pub const EVENT_NAMES: &[(u64, &str)] = &[
     (FAN_FS_ERROR, "FS_ERROR"),
 ];
 
-/// Convert an event mask bitfield to a list of human-readable event name strings.
+/// Convert an event mask bitfield to an iterator of human-readable event name strings.
+///
+/// Returns an iterator instead of collecting into a `Vec` to avoid heap allocation.
+/// Call `.collect()` if you need a `Vec`.
 ///
 /// # Example
 ///
 /// ```
 /// use fanotify_fid::consts::*;
-/// let names = mask_to_event_names(FAN_CREATE | FAN_MODIFY);
+/// let names: Vec<&str> = mask_to_event_names(FAN_CREATE | FAN_MODIFY).collect();
 /// assert_eq!(names, vec!["MODIFY", "CREATE"]);
 /// ```
-pub fn mask_to_event_names(mask: u64) -> Vec<&'static str> {
+pub fn mask_to_event_names(mask: u64) -> impl Iterator<Item = &'static str> {
     EVENT_NAMES
         .iter()
-        .filter(|(bit, _)| mask & bit != 0)
+        .filter(move |(bit, _)| mask & bit != 0)
         .map(|(_, name)| *name)
-        .collect()
 }

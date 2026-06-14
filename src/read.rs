@@ -64,7 +64,8 @@ use crate::types::{FanotifyResponse, FdEvent, FidEvent, HandleCache};
 ///
 /// let events = read_fid_events(&fan_fd, &mount_fds, &mut buf, None).unwrap();
 /// for ev in &events {
-///     println!("pid={} {:?} {}", ev.pid, ev.event_names(), ev.path.display());
+///     let names: Vec<&str> = ev.event_names().collect();
+///     println!("pid={} {:?} {}", ev.pid, names, ev.path.display());
 /// }
 /// ```
 pub fn read_fid_events(
@@ -440,7 +441,7 @@ mod tests {
             pid: 0,
             path: PathBuf::new(),
         };
-        let names = ev.event_names();
+        let names: Vec<&str> = ev.event_names().collect();
         assert_eq!(names, vec!["MODIFY", "CREATE"]);
     }
 
