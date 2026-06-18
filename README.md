@@ -24,6 +24,16 @@ Add to your `Cargo.toml`:
 fanotify-fid = "0.4.0"
 ```
 
+### Requirements
+
+- Linux kernel **≥ 5.1** for FID mode (`FAN_REPORT_FID`)
+- Linux kernel **≥ 5.15** for `FAN_REPORT_TARGET_FID`
+- **`CAP_SYS_ADMIN`** capability (run as root or with `cap_sys_admin+ep`)
+
+The crate compiles on any platform, but all runtime operations require a Linux
+kernel with `CONFIG_FANOTIFY` enabled.  Non-Linux platforms will fail at runtime
+with `FanotifyError::Init(ENOSYS)`.
+
 ### Quick start
 
 ```rust
@@ -57,27 +67,3 @@ for ev in &events {
     println!("{:?} {:?}", ev.event_names(), ev.path);
 }
 ```
-
-## Building from Source
-
-Requires Rust toolchain (tested with `rustc 1.85.0`).
-
-```bash
-git clone https://github.com/lenitain/fanotify-fid.git
-cd fanotify-fid
-cargo build --release
-```
-
-### Requirements
-
-- Linux kernel **≥ 5.1** for FID mode (`FAN_REPORT_FID`)
-- Linux kernel **≥ 5.15** for `FAN_REPORT_TARGET_FID`
-- **`CAP_SYS_ADMIN`** capability (run as root or with `cap_sys_admin+ep`)
-
-The crate compiles on any platform, but all runtime operations require a Linux
-kernel with `CONFIG_FANOTIFY` enabled.  Non-Linux platforms will fail at runtime
-with `FanotifyError::Init(ENOSYS)`.
-
-## License
-
-[MIT License](./LICENSE)
