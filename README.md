@@ -1,92 +1,32 @@
 # fanotify-fid
 
+Linux fanotify FID (File Identifier) mode event parser and file handle utilities.
+
 [![Crates.io](https://img.shields.io/crates/v/fanotify-fid.svg)](https://crates.io/crates/fanotify-fid)
 [![Docs.rs](https://docs.rs/fanotify-fid/badge.svg)](https://docs.rs/fanotify-fid)
 [![License: MIT](https://img.shields.io/badge/license-MIT-blue.svg)](LICENSE)
 [![CI](https://github.com/lenitain/fanotify-fid/actions/workflows/ci.yml/badge.svg)](https://github.com/lenitain/fanotify-fid/actions/workflows/ci.yml)
 
-Linux fanotify **FID (File Identifier) mode** event parser and file handle utilities.
+## Overview
 
-## Installation
+**fanotify-fid** is a comprehensive Rust library for Linux fanotify, supporting both fd-based and FID mode event parsing. It reads variable-length events correctly using each event's `event_len` field, parses file handles from info records, and resolves them to paths. The crate also provides safe wrappers for `name_to_handle_at()` and `open_by_handle_at()` syscalls needed to convert file handles back to paths.
 
-```bash
-cargo add fanotify-fid
+### Why fanotify-fid?
+
+Unlike basic fanotify wrappers that only handle fd-based events, **fanotify-fid** provides complete support for FID mode — the modern, variable-length event format that includes file handle information. This enables more efficient filesystem monitoring without needing to maintain separate file descriptors for each watched file. For system tools that need to track filesystem changes with minimal overhead, fanotify-fid offers the most complete and ergonomic Rust interface to Linux's fanotify subsystem.
+
+## Usage
+
+Add to your `Cargo.toml`:
+
+```toml
+[dependencies]
+fanotify-fid = "0.4.0"
 ```
 
-Minimum supported Rust version: **1.85** (edition 2024).
+### Quick start
 
-## Requirements
-
-- Linux kernel **≥ 5.1** for FID mode (`FAN_REPORT_FID`)
-- Linux kernel **≥ 5.15** for `FAN_REPORT_TARGET_FID`
-- **`CAP_SYS_ADMIN`** capability (run as root or with `cap_sys_admin+ep`)
-
-The crate compiles on any platform, but all runtime operations require a Linux
-kernel with `CONFIG_FANOTIFY` enabled.  Non-Linux platforms will fail at runtime
-with `FanotifyError::Init(ENOSYS)`.
-
-## Testing
-
-### Normal tests (no privileges needed)
-
-```bash
-cargo test
-```
-
-63 unit tests covering all parsing logic, builder flags, error formatting,
-cache resolution, and edge cases (empty buffers, truncated data, garbage
-input, etc.).  These run without `CAP_SYS_ADMIN`.
-
-### Integration tests (require root)
-
-7 additional tests verify end-to-end behavior against a real Linux kernel.
-Tests are organized by functionality in separate modules:
-
-```bash
-cargo test --test fid --test fd --test permission --test handle --no-run
-```
-
-```bash
-sudo -E ~/.cargo/bin/cargo test --test fid --test fd --test permission --test handle -- --ignored
-```
-
-Coverage:
-
-| Module | Tests | What it checks |
-|--------|-------|----------------|
-| `tests/fid.rs` | `test_fid_event_on_single_file` | FID init → mark file → modify → read event |
-| `tests/fd.rs` | `test_fd_event_lifecycle` | fd-based init → mark file → open → read event |
-| `tests/permission.rs` | `test_permission_event_response` | Permission event → `FAN_ALLOW` response → file access granted |
-| `tests/handle.rs` | `test_name_to_handle_at_real_path` | `name_to_handle_at` on `/tmp` |
-| `tests/handle.rs` | `test_open_by_handle_at_resolve` | `open_by_handle_at` (skips if FS doesn't support it) |
-| `tests/handle.rs` | `test_resolve_file_handle` | `resolve_file_handle` end-to-end (skips if unsupported) |
-| `tests/handle.rs` | `test_cache_recovers_deleted_path` | `HandleCache` recovery for deleted directories |
-
-Handle-dependent tests (`open_by_handle_at`, `resolve_file_handle`, cache)
-check for system support at runtime and skip gracefully if the filesystem
-doesn't support file handles (e.g., tmpfs, FUSE, containers without
-`CAP_DAC_READ_SEARCH`).
-
----
-
-## About this crate
-
-Linux fanotify has two event formats:
-
-| Mode | Init flags | Event size | Path resolution |
-|------|-----------|-----------|-----------------|
-| **fd-based** | default | Fixed (24 bytes) | Via `metadata.fd` |
-| **FID-based** | `FAN_REPORT_FID` / `FAN_REPORT_DIR_FID` / `FAN_REPORT_NAME` | Variable (each event may include extra info records) | Via `file_handle` → `open_by_handle_at()` |
-
-This crate covers both fd-based and FID mode: it reads variable-length events correctly (using each event's `event_len` field rather than fixed-size steps), parses file handles from info records, and resolves them to paths.
-
-It also provides safe wrappers for `name_to_handle_at()` and `open_by_handle_at()`, the syscalls needed to convert file handles back to paths.
-
----
-
-## Quick example
-
-```rust,no_run
+```rust
 use fanotify_fid::prelude::*;
 use std::os::fd::OwnedFd;
 
@@ -118,70 +58,25 @@ for ev in &events {
 }
 ```
 
-> **Note**: Alternatively, use the free functions [`fanotify_init`] and
-> [`read_fid_events`] directly if you prefer not to use the `Fanotify`
-> wrapper.
+## Building from Source
 
----
+Requires Rust toolchain (tested with `rustc 1.85.0`).
 
-## fd-based Event Reading
-
-For non-FID fanotify events, use the `FdReader` builder:
-
-```rust,no_run
-use fanotify_fid::FdReader;
-use std::os::fd::{FromRawFd, OwnedFd};
-
-# let fan_fd = unsafe { OwnedFd::from_raw_fd(3) };
-// Basic usage (default buffer: 200 events)
-let events = FdReader::new().read(&fan_fd).unwrap();
-
-// Custom buffer size
-let events = FdReader::new()
-    .event_count(500)
-    .read(&fan_fd)
-    .unwrap();
-
-// Callback mode
-FdReader::new()
-    .read_do(&fan_fd, |ev| {
-        println!("pid={} {:?}", ev.pid, ev.event_names());
-    })
-    .unwrap();
+```bash
+git clone https://github.com/lenitain/fanotify-fid.git
+cd fanotify-fid
+cargo build --release
 ```
 
-## Error handling
+### Requirements
 
-All operations return `Result<T, FanotifyError>`.  Each error variant carries the
-raw errno and a **concise diagnostic message** explaining the cause:
+- Linux kernel **≥ 5.1** for FID mode (`FAN_REPORT_FID`)
+- Linux kernel **≥ 5.15** for `FAN_REPORT_TARGET_FID`
+- **`CAP_SYS_ADMIN`** capability (run as root or with `cap_sys_admin+ep`)
 
-```rust,no_run
-use fanotify_fid::FanotifyError;
-
-let e = FanotifyError::Init(libc::EPERM);
-println!("{}", e);
-// Prints: fanotify_init failed (errno=1): Need CAP_SYS_ADMIN capability
-```
-
----
-
-## Design notes
-
-### io-uring
-
-io-uring (`IORING_OP_READ`) was evaluated as a replacement for
-`libc::read()` in the event reading path.  In theory it can eliminate the
-syscall overhead for fd reads.
-
-**Not used** because for a fanotify fd that is driven by epoll / tokio
-`AsyncFd`, the `read()` syscall returns immediately (~50–100 ns).  This is
-negligible next to the subsequent `open_by_handle_at()` calls (1–5 µs) and
-event parsing — well below the noise floor of the overall pipeline.
-
-If a future workload moves the bottleneck to the read path (e.g.
-sub‑microsecond event handlers with very high fanotify event rates),
-switching to io-uring would be straightforward — `read()` is the only
-syscall that needs replacement.
+The crate compiles on any platform, but all runtime operations require a Linux
+kernel with `CONFIG_FANOTIFY` enabled.  Non-Linux platforms will fail at runtime
+with `FanotifyError::Init(ENOSYS)`.
 
 ## License
 
