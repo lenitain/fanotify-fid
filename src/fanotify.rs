@@ -1,7 +1,7 @@
 //! High-level RAII fanotify file descriptor wrapper.
 
 use std::ffi::OsStr;
-use std::os::fd::{AsFd, BorrowedFd, OwnedFd};
+use std::os::fd::{AsFd, AsRawFd, BorrowedFd, OwnedFd};
 
 use crate::builder::FanotifyBuilder;
 use crate::consts;
@@ -61,6 +61,40 @@ impl Fanotify {
         path: &P,
     ) -> std::result::Result<(), FanotifyError> {
         fanotify_mark(&self.fd, flags, mask, consts::AT_FDCWD, path)
+    }
+
+    /// Add or remove a mark using a directory fd as anchor (TOCTOU-safe).
+    ///
+    /// Unlike [`mark`](Self::mark) which uses `AT_FDCWD`, this method uses the
+    /// provided `dir_fd` as the directory anchor for the path.  Combined with
+    /// `O_NOFOLLOW | O_DIRECTORY` when opening `dir_fd`, this eliminates
+    /// TOCTOU race conditions between path resolution and marking.
+    ///
+    /// # Example
+    ///
+    /// ```rust,no_run
+    /// use fanotify_fid::prelude::*;
+    /// use std::fs::OpenOptions;
+    /// use std::os::unix::fs::OpenOptionsExt;
+    /// use std::path::Path;
+    ///
+    /// let fan = Fanotify::new().report_fid().init().unwrap();
+    /// let dir_fd = OpenOptions::new()
+    ///     .read(true)
+    ///     .custom_flags(libc::O_DIRECTORY | libc::O_NOFOLLOW | libc::O_CLOEXEC)
+    ///     .open("/some/dir")
+    ///     .unwrap();
+    ///
+    /// fan.mark_at(&dir_fd, FAN_MARK_ADD, FAN_CREATE | FAN_DELETE, Path::new(".")).unwrap();
+    /// ```
+    pub fn mark_at(
+        &self,
+        dir_fd: &OwnedFd,
+        flags: u32,
+        mask: u64,
+        path: &std::path::Path,
+    ) -> std::result::Result<(), FanotifyError> {
+        fanotify_mark(&self.fd, flags, mask, dir_fd.as_raw_fd(), path)
     }
 
     /// Read and parse FID-format events from the fanotify file descriptor.
