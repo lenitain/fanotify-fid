@@ -21,7 +21,7 @@ Add to your `Cargo.toml`:
 
 ```toml
 [dependencies]
-fanotify-fid = "0.4.0"
+fanotify-fid = "0.4.1"
 ```
 
 ### Requirements
@@ -64,6 +64,7 @@ let mut buf = Vec::with_capacity(65536);
 let events = fan.read_events(&mount_fds, &mut buf, None).unwrap();
 
 for ev in &events {
-    println!("{:?} {:?}", ev.event_names(), ev.path);
+    let names: Vec<&str> = ev.event_names().collect();
+    println!("{:?} {:?}", names, ev.path);
 }
 ```

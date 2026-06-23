@@ -5,6 +5,32 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.4.1] - 2026-06-22
+
+### Added
+
+- **`mark_at()` method for TOCTOU-safe fd-based marking**: New method on `Fanotify` that
+  accepts a directory fd as anchor instead of using `AT_FDCWD`.
+  Combined with `O_NOFOLLOW | O_DIRECTORY` when opening the `dir_fd`,
+  this eliminates TOCTOU race conditions between path resolution and
+  `fanotify_mark()` calls.
+
+  ```rust
+  use fanotify_fid::prelude::*;
+  use std::fs::OpenOptions;
+  use std::os::unix::fs::OpenOptionsExt;
+  use std::path::Path;
+
+  let fan = Fanotify::new().report_fid().init().unwrap();
+  let dir_fd = OpenOptions::new()
+      .read(true)
+      .custom_flags(libc::O_DIRECTORY | libc::O_NOFOLLOW | libc::O_CLOEXEC)
+      .open("/some/dir")
+      .unwrap();
+
+  fan.mark_at(&dir_fd, FAN_MARK_ADD, FAN_CREATE | FAN_DELETE, Path::new(".")).unwrap();
+  ```
+
 ## [0.4.0] - 2026-06-14
 
 ### Breaking Changes

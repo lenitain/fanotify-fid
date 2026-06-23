@@ -89,12 +89,12 @@ impl Fanotify {
     /// ```
     pub fn mark_at(
         &self,
-        dir_fd: &OwnedFd,
+        dir_fd: &impl AsFd,
         flags: u32,
         mask: u64,
         path: &std::path::Path,
     ) -> std::result::Result<(), FanotifyError> {
-        fanotify_mark(&self.fd, flags, mask, dir_fd.as_raw_fd(), path)
+        fanotify_mark(&self.fd, flags, mask, dir_fd.as_fd().as_raw_fd(), path)
     }
 
     /// Read and parse FID-format events from the fanotify file descriptor.

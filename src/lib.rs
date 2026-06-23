@@ -12,7 +12,7 @@
 //!
 //! - Linux kernel **≥ 5.1** (FID mode), **≥ 5.15** (`FAN_REPORT_TARGET_FID`)
 //! - **`CAP_SYS_ADMIN`** capability (run as root)
-//! - Minimum Rust version: **1.75** (edition 2024)
+//! - Minimum Rust version: **1.85** (edition 2024)
 //!
 //! ## Error handling
 //!
