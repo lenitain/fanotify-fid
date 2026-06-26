@@ -88,7 +88,7 @@ pub fn open_mount<P: AsRef<OsStr> + ?Sized>(
 ) -> std::result::Result<OwnedFd, FanotifyError> {
     use std::os::unix::fs::OpenOptionsExt;
     let file = std::fs::OpenOptions::new()
-        .custom_flags(libc::O_PATH | libc::O_CLOEXEC)
+        .custom_flags(libc::O_DIRECTORY | libc::O_CLOEXEC)
         .read(true)
         .open(path.as_ref())
         .map_err(FanotifyError::Io)?;
