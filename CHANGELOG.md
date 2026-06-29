@@ -7,6 +7,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [0.5.0] - 2026-06-29
 
+### Fixed
+
+- **ZFS compatibility**: `open_mount()` now uses `O_DIRECTORY` instead of `O_PATH` to
+  resolve path resolution failures on ZFS file systems. ZFS's `open_by_handle_at`
+  implementation requires a directory file descriptor to correctly identify mount points.
+
 ### Changed
 
 - **Event struct fields are now private** ([C-STRUCT-PRIVATE](https://rust-lang.github.io/api-guidelines/interoperability.html#types-are-send-and-sync-where-possible-c-send-sync)):
