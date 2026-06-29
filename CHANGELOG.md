@@ -5,6 +5,39 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.5.0] - 2026-06-29
+
+### Changed
+
+- **Event struct fields are now private** ([C-STRUCT-PRIVATE](https://rust-lang.github.io/api-guidelines/interoperability.html#types-are-send-and-sync-where-possible-c-send-sync)):
+  - `FidEvent`: fields `mask`, `pid`, `path`, `dfid_name_handle`, `dfid_name_filename`, `self_handle` are now private
+  - `FdEvent`: fields `mask`, `fd`, `pid`, `path` are now private
+  - `FanotifyResponse`: fields `fd`, `response` are now private
+  - Added constructors: `FidEvent::new()`, `FdEvent::new()`, `FanotifyResponse::new()`
+  - Added getter methods for all fields
+
+### Migration Guide
+
+**Struct field access** (breaking):
+```rust
+// Before (0.4.x)
+let ev: FidEvent = ...;
+println!("pid={} path={}", ev.pid, ev.path.display());
+
+// After (0.5.0)
+let ev: FidEvent = ...;
+println!("pid={} path={}", ev.pid(), ev.path().display());
+```
+
+**Struct construction** (breaking):
+```rust
+// Before (0.4.x)
+let resp = FanotifyResponse { fd: 5, response: FAN_ALLOW };
+
+// After (0.5.0)
+let resp = FanotifyResponse::new(5, FAN_ALLOW);
+```
+
 ## [0.4.1] - 2026-06-22
 
 ### Added
