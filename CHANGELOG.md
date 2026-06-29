@@ -16,6 +16,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   - Added constructors: `FidEvent::new()`, `FdEvent::new()`, `FanotifyResponse::new()`
   - Added getter methods for all fields
 
+- **`FidEvent` implements `PartialEq` and `Eq`** ([C-COMMON-TRAITS](https://rust-lang.github.io/api-guidelines/interoperability.html#commonly-used-types-should-be-the-same-c-common-traits))
+
 ### Migration Guide
 
 **Struct field access** (breaking):
