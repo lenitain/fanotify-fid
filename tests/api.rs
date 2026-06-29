@@ -38,24 +38,16 @@ fn test_public_api_function_signatures() {
     fn _check_prelude() {
         let _ = Fanotify::new();
         let _ = FanotifyBuilder::default();
-        let _ = FidEvent {
-            mask: 0,
-            pid: 0,
-            path: PathBuf::new(),
-            dfid_name_handle: None,
-            dfid_name_filename: None,
-            self_handle: None,
-        };
-        let _ = FdEvent {
-            mask: 0,
-            fd: -1,
-            pid: 0,
-            path: PathBuf::new(),
-        };
-        let _ = FanotifyResponse {
-            fd: -1,
-            response: 0,
-        };
+        let _ = FidEvent::new(
+            0,
+            0,
+            PathBuf::new(),
+            None,
+            None,
+            None,
+        );
+        let _ = FdEvent::new(0, -1, 0, PathBuf::new());
+        let _ = FanotifyResponse::new(-1, 0);
     }
 
     _check_free_fns();

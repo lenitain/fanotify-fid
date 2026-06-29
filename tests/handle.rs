@@ -66,14 +66,14 @@ fn test_cache_recovers_deleted_path() {
     let mut cache = HashMap::new();
     cache.insert(h.clone(), r);
 
-    let mut evts = vec![FidEvent {
-        mask: FAN_DELETE_SELF,
-        pid: 1,
-        path: Path::new("").to_path_buf(),
-        dfid_name_handle: None,
-        dfid_name_filename: None,
-        self_handle: Some(h),
-    }];
+    let mut evts = vec![FidEvent::new(
+        FAN_DELETE_SELF,
+        1,
+        Path::new("").to_path_buf(),
+        None,
+        None,
+        Some(h),
+    )];
     resolve_with_cache(&mut evts, &cache);
-    assert!(!evts[0].path.as_os_str().is_empty());
+    assert!(!evts[0].path().as_os_str().is_empty());
 }

@@ -51,7 +51,7 @@
 //!
 //! for ev in &events {
 //!     let names: Vec<&str> = ev.event_names().collect();
-//!     println!("{:?} {:?}", names, ev.path);
+//!     println!("{:?} {:?}", names, ev.path());
 //! }
 //! ```
 

@@ -121,14 +121,14 @@ pub fn parse_fid_events(buf: &[u8], mount_fds: &[OwnedFd]) -> Vec<FidEvent> {
             info_off += info_len;
         }
 
-        events.push(FidEvent {
-            mask: meta.mask,
-            pid: meta.pid,
+        events.push(FidEvent::new(
+            meta.mask,
+            meta.pid,
             path,
             dfid_name_handle,
             dfid_name_filename,
             self_handle,
-        });
+        ));
 
         offset += event_len;
     }
@@ -172,28 +172,29 @@ pub fn resolve_with_cache(events: &mut [FidEvent], cache: &HandleCache) -> bool 
     let mut made_progress = false;
 
     for ev in events.iter_mut() {
-        if !ev.path.as_os_str().is_empty() {
+        if !ev.path().as_os_str().is_empty() {
             continue;
         }
 
         // Try DFID_NAME: parent directory handle → cached dir path + filename
-        if let (Some(key), Some(filename)) = (&ev.dfid_name_handle, &ev.dfid_name_filename)
+        if let (Some(key), Some(filename)) = (ev.dfid_name_handle(), ev.dfid_name_filename())
             && let Some(dir_path) = cache.get(key)
         {
-            ev.path = if filename.is_empty() {
+            let new_path = if filename.is_empty() {
                 dir_path.clone()
             } else {
                 dir_path.join(filename)
             };
+            ev.set_path(new_path);
             made_progress = true;
         }
 
         // Try self handle → cached path
-        if ev.path.as_os_str().is_empty()
-            && let Some(ref key) = ev.self_handle
+        if ev.path().as_os_str().is_empty()
+            && let Some(key) = ev.self_handle()
             && let Some(cached_path) = cache.get(key)
         {
-            ev.path = cached_path.clone();
+            ev.set_path(cached_path.clone());
             made_progress = true;
         }
     }
@@ -389,12 +390,12 @@ mod tests {
 
         let events = parse_fid_events(&buf, &[]);
         assert_eq!(events.len(), 1);
-        assert_eq!(events[0].mask, 0x0000_0100);
-        assert_eq!(events[0].pid, 1234);
-        assert!(events[0].path.as_os_str().is_empty()); // no mount_fds to resolve
-        assert!(events[0].dfid_name_handle.is_none());
-        assert!(events[0].dfid_name_filename.is_none());
-        assert!(events[0].self_handle.is_some());
+        assert_eq!(events[0].mask(), 0x0000_0100);
+        assert_eq!(events[0].pid(), 1234);
+        assert!(events[0].path().as_os_str().is_empty()); // no mount_fds to resolve
+        assert!(events[0].dfid_name_handle().is_none());
+        assert!(events[0].dfid_name_filename().is_none());
+        assert!(events[0].self_handle().is_some());
     }
 
     #[test]
@@ -407,12 +408,12 @@ mod tests {
 
         let events = parse_fid_events(&buf, &[]);
         assert_eq!(events.len(), 1);
-        assert_eq!(events[0].mask, 0x0000_0001);
-        assert_eq!(events[0].pid, 5678);
-        assert!(events[0].path.as_os_str().is_empty()); // no mount_fds
-        assert!(events[0].dfid_name_handle.is_some());
-        assert_eq!(events[0].dfid_name_filename.as_deref(), Some("hello.txt"));
-        assert!(events[0].self_handle.is_none());
+        assert_eq!(events[0].mask(), 0x0000_0001);
+        assert_eq!(events[0].pid(), 5678);
+        assert!(events[0].path().as_os_str().is_empty()); // no mount_fds
+        assert!(events[0].dfid_name_handle().is_some());
+        assert_eq!(events[0].dfid_name_filename(), Some("hello.txt"));
+        assert!(events[0].self_handle().is_none());
     }
 
     #[test]
@@ -430,10 +431,10 @@ mod tests {
 
         let events = parse_fid_events(&buf, &[]);
         assert_eq!(events.len(), 1);
-        assert_eq!(events[0].pid, 42);
-        assert!(events[0].self_handle.is_some());
-        assert!(events[0].dfid_name_handle.is_some());
-        assert_eq!(events[0].dfid_name_filename.as_deref(), Some("foo.txt"));
+        assert_eq!(events[0].pid(), 42);
+        assert!(events[0].self_handle().is_some());
+        assert!(events[0].dfid_name_handle().is_some());
+        assert_eq!(events[0].dfid_name_filename(), Some("foo.txt"));
     }
 
     #[test]
@@ -456,12 +457,12 @@ mod tests {
         let buf = [ev1, ev2].concat();
         let events = parse_fid_events(&buf, &[]);
         assert_eq!(events.len(), 2);
-        assert_eq!(events[0].pid, 10);
-        assert_eq!(events[0].mask, 0x0000_0002);
-        assert_eq!(events[0].dfid_name_filename.as_deref(), Some("a.txt"));
-        assert_eq!(events[1].pid, 20);
-        assert_eq!(events[1].mask, 0x0000_0008);
-        assert!(events[1].self_handle.is_some());
+        assert_eq!(events[0].pid(), 10);
+        assert_eq!(events[0].mask(), 0x0000_0002);
+        assert_eq!(events[0].dfid_name_filename(), Some("a.txt"));
+        assert_eq!(events[1].pid(), 20);
+        assert_eq!(events[1].mask(), 0x0000_0008);
+        assert!(events[1].self_handle().is_some());
     }
 
     #[test]
@@ -474,10 +475,10 @@ mod tests {
 
         let events = parse_fid_events(&buf, &[]);
         assert_eq!(events.len(), 1);
-        assert_eq!(events[0].mask, 0x0000_0004);
-        assert_eq!(events[0].pid, 333);
-        assert!(events[0].self_handle.is_some());
-        assert!(events[0].dfid_name_handle.is_none());
+        assert_eq!(events[0].mask(), 0x0000_0004);
+        assert_eq!(events[0].pid(), 333);
+        assert!(events[0].self_handle().is_some());
+        assert!(events[0].dfid_name_handle().is_none());
     }
 
     // ── Edge cases ──
@@ -521,8 +522,8 @@ mod tests {
         let events = parse_fid_events(&buf, &[]);
         assert_eq!(events.len(), 1);
         // The info record is skipped, so no handles extracted
-        assert!(events[0].self_handle.is_none());
-        assert!(events[0].dfid_name_handle.is_none());
+        assert!(events[0].self_handle().is_none());
+        assert!(events[0].dfid_name_handle().is_none());
     }
 
     #[test]
@@ -538,7 +539,7 @@ mod tests {
         let events = parse_fid_events(&buf, &[]);
         assert_eq!(events.len(), 1);
         // Info record skipped due to bounds check
-        assert!(events[0].self_handle.is_none());
+        assert!(events[0].self_handle().is_none());
     }
 
     #[test]
@@ -556,7 +557,7 @@ mod tests {
 
         let events = parse_fid_events(&buf, &[]);
         assert_eq!(events.len(), 1);
-        assert!(events[0].self_handle.is_none());
+        assert!(events[0].self_handle().is_none());
     }
 
     #[test]
@@ -569,7 +570,7 @@ mod tests {
 
         let events = parse_fid_events(&buf, &[]);
         assert_eq!(events.len(), 1);
-        assert_eq!(events[0].dfid_name_filename.as_deref(), Some(""));
+        assert_eq!(events[0].dfid_name_filename(), Some(""));
     }
 
     #[test]
@@ -582,7 +583,7 @@ mod tests {
 
         let events = parse_fid_events(&buf, &[]);
         assert_eq!(events.len(), 1);
-        assert_eq!(events[0].dfid_name_filename.as_deref(), Some("文件.txt"));
+        assert_eq!(events[0].dfid_name_filename(), Some("文件.txt"));
     }
 
     #[test]
@@ -596,7 +597,7 @@ mod tests {
 
         let events = parse_fid_events(&buf, &[]);
         assert_eq!(events.len(), 1);
-        assert_eq!(events[0].dfid_name_filename.as_deref(), Some(name.as_str()));
+        assert_eq!(events[0].dfid_name_filename(), Some(name.as_str()));
     }
 
     #[test]
@@ -617,7 +618,7 @@ mod tests {
         let events = parse_fid_events(&buf, &[]);
         assert_eq!(events.len(), 1);
         // The corrupt handle should be gracefully skipped
-        assert!(events[0].self_handle.is_none());
+        assert!(events[0].self_handle().is_none());
     }
 
     #[test]
@@ -650,114 +651,72 @@ mod tests {
         // Only the last self_handle is kept (FID takes priority)
         // Actually, DFID overwrites self_handle because match checks FID then DFID
         // Both have handle payloads, so self_handle should be set
-        assert!(events[0].self_handle.is_some());
+        assert!(events[0].self_handle().is_some());
     }
 
     // ── Tests for resolve_with_cache ──
 
     #[test]
     fn test_resolve_with_cache_noop_when_all_resolved() {
-        let mut events = vec![FidEvent {
-            mask: 0,
-            pid: 0,
-            path: "/tmp/foo".into(),
-            dfid_name_handle: None,
-            dfid_name_filename: None,
-            self_handle: None,
-        }];
+        let mut events = vec![FidEvent::new(0, 0, "/tmp/foo".into(), None, None, None)];
         let cache = HashMap::new();
         assert!(!resolve_with_cache(&mut events, &cache));
-        assert_eq!(events[0].path.to_str(), Some("/tmp/foo"));
+        assert_eq!(events[0].path().to_str(), Some("/tmp/foo"));
     }
 
     #[test]
     fn test_resolve_with_cache_dfid_name() {
         let dir_handle = HandleKey::from(b"dir_handle" as &[u8]);
-        let mut events = vec![FidEvent {
-            mask: 0,
-            pid: 0,
-            path: PathBuf::new(),
-            dfid_name_handle: Some(dir_handle.clone()),
-            dfid_name_filename: Some("bar.txt".into()),
-            self_handle: None,
-        }];
+        let mut events = vec![FidEvent::new(0, 0, PathBuf::new(), Some(dir_handle.clone()), Some("bar.txt".into()), None)];
         let mut cache = HashMap::new();
         cache.insert(dir_handle, "/tmp/mydir".into());
 
         assert!(resolve_with_cache(&mut events, &cache));
-        assert_eq!(events[0].path.to_str(), Some("/tmp/mydir/bar.txt"));
+        assert_eq!(events[0].path().to_str(), Some("/tmp/mydir/bar.txt"));
     }
 
     #[test]
     fn test_resolve_with_cache_dfid_name_empty_filename() {
         let dir_handle = HandleKey::from(b"dir_handle" as &[u8]);
-        let mut events = vec![FidEvent {
-            mask: 0,
-            pid: 0,
-            path: PathBuf::new(),
-            dfid_name_handle: Some(dir_handle.clone()),
-            dfid_name_filename: Some(String::new()),
-            self_handle: None,
-        }];
+        let mut events = vec![FidEvent::new(0, 0, PathBuf::new(), Some(dir_handle.clone()), Some(String::new()), None)];
         let mut cache = HashMap::new();
         cache.insert(dir_handle, "/tmp/mydir".into());
 
         assert!(resolve_with_cache(&mut events, &cache));
-        assert_eq!(events[0].path.to_str(), Some("/tmp/mydir"));
+        assert_eq!(events[0].path().to_str(), Some("/tmp/mydir"));
     }
 
     #[test]
     fn test_resolve_with_cache_self_handle() {
         let handle = HandleKey::from(b"self_key" as &[u8]);
-        let mut events = vec![FidEvent {
-            mask: 0,
-            pid: 0,
-            path: PathBuf::new(),
-            dfid_name_handle: None,
-            dfid_name_filename: None,
-            self_handle: Some(handle.clone()),
-        }];
+        let mut events = vec![FidEvent::new(0, 0, PathBuf::new(), None, None, Some(handle.clone()))];
         let mut cache = HashMap::new();
         cache.insert(handle, "/cached/path.txt".into());
 
         assert!(resolve_with_cache(&mut events, &cache));
-        assert_eq!(events[0].path.to_str(), Some("/cached/path.txt"));
+        assert_eq!(events[0].path().to_str(), Some("/cached/path.txt"));
     }
 
     #[test]
     fn test_resolve_with_cache_no_match() {
         let handle = HandleKey::from(b"unknown" as &[u8]);
-        let mut events = vec![FidEvent {
-            mask: 0,
-            pid: 0,
-            path: PathBuf::new(),
-            dfid_name_handle: Some(handle),
-            dfid_name_filename: Some("x.txt".into()),
-            self_handle: None,
-        }];
+        let mut events = vec![FidEvent::new(0, 0, PathBuf::new(), Some(handle), Some("x.txt".into()), None)];
         let cache = HashMap::new(); // empty cache
         assert!(!resolve_with_cache(&mut events, &cache));
-        assert!(events[0].path.as_os_str().is_empty());
+        assert!(events[0].path().as_os_str().is_empty());
     }
 
     #[test]
     fn test_resolve_with_cache_prefers_dfid_name_over_self() {
         let dir_handle = HandleKey::from(b"dir" as &[u8]);
         let self_handle = HandleKey::from(b"self" as &[u8]);
-        let mut events = vec![FidEvent {
-            mask: 0,
-            pid: 0,
-            path: PathBuf::new(),
-            dfid_name_handle: Some(dir_handle.clone()),
-            dfid_name_filename: Some("name.txt".into()),
-            self_handle: Some(self_handle),
-        }];
+        let mut events = vec![FidEvent::new(0, 0, PathBuf::new(), Some(dir_handle.clone()), Some("name.txt".into()), Some(self_handle))];
         let mut cache = HashMap::new();
         cache.insert(dir_handle, "/dirpath".into());
 
         assert!(resolve_with_cache(&mut events, &cache));
         // Should use DFID_NAME (dir + filename) rather than just self handle
-        assert_eq!(events[0].path.to_str(), Some("/dirpath/name.txt"));
+        assert_eq!(events[0].path().to_str(), Some("/dirpath/name.txt"));
     }
 
     // ── Integration: multiple events + resolve_with_cache ──
@@ -767,49 +726,28 @@ mod tests {
         let dh1 = HandleKey::from(b"dir1" as &[u8]);
         let dh2 = HandleKey::from(b"dir2" as &[u8]);
         let mut events = vec![
-            FidEvent {
-                mask: 0,
-                pid: 1,
-                path: PathBuf::new(),
-                dfid_name_handle: Some(dh1.clone()),
-                dfid_name_filename: Some("a.txt".into()),
-                self_handle: None,
-            },
-            FidEvent {
-                mask: 0,
-                pid: 2,
-                path: PathBuf::new(),
-                dfid_name_handle: Some(dh2.clone()),
-                dfid_name_filename: Some("b.txt".into()),
-                self_handle: None,
-            },
+            FidEvent::new(0, 1, PathBuf::new(), Some(dh1.clone()), Some("a.txt".into()), None),
+            FidEvent::new(0, 2, PathBuf::new(), Some(dh2.clone()), Some("b.txt".into()), None),
         ];
         let mut cache = HashMap::new();
         cache.insert(dh1, "/dir1".into());
         cache.insert(dh2, "/dir2".into());
 
         assert!(resolve_with_cache(&mut events, &cache));
-        assert_eq!(events[0].path.to_str(), Some("/dir1/a.txt"));
-        assert_eq!(events[1].path.to_str(), Some("/dir2/b.txt"));
+        assert_eq!(events[0].path().to_str(), Some("/dir1/a.txt"));
+        assert_eq!(events[1].path().to_str(), Some("/dir2/b.txt"));
     }
 
     #[test]
     fn test_resolve_with_cache_does_not_overwrite_existing() {
         let dh = HandleKey::from(b"dir" as &[u8]);
-        let mut events = vec![FidEvent {
-            mask: 0,
-            pid: 0,
-            path: "/existing/path".into(),
-            dfid_name_handle: Some(dh.clone()),
-            dfid_name_filename: Some("new.txt".into()),
-            self_handle: None,
-        }];
+        let mut events = vec![FidEvent::new(0, 0, "/existing/path".into(), Some(dh.clone()), Some("new.txt".into()), None)];
         let mut cache = HashMap::new();
         cache.insert(dh, "/cached/dir".into());
 
         // Already has a path, should NOT be overwritten
         assert!(!resolve_with_cache(&mut events, &cache));
-        assert_eq!(events[0].path.to_str(), Some("/existing/path"));
+        assert_eq!(events[0].path().to_str(), Some("/existing/path"));
     }
 
     // ── Tests for consts ──

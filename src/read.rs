@@ -65,7 +65,7 @@ use crate::types::{FanotifyResponse, FdEvent, FidEvent, HandleCache};
 /// let events = read_fid_events(&fan_fd, &mount_fds, &mut buf, None).unwrap();
 /// for ev in &events {
 ///     let names: Vec<&str> = ev.event_names().collect();
-///     println!("pid={} {:?} {}", ev.pid, names, ev.path.display());
+///     println!("pid={} {:?} {}", ev.pid(), names, ev.path().display());
 /// }
 /// ```
 pub fn read_fid_events(
@@ -111,18 +111,18 @@ pub fn read_fid_events(
         for _ in 0..10 {
             // Update cache from successfully-resolved events
             for ev in events.iter() {
-                if ev.path.as_os_str().is_empty() {
+                if ev.path().as_os_str().is_empty() {
                     continue;
                 }
-                if let Some(ref key) = ev.self_handle {
-                    cache.entry(key.clone()).or_insert_with(|| ev.path.clone());
+                if let Some(key) = ev.self_handle() {
+                    cache.entry(key.clone()).or_insert_with(|| ev.path().to_path_buf());
                 }
-                if let (Some(key), Some(filename)) = (&ev.dfid_name_handle, &ev.dfid_name_filename)
+                if let (Some(key), Some(filename)) = (ev.dfid_name_handle(), ev.dfid_name_filename())
                 {
                     let dir_path = if !filename.is_empty() {
-                        ev.path.parent().map(|p| p.to_path_buf())
+                        ev.path().parent().map(|p| p.to_path_buf())
                     } else {
-                        Some(ev.path.clone())
+                        Some(ev.path().to_path_buf())
                     };
                     if let Some(dp) = dir_path {
                         cache.entry(key.clone()).or_insert(dp);
@@ -242,12 +242,12 @@ impl FdReader {
                 PathBuf::new()
             };
 
-            events.push(FdEvent {
-                mask: meta.mask,
-                fd: meta.fd,
-                pid: meta.pid,
+            events.push(FdEvent::new(
+                meta.mask,
+                meta.fd,
+                meta.pid,
                 path,
-            });
+            ));
 
             offset += event_len;
         }
@@ -302,7 +302,7 @@ impl Default for FdReader {
 /// use std::os::fd::{FromRawFd, OwnedFd};
 ///
 /// let fan_fd = unsafe { OwnedFd::from_raw_fd(3) };
-/// let resp = FanotifyResponse { fd: 5, response: 0x01 }; // FAN_ALLOW
+/// let resp = FanotifyResponse::new(5, 0x01); // FAN_ALLOW
 /// write_response(&fan_fd, &resp).unwrap();
 /// ```
 pub fn write_response(fan_fd: &OwnedFd, response: &FanotifyResponse) -> Result<(), FanotifyError> {
@@ -310,8 +310,8 @@ pub fn write_response(fan_fd: &OwnedFd, response: &FanotifyResponse) -> Result<(
 
     // SAFETY: fanotify_response is a plain-old-data struct.
     let resp = libc::fanotify_response {
-        fd: response.fd,
-        response: response.response,
+        fd: response.fd(),
+        response: response.response(),
     };
 
     let ret = unsafe {
@@ -424,23 +424,13 @@ mod tests {
 
     #[test]
     fn test_fd_overflow_flag() {
-        let ev = FdEvent {
-            mask: crate::consts::FAN_Q_OVERFLOW,
-            fd: -1,
-            pid: 0,
-            path: PathBuf::new(),
-        };
+        let ev = FdEvent::new(crate::consts::FAN_Q_OVERFLOW, -1, 0, PathBuf::new());
         assert!(ev.is_overflow());
     }
 
     #[test]
     fn test_fd_event_names() {
-        let ev = FdEvent {
-            mask: crate::consts::FAN_CREATE | crate::consts::FAN_MODIFY,
-            fd: -1,
-            pid: 0,
-            path: PathBuf::new(),
-        };
+        let ev = FdEvent::new(crate::consts::FAN_CREATE | crate::consts::FAN_MODIFY, -1, 0, PathBuf::new());
         let names: Vec<&str> = ev.event_names().collect();
         assert_eq!(names, vec!["MODIFY", "CREATE"]);
     }
@@ -449,12 +439,12 @@ mod tests {
     fn test_fd_drop_closes_fd() {
         // We can't easily test real fd close without opening a real fd,
         // but we can verify the Drop impl doesn't crash on invalid fd.
-        let ev = FdEvent {
-            mask: 0,
-            fd: -1, // FAN_NOFD — should be safely ignored by Drop
-            pid: 0,
-            path: PathBuf::new(),
-        };
+        let ev = FdEvent::new(
+            0,
+            -1, // FAN_NOFD — should be safely ignored by Drop
+            0,
+            PathBuf::new(),
+        );
         drop(ev); // should not panic or crash
     }
 

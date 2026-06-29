@@ -2,7 +2,7 @@
 
 use std::collections::HashMap;
 use std::mem;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 
 // ── Internal size constants ──
 
@@ -94,39 +94,77 @@ pub type HandleCache = HashMap<HandleKey, PathBuf>;
 /// the raw handle keys from the event's info records.
 #[derive(Debug, Clone)]
 pub struct FidEvent {
-    /// Event mask (one or more of `FAN_CREATE`, `FAN_MODIFY`, etc.).
-    pub mask: u64,
-    /// PID of the process that triggered the event.
-    pub pid: i32,
-    /// Resolved absolute path.
-    ///
-    /// This is best-effort: it may be empty if the file or its parent directory
-    /// was deleted before the path could be resolved.  Use a persistent cache
-    /// (see [`parse::resolve_with_cache`](crate::parse::resolve_with_cache)) to
-    /// recover paths in a later read cycle.
-    pub path: PathBuf,
-    /// If the event includes a `DFID_NAME` info record: the parent directory's
-    /// handle key.  Useful for caching directory → path mappings.
-    pub dfid_name_handle: Option<HandleKey>,
-    /// If the event includes a `DFID_NAME` info record: the filename within
-    /// the parent directory.
-    pub dfid_name_filename: Option<String>,
-    /// If the event includes a `FID` or `DFID` info record: the object's own
-    /// handle key.  Useful for caching the object's path for future lookups.
-    pub self_handle: Option<HandleKey>,
+    mask: u64,
+    pid: i32,
+    path: PathBuf,
+    dfid_name_handle: Option<HandleKey>,
+    dfid_name_filename: Option<String>,
+    self_handle: Option<HandleKey>,
 }
 
 impl FidEvent {
+    /// Create a new `FidEvent`.
+    pub fn new(
+        mask: u64,
+        pid: i32,
+        path: PathBuf,
+        dfid_name_handle: Option<HandleKey>,
+        dfid_name_filename: Option<String>,
+        self_handle: Option<HandleKey>,
+    ) -> Self {
+        Self {
+            mask,
+            pid,
+            path,
+            dfid_name_handle,
+            dfid_name_filename,
+            self_handle,
+        }
+    }
+
+    /// Event mask (one or more of `FAN_CREATE`, `FAN_MODIFY`, etc.).
+    pub fn mask(&self) -> u64 {
+        self.mask
+    }
+
+    /// PID of the process that triggered the event.
+    pub fn pid(&self) -> i32 {
+        self.pid
+    }
+
+    /// Resolved absolute path.
+    pub fn path(&self) -> &Path {
+        &self.path
+    }
+
+    /// Parent directory's handle key (from `DFID_NAME` info record).
+    pub fn dfid_name_handle(&self) -> Option<&HandleKey> {
+        self.dfid_name_handle.as_ref()
+    }
+
+    /// Filename within the parent directory (from `DFID_NAME` info record).
+    pub fn dfid_name_filename(&self) -> Option<&str> {
+        self.dfid_name_filename.as_deref()
+    }
+
+    /// Object's own handle key (from `FID` or `DFID` info record).
+    pub fn self_handle(&self) -> Option<&HandleKey> {
+        self.self_handle.as_ref()
+    }
+
     /// Returns `true` if this event indicates a queue overflow.
     pub fn is_overflow(&self) -> bool {
         self.mask & crate::consts::FAN_Q_OVERFLOW != 0
     }
 
     /// Human-readable event names from the mask (e.g. `["CREATE", "MODIFY"]`).
-    ///
-    /// Returns an iterator. Call `.collect()` if you need a `Vec`.
     pub fn event_names(&self) -> impl Iterator<Item = &'static str> {
         crate::consts::mask_to_event_names(self.mask)
+    }
+
+    /// Set the resolved path.
+    pub fn set_path(&mut self, path: PathBuf) {
+        self.path = path;
     }
 }
 
@@ -140,17 +178,10 @@ impl FidEvent {
 /// obtain a copy.
 #[derive(Debug)]
 pub struct FdEvent {
-    /// Event mask (one or more of `FAN_ACCESS`, `FAN_MODIFY`, etc.).
-    pub mask: u64,
-    /// Open file descriptor for the object being accessed.
-    /// Automatically closed on drop.
-    pub fd: i32,
-    /// PID of the process that triggered the event.
-    pub pid: i32,
-    /// Resolved path (via `readlink("/proc/self/fd/N")`).
-    ///
-    /// This is best-effort; may be empty if resolution fails.
-    pub path: PathBuf,
+    mask: u64,
+    fd: i32,
+    pid: i32,
+    path: PathBuf,
 }
 
 impl Drop for FdEvent {
@@ -164,14 +195,40 @@ impl Drop for FdEvent {
 }
 
 impl FdEvent {
+    /// Create a new `FdEvent`.
+    ///
+    /// The `fd` will be closed when this event is dropped.
+    pub fn new(mask: u64, fd: i32, pid: i32, path: PathBuf) -> Self {
+        Self { mask, fd, pid, path }
+    }
+
+    /// Event mask (one or more of `FAN_ACCESS`, `FAN_MODIFY`, etc.).
+    pub fn mask(&self) -> u64 {
+        self.mask
+    }
+
+    /// Open file descriptor for the object being accessed.
+    /// Automatically closed on drop.
+    pub fn fd(&self) -> i32 {
+        self.fd
+    }
+
+    /// PID of the process that triggered the event.
+    pub fn pid(&self) -> i32 {
+        self.pid
+    }
+
+    /// Resolved path (via `readlink("/proc/self/fd/N")`).
+    pub fn path(&self) -> &Path {
+        &self.path
+    }
+
     /// Returns `true` if this event indicates a queue overflow.
     pub fn is_overflow(&self) -> bool {
         self.mask & crate::consts::FAN_Q_OVERFLOW != 0
     }
 
     /// Human-readable event names from the mask.
-    ///
-    /// Returns an iterator. Call `.collect()` if you need a `Vec`.
     pub fn event_names(&self) -> impl Iterator<Item = &'static str> {
         crate::consts::mask_to_event_names(self.mask)
     }
@@ -187,9 +244,26 @@ impl FdEvent {
 /// [`FdEvent`] that triggered the permission check.
 #[derive(Debug, Clone)]
 pub struct FanotifyResponse {
-    /// The file descriptor from the `FdEvent` that triggered the
-    /// permission check.
-    pub fd: i32,
+    fd: i32,
+    response: u32,
+}
+
+impl FanotifyResponse {
+    /// Create a new `FanotifyResponse`.
+    ///
+    /// - `fd`: The file descriptor from the `FdEvent` that triggered the permission check.
+    /// - `response`: `FAN_ALLOW` to grant, `FAN_DENY` to deny.
+    pub fn new(fd: i32, response: u32) -> Self {
+        Self { fd, response }
+    }
+
+    /// The file descriptor from the `FdEvent` that triggered the permission check.
+    pub fn fd(&self) -> i32 {
+        self.fd
+    }
+
     /// `FAN_ALLOW` to grant, `FAN_DENY` to deny.
-    pub response: u32,
+    pub fn response(&self) -> u32 {
+        self.response
+    }
 }

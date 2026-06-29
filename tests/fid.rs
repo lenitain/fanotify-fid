@@ -35,5 +35,5 @@ fn test_fid_event_on_single_file() {
     )
     .expect("MODIFY event within 2s");
 
-    assert!(evts.iter().any(|e| e.mask & FAN_MODIFY != 0));
+    assert!(evts.iter().any(|e| e.mask() & FAN_MODIFY != 0));
 }
