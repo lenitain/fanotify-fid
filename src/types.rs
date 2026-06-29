@@ -92,7 +92,7 @@ pub type HandleCache = HashMap<HandleKey, PathBuf>;
 ///
 /// Contains the event mask, PID, the best-effort resolved path, and optionally
 /// the raw handle keys from the event's info records.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct FidEvent {
     mask: u64,
     pid: i32,
