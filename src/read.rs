@@ -115,9 +115,12 @@ pub fn read_fid_events(
                     continue;
                 }
                 if let Some(key) = ev.self_handle() {
-                    cache.entry(key.clone()).or_insert_with(|| ev.path().to_path_buf());
+                    cache
+                        .entry(key.clone())
+                        .or_insert_with(|| ev.path().to_path_buf());
                 }
-                if let (Some(key), Some(filename)) = (ev.dfid_name_handle(), ev.dfid_name_filename())
+                if let (Some(key), Some(filename)) =
+                    (ev.dfid_name_handle(), ev.dfid_name_filename())
                 {
                     let dir_path = if !filename.is_empty() {
                         ev.path().parent().map(|p| p.to_path_buf())
@@ -242,12 +245,7 @@ impl FdReader {
                 PathBuf::new()
             };
 
-            events.push(FdEvent::new(
-                meta.mask,
-                meta.fd,
-                meta.pid,
-                path,
-            ));
+            events.push(FdEvent::new(meta.mask, meta.fd, meta.pid, path));
 
             offset += event_len;
         }
@@ -430,7 +428,12 @@ mod tests {
 
     #[test]
     fn test_fd_event_names() {
-        let ev = FdEvent::new(crate::consts::FAN_CREATE | crate::consts::FAN_MODIFY, -1, 0, PathBuf::new());
+        let ev = FdEvent::new(
+            crate::consts::FAN_CREATE | crate::consts::FAN_MODIFY,
+            -1,
+            0,
+            PathBuf::new(),
+        );
         let names: Vec<&str> = ev.event_names().collect();
         assert_eq!(names, vec!["MODIFY", "CREATE"]);
     }

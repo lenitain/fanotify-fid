@@ -20,14 +20,7 @@ fn test_fid_event_methods() {
 
 #[test]
 fn test_fid_event_overflow() {
-    let ev = FidEvent::new(
-        FAN_Q_OVERFLOW,
-        0,
-        PathBuf::new(),
-        None,
-        None,
-        None,
-    );
+    let ev = FidEvent::new(FAN_Q_OVERFLOW, 0, PathBuf::new(), None, None, None);
     assert!(ev.is_overflow());
 }
 
@@ -40,12 +33,7 @@ fn test_fd_event_auto_close_fd() {
 
 #[test]
 fn test_fd_event_methods() {
-    let ev = FdEvent::new(
-        FAN_CREATE | FAN_MODIFY,
-        -1,
-        0,
-        PathBuf::new(),
-    );
+    let ev = FdEvent::new(FAN_CREATE | FAN_MODIFY, -1, 0, PathBuf::new());
     assert!(!ev.is_overflow());
     let names: Vec<&str> = ev.event_names().collect();
     assert_eq!(names, vec!["MODIFY", "CREATE"]);

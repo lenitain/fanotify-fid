@@ -199,7 +199,12 @@ impl FdEvent {
     ///
     /// The `fd` will be closed when this event is dropped.
     pub fn new(mask: u64, fd: i32, pid: i32, path: PathBuf) -> Self {
-        Self { mask, fd, pid, path }
+        Self {
+            mask,
+            fd,
+            pid,
+            path,
+        }
     }
 
     /// Event mask (one or more of `FAN_ACCESS`, `FAN_MODIFY`, etc.).

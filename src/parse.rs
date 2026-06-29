@@ -667,7 +667,14 @@ mod tests {
     #[test]
     fn test_resolve_with_cache_dfid_name() {
         let dir_handle = HandleKey::from(b"dir_handle" as &[u8]);
-        let mut events = vec![FidEvent::new(0, 0, PathBuf::new(), Some(dir_handle.clone()), Some("bar.txt".into()), None)];
+        let mut events = vec![FidEvent::new(
+            0,
+            0,
+            PathBuf::new(),
+            Some(dir_handle.clone()),
+            Some("bar.txt".into()),
+            None,
+        )];
         let mut cache = HashMap::new();
         cache.insert(dir_handle, "/tmp/mydir".into());
 
@@ -678,7 +685,14 @@ mod tests {
     #[test]
     fn test_resolve_with_cache_dfid_name_empty_filename() {
         let dir_handle = HandleKey::from(b"dir_handle" as &[u8]);
-        let mut events = vec![FidEvent::new(0, 0, PathBuf::new(), Some(dir_handle.clone()), Some(String::new()), None)];
+        let mut events = vec![FidEvent::new(
+            0,
+            0,
+            PathBuf::new(),
+            Some(dir_handle.clone()),
+            Some(String::new()),
+            None,
+        )];
         let mut cache = HashMap::new();
         cache.insert(dir_handle, "/tmp/mydir".into());
 
@@ -689,7 +703,14 @@ mod tests {
     #[test]
     fn test_resolve_with_cache_self_handle() {
         let handle = HandleKey::from(b"self_key" as &[u8]);
-        let mut events = vec![FidEvent::new(0, 0, PathBuf::new(), None, None, Some(handle.clone()))];
+        let mut events = vec![FidEvent::new(
+            0,
+            0,
+            PathBuf::new(),
+            None,
+            None,
+            Some(handle.clone()),
+        )];
         let mut cache = HashMap::new();
         cache.insert(handle, "/cached/path.txt".into());
 
@@ -700,7 +721,14 @@ mod tests {
     #[test]
     fn test_resolve_with_cache_no_match() {
         let handle = HandleKey::from(b"unknown" as &[u8]);
-        let mut events = vec![FidEvent::new(0, 0, PathBuf::new(), Some(handle), Some("x.txt".into()), None)];
+        let mut events = vec![FidEvent::new(
+            0,
+            0,
+            PathBuf::new(),
+            Some(handle),
+            Some("x.txt".into()),
+            None,
+        )];
         let cache = HashMap::new(); // empty cache
         assert!(!resolve_with_cache(&mut events, &cache));
         assert!(events[0].path().as_os_str().is_empty());
@@ -710,7 +738,14 @@ mod tests {
     fn test_resolve_with_cache_prefers_dfid_name_over_self() {
         let dir_handle = HandleKey::from(b"dir" as &[u8]);
         let self_handle = HandleKey::from(b"self" as &[u8]);
-        let mut events = vec![FidEvent::new(0, 0, PathBuf::new(), Some(dir_handle.clone()), Some("name.txt".into()), Some(self_handle))];
+        let mut events = vec![FidEvent::new(
+            0,
+            0,
+            PathBuf::new(),
+            Some(dir_handle.clone()),
+            Some("name.txt".into()),
+            Some(self_handle),
+        )];
         let mut cache = HashMap::new();
         cache.insert(dir_handle, "/dirpath".into());
 
@@ -726,8 +761,22 @@ mod tests {
         let dh1 = HandleKey::from(b"dir1" as &[u8]);
         let dh2 = HandleKey::from(b"dir2" as &[u8]);
         let mut events = vec![
-            FidEvent::new(0, 1, PathBuf::new(), Some(dh1.clone()), Some("a.txt".into()), None),
-            FidEvent::new(0, 2, PathBuf::new(), Some(dh2.clone()), Some("b.txt".into()), None),
+            FidEvent::new(
+                0,
+                1,
+                PathBuf::new(),
+                Some(dh1.clone()),
+                Some("a.txt".into()),
+                None,
+            ),
+            FidEvent::new(
+                0,
+                2,
+                PathBuf::new(),
+                Some(dh2.clone()),
+                Some("b.txt".into()),
+                None,
+            ),
         ];
         let mut cache = HashMap::new();
         cache.insert(dh1, "/dir1".into());
@@ -741,7 +790,14 @@ mod tests {
     #[test]
     fn test_resolve_with_cache_does_not_overwrite_existing() {
         let dh = HandleKey::from(b"dir" as &[u8]);
-        let mut events = vec![FidEvent::new(0, 0, "/existing/path".into(), Some(dh.clone()), Some("new.txt".into()), None)];
+        let mut events = vec![FidEvent::new(
+            0,
+            0,
+            "/existing/path".into(),
+            Some(dh.clone()),
+            Some("new.txt".into()),
+            None,
+        )];
         let mut cache = HashMap::new();
         cache.insert(dh, "/cached/dir".into());
 
