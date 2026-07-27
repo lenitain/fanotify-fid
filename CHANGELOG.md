@@ -5,6 +5,45 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.6.0] - 2026-07-27
+
+### Breaking Changes
+
+- **`FdEvent` fd field changed from `i32` to `Option<OwnedFd>`**: Constructing an `FdEvent`
+  now requires transferring ownership of the file descriptor. Pass `None` for overflow events
+  (where `mask` contains `FAN_Q_OVERFLOW`).
+- **`FdEvent::fd()` returns `Option<BorrowedFd<'_>>` instead of `i32`**: The returned
+  `BorrowedFd` is lifetime-bound to the event, preventing use-after-close.
+- **Added `FdEvent::into_fd()`**: Consumes the event and returns `Option<OwnedFd>`,
+  transferring fd ownership to the caller.
+- **Removed `impl Drop for FdEvent`**: `OwnedFd` handles closing automatically.
+- **`FanotifyResponse` now has a lifetime parameter**: `FanotifyResponse<'a>` ties the
+  response's lifetime to the event's file descriptor via `BorrowedFd<'a>`, preventing
+  use-after-close bugs at compile time.
+- **`FanotifyResponse::new()` takes `BorrowedFd<'a>` instead of `i32`**.
+- **`FanotifyResponse::fd()` returns `BorrowedFd<'a>` instead of `i32`**.
+- **Removed `Clone` from `FanotifyResponse`**: `BorrowedFd` is not cloneable, and responses
+  are consumed by `write_response` anyway.
+- **`write_response()` and `Fanotify::send_response()` now take `&FanotifyResponse<'_>`**.
+
+### Migration Guide
+
+```rust
+// BEFORE (0.5.x)
+let ev = FdEvent::new(mask, raw_fd, pid, path);
+let fd = ev.fd(); // i32
+let resp = FanotifyResponse::new(fd, FAN_ALLOW);
+
+// AFTER (0.6.0)
+let ev = FdEvent::new(mask, Some(owned_fd), pid, path);
+let fd = ev.fd(); // Option<BorrowedFd<'_>>
+let resp = FanotifyResponse::new(fd.unwrap(), FAN_ALLOW);
+
+// For overflow events:
+let ev = FdEvent::new(FAN_Q_OVERFLOW, None, 0, PathBuf::new());
+assert!(ev.fd().is_none());
+```
+
 ## [0.5.0] - 2026-06-29
 
 ### Fixed

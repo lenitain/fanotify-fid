@@ -28,5 +28,5 @@ fn test_fd_event_lifecycle() {
     .expect("OPEN event within 2s");
 
     assert!(evts[0].mask() & FAN_OPEN != 0);
-    assert!(evts[0].fd() >= 0);
+    assert!(evts[0].fd().is_some());
 }

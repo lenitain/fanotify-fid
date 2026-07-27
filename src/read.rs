@@ -3,7 +3,7 @@
 //! Combines `read` from a fanotify file descriptor with FID event parsing
 //! and optional cache-based path recovery.
 
-use std::os::fd::OwnedFd;
+use std::os::fd::{FromRawFd, OwnedFd};
 use std::path::PathBuf;
 
 use crate::FanotifyError;
@@ -239,13 +239,19 @@ impl FdReader {
                 break;
             }
 
-            let path = if meta.fd >= 0 {
-                std::fs::read_link(format!("/proc/self/fd/{}", meta.fd)).unwrap_or_default()
+            let fd: Option<OwnedFd> = if meta.fd >= 0 {
+                Some(unsafe { OwnedFd::from_raw_fd(meta.fd) })
             } else {
-                PathBuf::new()
+                None
             };
 
-            events.push(FdEvent::new(meta.mask, meta.fd, meta.pid, path));
+            let path = match &fd {
+                Some(fd) => std::fs::read_link(format!("/proc/self/fd/{}", fd.as_raw_fd()))
+                    .unwrap_or_default(),
+                None => PathBuf::new(),
+            };
+
+            events.push(FdEvent::new(meta.mask, fd, meta.pid, path));
 
             offset += event_len;
         }
@@ -285,7 +291,7 @@ impl Default for FdReader {
 /// `FAN_ACCESS_PERM`, or `FAN_OPEN_EXEC_PERM`) to grant or deny the
 /// operation.
 ///
-/// The `response.fd` should be copied from the [`FdEvent`] that
+/// The `response.fd` should be borrowed from the [`FdEvent`] that
 /// triggered the permission check.
 ///
 /// # Errors
@@ -300,15 +306,19 @@ impl Default for FdReader {
 /// use std::os::fd::{FromRawFd, OwnedFd};
 ///
 /// let fan_fd = unsafe { OwnedFd::from_raw_fd(3) };
-/// let resp = FanotifyResponse::new(5, 0x01); // FAN_ALLOW
-/// write_response(&fan_fd, &resp).unwrap();
+/// // Assuming `ev` is an FdEvent with a valid fd:
+/// // let resp = FanotifyResponse::new(ev.fd().unwrap(), 0x01); // FAN_ALLOW
+/// // write_response(&fan_fd, &resp).unwrap();
 /// ```
-pub fn write_response(fan_fd: &OwnedFd, response: &FanotifyResponse) -> Result<(), FanotifyError> {
+pub fn write_response(
+    fan_fd: &OwnedFd,
+    response: &FanotifyResponse<'_>,
+) -> Result<(), FanotifyError> {
     use std::os::fd::AsRawFd;
 
     // SAFETY: fanotify_response is a plain-old-data struct.
     let resp = libc::fanotify_response {
-        fd: response.fd(),
+        fd: response.fd().as_raw_fd(),
         response: response.response(),
     };
 
@@ -422,7 +432,7 @@ mod tests {
 
     #[test]
     fn test_fd_overflow_flag() {
-        let ev = FdEvent::new(crate::consts::FAN_Q_OVERFLOW, -1, 0, PathBuf::new());
+        let ev = FdEvent::new(crate::consts::FAN_Q_OVERFLOW, None, 0, PathBuf::new());
         assert!(ev.is_overflow());
     }
 
@@ -430,7 +440,7 @@ mod tests {
     fn test_fd_event_names() {
         let ev = FdEvent::new(
             crate::consts::FAN_CREATE | crate::consts::FAN_MODIFY,
-            -1,
+            None,
             0,
             PathBuf::new(),
         );
@@ -440,14 +450,8 @@ mod tests {
 
     #[test]
     fn test_fd_drop_closes_fd() {
-        // We can't easily test real fd close without opening a real fd,
-        // but we can verify the Drop impl doesn't crash on invalid fd.
-        let ev = FdEvent::new(
-            0,
-            -1, // FAN_NOFD — should be safely ignored by Drop
-            0,
-            PathBuf::new(),
-        );
+        // FdEvent with None fd should not panic on drop
+        let ev = FdEvent::new(0, None, 0, PathBuf::new());
         drop(ev); // should not panic or crash
     }
 

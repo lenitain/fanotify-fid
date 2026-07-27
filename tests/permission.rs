@@ -41,7 +41,7 @@ fn test_permission_event_response() {
         .first()
         .filter(|e| e.mask() & FAN_OPEN_PERM != 0)
         .expect("first event should be FAN_OPEN_PERM");
-    fan.send_response(&FanotifyResponse::new(ev.fd(), FAN_ALLOW))
+    fan.send_response(&FanotifyResponse::new(ev.fd().unwrap(), FAN_ALLOW))
         .expect("send FAN_ALLOW");
 
     assert_eq!(rdr.join().expect("reader"), "t");

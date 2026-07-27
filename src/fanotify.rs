@@ -134,7 +134,7 @@ impl Fanotify {
     /// Convenience wrapper around [`write_response`](crate::read::write_response).
     pub fn send_response(
         &self,
-        response: &crate::types::FanotifyResponse,
+        response: &crate::types::FanotifyResponse<'_>,
     ) -> crate::error::Result<()> {
         crate::read::write_response(&self.fd, response)
     }

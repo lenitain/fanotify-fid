@@ -39,8 +39,12 @@ fn test_public_api_function_signatures() {
         let _ = Fanotify::new();
         let _ = FanotifyBuilder::default();
         let _ = FidEvent::new(0, 0, PathBuf::new(), None, None, None);
-        let _ = FdEvent::new(0, -1, 0, PathBuf::new());
-        let _ = FanotifyResponse::new(-1, 0);
+        let _ = FdEvent::new(0, None, 0, PathBuf::new());
+        // FanotifyResponse requires a valid BorrowedFd — open /dev/null for testing
+        let f = std::fs::File::open("/dev/null").unwrap();
+        let owned: std::os::fd::OwnedFd = f.into();
+        let fd = owned.as_fd();
+        let _ = FanotifyResponse::new(fd, 0);
     }
 
     _check_free_fns();

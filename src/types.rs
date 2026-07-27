@@ -2,6 +2,7 @@
 
 use std::collections::HashMap;
 use std::mem;
+use std::os::fd::{AsFd, AsRawFd, BorrowedFd, OwnedFd};
 use std::path::{Path, PathBuf};
 
 // ── Internal size constants ──
@@ -172,33 +173,24 @@ impl FidEvent {
 
 /// A parsed fd-based (non-FID) fanotify event.
 ///
-/// fd-based events carry an open file descriptor for the accessed file.
+/// fd-based events carry an owned file descriptor for the accessed file.
 /// The fd is automatically closed when this event is dropped (RAII).
-/// If you need the fd to outlive the event, use `libc::dup(ev.fd)` to
-/// obtain a copy.
+/// Use [`fd()`](Self::fd) to borrow the fd, or [`into_fd()`](Self::into_fd)
+/// to take ownership.
 #[derive(Debug)]
 pub struct FdEvent {
     mask: u64,
-    fd: i32,
+    fd: Option<OwnedFd>,
     pid: i32,
     path: PathBuf,
-}
-
-impl Drop for FdEvent {
-    fn drop(&mut self) {
-        if self.fd >= 0 {
-            unsafe {
-                libc::close(self.fd);
-            }
-        }
-    }
 }
 
 impl FdEvent {
     /// Create a new `FdEvent`.
     ///
     /// The `fd` will be closed when this event is dropped.
-    pub fn new(mask: u64, fd: i32, pid: i32, path: PathBuf) -> Self {
+    /// Pass `None` for overflow events (where `mask` contains `FAN_Q_OVERFLOW`).
+    pub fn new(mask: u64, fd: Option<OwnedFd>, pid: i32, path: PathBuf) -> Self {
         Self {
             mask,
             fd,
@@ -212,9 +204,20 @@ impl FdEvent {
         self.mask
     }
 
-    /// Open file descriptor for the object being accessed.
-    /// Automatically closed on drop.
-    pub fn fd(&self) -> i32 {
+    /// Borrow the open file descriptor for the object being accessed.
+    ///
+    /// Returns `None` for overflow events.  The returned `BorrowedFd` is
+    /// valid for the lifetime of this event.
+    pub fn fd(&self) -> Option<BorrowedFd<'_>> {
+        self.fd.as_ref().map(|fd| fd.as_fd())
+    }
+
+    /// Consume the event and return the owned file descriptor.
+    ///
+    /// Returns `None` for overflow events.  After calling this, the fd
+    /// will **not** be closed when the event is dropped (ownership was
+    /// transferred to the caller).
+    pub fn into_fd(self) -> Option<OwnedFd> {
         self.fd
     }
 
@@ -245,25 +248,37 @@ impl FdEvent {
 /// `FAN_OPEN_EXEC_PERM`).
 ///
 /// Write this to the fanotify fd after receiving a permission event to
-/// grant or deny the operation.  The `fd` field should be copied from the
-/// [`FdEvent`] that triggered the permission check.
-#[derive(Debug, Clone)]
-pub struct FanotifyResponse {
-    fd: i32,
+/// grant or deny the operation.  The `fd` field should be borrowed from
+/// the [`FdEvent`] that triggered the permission check.
+///
+/// The lifetime `'a` is tied to the event's file descriptor, ensuring
+/// the response cannot outlive the event fd.
+pub struct FanotifyResponse<'a> {
+    fd: BorrowedFd<'a>,
     response: u32,
 }
 
-impl FanotifyResponse {
+impl std::fmt::Debug for FanotifyResponse<'_> {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("FanotifyResponse")
+            .field("fd", &self.fd.as_raw_fd())
+            .field("response", &self.response)
+            .finish()
+    }
+}
+
+impl<'a> FanotifyResponse<'a> {
     /// Create a new `FanotifyResponse`.
     ///
-    /// - `fd`: The file descriptor from the `FdEvent` that triggered the permission check.
+    /// - `fd`: The file descriptor borrowed from the `FdEvent` that triggered
+    ///   the permission check.
     /// - `response`: `FAN_ALLOW` to grant, `FAN_DENY` to deny.
-    pub fn new(fd: i32, response: u32) -> Self {
+    pub fn new(fd: BorrowedFd<'a>, response: u32) -> Self {
         Self { fd, response }
     }
 
     /// The file descriptor from the `FdEvent` that triggered the permission check.
-    pub fn fd(&self) -> i32 {
+    pub fn fd(&self) -> BorrowedFd<'a> {
         self.fd
     }
 

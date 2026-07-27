@@ -21,7 +21,7 @@ Add to your `Cargo.toml`:
 
 ```toml
 [dependencies]
-fanotify-fid = "0.5.0"
+fanotify-fid = "0.6.0"
 ```
 
 ### Requirements
@@ -65,6 +65,6 @@ let events = fan.read_events(&mount_fds, &mut buf, None).unwrap();
 
 for ev in &events {
     let names: Vec<&str> = ev.event_names().collect();
-    println!("{:?} {:?}", names, ev.path);
+    println!("{:?} {:?}", names, ev.path());
 }
 ```
