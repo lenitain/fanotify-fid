@@ -30,9 +30,7 @@ fanotify-fid = "0.6.0"
 - Linux kernel **≥ 5.15** for `FAN_REPORT_TARGET_FID`
 - **`CAP_SYS_ADMIN`** capability (run as root or with `cap_sys_admin+ep`)
 
-The crate compiles on any platform, but all runtime operations require a Linux
-kernel with `CONFIG_FANOTIFY` enabled.  Non-Linux platforms will fail at runtime
-with `FanotifyError::Init(ENOSYS)`.
+This crate is Linux-only and will fail to compile on other platforms.
 
 ### Quick start
 

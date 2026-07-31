@@ -8,6 +8,9 @@
 //! `fanotify_init`, you **must** use this crate (or equivalent code) to
 //! correctly parse the variable-length events.
 //!
+//! **Linux only.** Compilation on non-Linux platforms will fail with a
+//! clear error message.
+//!
 //! ## Requirements
 //!
 //! - Linux kernel **≥ 5.1** (FID mode), **≥ 5.15** (`FAN_REPORT_TARGET_FID`)
@@ -54,6 +57,14 @@
 //!     println!("{:?} {:?}", names, ev.path());
 //! }
 //! ```
+//!
+//! # Linux only
+//!
+//! fanotify-fid is a Linux-only crate.  Compilation on non-Linux platforms
+//! will fail with a clear error message.
+
+#[cfg(not(target_os = "linux"))]
+compile_error!("fanotify-fid only supports Linux");
 
 mod builder;
 mod error;
