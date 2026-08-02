@@ -34,8 +34,8 @@ use crate::consts::{
 };
 use crate::handle::{resolve_file_handle, strip_deleted_suffix};
 use crate::types::{
-    PathStore, FH_HDR_SIZE, FSID_SIZE, FanInfoHeader, FanMetadata, FidEvent, HandleKey,
-    INFO_HDR_SIZE, META_SIZE,
+    FH_HDR_SIZE, FSID_SIZE, FanInfoHeader, FanMetadata, FidEvent, HandleKey, INFO_HDR_SIZE,
+    META_SIZE, PathStore,
 };
 
 /// Parse a buffer of raw fanotify FID events into a [`Vec<FidEvent>`].
