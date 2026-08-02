@@ -74,6 +74,6 @@ fn test_cache_recovers_deleted_path() {
         None,
         Some(h),
     )];
-    resolve_with_cache(&mut evts, &cache);
+    resolve_with_cache(&mut evts, &mut cache, &[]);
     assert!(!evts[0].path().as_os_str().is_empty());
 }

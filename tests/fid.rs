@@ -27,7 +27,7 @@ fn test_fid_event_on_single_file() {
 
     let evts = retry(
         || {
-            read_fid_events(fan.as_fd(), mnt, &mut buf, None)
+            read_fid_events::<fanotify_fid::types::HandleCache>(fan.as_fd(), mnt, &mut buf, None)
                 .ok()
                 .filter(|e| !e.is_empty())
         },

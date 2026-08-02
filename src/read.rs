@@ -8,7 +8,7 @@ use std::path::PathBuf;
 
 use crate::FanotifyError;
 use crate::parse::{parse_fid_events, resolve_with_cache};
-use crate::types::{FanotifyResponse, FdEvent, FidEvent, HandleCache};
+use crate::types::{FanotifyResponse, FdEvent, FidEvent, PathStore};
 
 /// Read and parse FID-format events from a fanotify file descriptor.
 ///
@@ -62,17 +62,19 @@ use crate::types::{FanotifyResponse, FdEvent, FidEvent, HandleCache};
 /// let mount_fds = vec![unsafe { OwnedFd::from_raw_fd(4) }]; // from open(O_PATH)
 /// let mut buf = Vec::with_capacity(65536);
 ///
-/// let events = read_fid_events(&fan_fd, &mount_fds, &mut buf, None).unwrap();
+/// let events =
+///     read_fid_events::<fanotify_fid::types::HandleCache>(&fan_fd, &mount_fds, &mut buf, None)
+///         .unwrap();
 /// for ev in &events {
 ///     let names: Vec<&str> = ev.event_names().collect();
 ///     println!("pid={} {:?} {}", ev.pid(), names, ev.path().display());
 /// }
 /// ```
-pub fn read_fid_events(
+pub fn read_fid_events<C: PathStore>(
     fan_fd: &OwnedFd,
     mount_fds: &[OwnedFd],
     buf: &mut Vec<u8>,
-    mut cache: Option<&mut HandleCache>,
+    cache: Option<&mut C>,
 ) -> Result<Vec<FidEvent>, FanotifyError> {
     use std::os::fd::AsRawFd;
 
@@ -106,18 +108,22 @@ pub fn read_fid_events(
 
     let mut events = parse_fid_events(buf, mount_fds);
 
-    // Second-pass cache resolution: multiple passes for nested deletions
-    if let Some(ref mut cache) = cache {
+    // Convergence resolution: multiple passes so batch-internal knowledge
+    // (handles from newly-resolved events) propagates through nested
+    // deletions. `resolve_with_cache` consults the cache (batch-internal +
+    // persistent, one store) and falls back to the open_by_handle_at
+    // syscall; newly resolved paths are written back so later passes
+    // benefit.
+    if let Some(cache) = cache {
         for _ in 0..10 {
-            // Update cache from successfully-resolved events
-            for ev in events.iter() {
+            let mut made_progress = false;
+            for ev in events.iter_mut() {
                 if ev.path().as_os_str().is_empty() {
                     continue;
                 }
                 if let Some(key) = ev.self_handle() {
-                    cache
-                        .entry(key.clone())
-                        .or_insert_with(|| ev.path().to_path_buf());
+                    cache.insert(key.to_vec(), ev.path().to_path_buf());
+                    made_progress = true;
                 }
                 if let (Some(key), Some(filename)) =
                     (ev.dfid_name_handle(), ev.dfid_name_filename())
@@ -128,12 +134,13 @@ pub fn read_fid_events(
                         Some(ev.path().to_path_buf())
                     };
                     if let Some(dp) = dir_path {
-                        cache.entry(key.clone()).or_insert(dp);
+                        cache.insert(key.to_vec(), dp);
+                        made_progress = true;
                     }
                 }
             }
-
-            if !resolve_with_cache(&mut events, cache) {
+            let _ = made_progress;
+            if !resolve_with_cache(&mut events, cache, mount_fds) {
                 break;
             }
         }

@@ -145,6 +145,16 @@ pub fn open_by_handle_at(mount_fd: i32, fh_data: &[u8]) -> io::Result<OwnedFd> {
 ///
 /// This is a best-effort function: on a busy system, the file may be deleted
 /// between resolution and path read.
+/// Remove the trailing " (deleted)" marker that `/proc/self/fd` appends to
+/// symlinks of unlinked objects.
+pub fn strip_deleted_suffix(path: PathBuf) -> PathBuf {
+    let s = path.to_string_lossy();
+    match s.strip_suffix(" (deleted)") {
+        Some(stripped) => PathBuf::from(stripped),
+        None => path,
+    }
+}
+
 pub fn resolve_file_handle(mount_fds: &[OwnedFd], fh_data: &[u8]) -> Option<PathBuf> {
     if fh_data.len() < FH_HDR_SIZE {
         return None;
@@ -156,7 +166,9 @@ pub fn resolve_file_handle(mount_fds: &[OwnedFd], fh_data: &[u8]) -> Option<Path
                 let result = fs::read_link(format!("/proc/self/fd/{}", fd.as_raw_fd()));
                 // fd is closed by OwnedFd::drop
                 if let Ok(p) = result {
-                    return Some(p);
+                    // `/proc/self/fd` appends " (deleted)" for unlinked
+                    // objects; consumers never want the suffix.
+                    return Some(strip_deleted_suffix(p));
                 }
             }
             Err(_) => continue,

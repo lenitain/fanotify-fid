@@ -78,6 +78,24 @@ pub(crate) struct FanInfoHeader {
 /// events on deleted directories.
 pub type HandleKey = Vec<u8>;
 
+/// Minimal handle→path store abstraction so callers can plug in their own
+/// cache (bounded, TTL, ...) instead of being forced into a plain `HashMap`.
+/// `HandleCache` (the `HashMap` alias) implements this trait.
+pub trait PathStore {
+    fn get(&self, key: &[u8]) -> Option<PathBuf>;
+    fn insert(&mut self, key: Vec<u8>, path: PathBuf);
+}
+
+impl PathStore for HashMap<HandleKey, PathBuf> {
+    fn get(&self, key: &[u8]) -> Option<PathBuf> {
+        self.get(key).cloned()
+    }
+
+    fn insert(&mut self, key: Vec<u8>, path: PathBuf) {
+        self.insert(key, path);
+    }
+}
+
 /// Persistent cache mapping file handle keys to resolved paths.
 ///
 /// Used to recover paths for events whose directories were deleted

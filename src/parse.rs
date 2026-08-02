@@ -32,9 +32,9 @@ use std::ptr;
 use crate::consts::{
     FAN_EVENT_INFO_TYPE_DFID, FAN_EVENT_INFO_TYPE_DFID_NAME, FAN_EVENT_INFO_TYPE_FID,
 };
-use crate::handle::resolve_file_handle;
+use crate::handle::{resolve_file_handle, strip_deleted_suffix};
 use crate::types::{
-    FH_HDR_SIZE, FSID_SIZE, FanInfoHeader, FanMetadata, FidEvent, HandleCache, HandleKey,
+    PathStore, FH_HDR_SIZE, FSID_SIZE, FanInfoHeader, FanMetadata, FidEvent, HandleKey,
     INFO_HDR_SIZE, META_SIZE,
 };
 
@@ -166,9 +166,13 @@ pub fn parse_fid_events(buf: &[u8], mount_fds: &[OwnedFd]) -> Vec<FidEvent> {
 ///
 /// let mut events = parse_fid_events(buf, mount_fds);
 /// // Update cache from successfully-resolved events...
-/// resolve_with_cache(&mut events, &cache);
+/// resolve_with_cache(&mut events, &mut cache, &[]);
 /// ```
-pub fn resolve_with_cache(events: &mut [FidEvent], cache: &HandleCache) -> bool {
+pub fn resolve_with_cache<C: PathStore>(
+    events: &mut [FidEvent],
+    cache: &mut C,
+    mount_fds: &[OwnedFd],
+) -> bool {
     let mut made_progress = false;
 
     for ev in events.iter_mut() {
@@ -176,26 +180,43 @@ pub fn resolve_with_cache(events: &mut [FidEvent], cache: &HandleCache) -> bool 
             continue;
         }
 
-        // Try DFID_NAME: parent directory handle → cached dir path + filename
-        if let (Some(key), Some(filename)) = (ev.dfid_name_handle(), ev.dfid_name_filename())
-            && let Some(dir_path) = cache.get(key)
-        {
-            let new_path = if filename.is_empty() {
-                dir_path.clone()
+        // Tier 1: batch-internal knowledge (already-written cache entries
+        // from this batch) and Tier 2: persistent cache, both live in the
+        // same `cache` argument; a plain HashMap accumulates within the
+        // caller's convergence loop.
+        let resolve_dir = |key: &[u8], filename: &str| -> Option<PathBuf> {
+            let dir_path = cache
+                .get(key)
+                .or_else(|| resolve_file_handle(mount_fds, key));
+            let dir_path = dir_path.map(strip_deleted_suffix)?;
+            Some(if filename.is_empty() {
+                dir_path
             } else {
                 dir_path.join(filename)
-            };
+            })
+        };
+
+        // Try DFID_NAME: parent directory handle → dir path + filename.
+        if let (Some(key), Some(filename)) = (ev.dfid_name_handle(), ev.dfid_name_filename())
+            && let Some(new_path) = resolve_dir(key, filename)
+        {
             ev.set_path(new_path);
             made_progress = true;
         }
 
-        // Try self handle → cached path
+        // Try self handle (Tier 3: syscall fallback for events without a
+        // parent reference, e.g. DELETE_SELF on directories).
         if ev.path().as_os_str().is_empty()
             && let Some(key) = ev.self_handle()
-            && let Some(cached_path) = cache.get(key)
         {
-            ev.set_path(cached_path.clone());
-            made_progress = true;
+            let path = cache
+                .get(key)
+                .or_else(|| resolve_file_handle(mount_fds, key))
+                .map(strip_deleted_suffix);
+            if let Some(path) = path {
+                ev.set_path(path);
+                made_progress = true;
+            }
         }
     }
 
@@ -659,8 +680,8 @@ mod tests {
     #[test]
     fn test_resolve_with_cache_noop_when_all_resolved() {
         let mut events = vec![FidEvent::new(0, 0, "/tmp/foo".into(), None, None, None)];
-        let cache = HashMap::new();
-        assert!(!resolve_with_cache(&mut events, &cache));
+        let mut cache: crate::types::HandleCache = HashMap::new();
+        assert!(!resolve_with_cache(&mut events, &mut cache, &[]));
         assert_eq!(events[0].path().to_str(), Some("/tmp/foo"));
     }
 
@@ -678,7 +699,7 @@ mod tests {
         let mut cache = HashMap::new();
         cache.insert(dir_handle, "/tmp/mydir".into());
 
-        assert!(resolve_with_cache(&mut events, &cache));
+        assert!(resolve_with_cache(&mut events, &mut cache, &[]));
         assert_eq!(events[0].path().to_str(), Some("/tmp/mydir/bar.txt"));
     }
 
@@ -696,7 +717,7 @@ mod tests {
         let mut cache = HashMap::new();
         cache.insert(dir_handle, "/tmp/mydir".into());
 
-        assert!(resolve_with_cache(&mut events, &cache));
+        assert!(resolve_with_cache(&mut events, &mut cache, &[]));
         assert_eq!(events[0].path().to_str(), Some("/tmp/mydir"));
     }
 
@@ -714,7 +735,7 @@ mod tests {
         let mut cache = HashMap::new();
         cache.insert(handle, "/cached/path.txt".into());
 
-        assert!(resolve_with_cache(&mut events, &cache));
+        assert!(resolve_with_cache(&mut events, &mut cache, &[]));
         assert_eq!(events[0].path().to_str(), Some("/cached/path.txt"));
     }
 
@@ -729,8 +750,8 @@ mod tests {
             Some("x.txt".into()),
             None,
         )];
-        let cache = HashMap::new(); // empty cache
-        assert!(!resolve_with_cache(&mut events, &cache));
+        let mut cache: crate::types::HandleCache = HashMap::new(); // empty cache
+        assert!(!resolve_with_cache(&mut events, &mut cache, &[]));
         assert!(events[0].path().as_os_str().is_empty());
     }
 
@@ -749,7 +770,7 @@ mod tests {
         let mut cache = HashMap::new();
         cache.insert(dir_handle, "/dirpath".into());
 
-        assert!(resolve_with_cache(&mut events, &cache));
+        assert!(resolve_with_cache(&mut events, &mut cache, &[]));
         // Should use DFID_NAME (dir + filename) rather than just self handle
         assert_eq!(events[0].path().to_str(), Some("/dirpath/name.txt"));
     }
@@ -782,7 +803,7 @@ mod tests {
         cache.insert(dh1, "/dir1".into());
         cache.insert(dh2, "/dir2".into());
 
-        assert!(resolve_with_cache(&mut events, &cache));
+        assert!(resolve_with_cache(&mut events, &mut cache, &[]));
         assert_eq!(events[0].path().to_str(), Some("/dir1/a.txt"));
         assert_eq!(events[1].path().to_str(), Some("/dir2/b.txt"));
     }
@@ -802,7 +823,7 @@ mod tests {
         cache.insert(dh, "/cached/dir".into());
 
         // Already has a path, should NOT be overwritten
-        assert!(!resolve_with_cache(&mut events, &cache));
+        assert!(!resolve_with_cache(&mut events, &mut cache, &[]));
         assert_eq!(events[0].path().to_str(), Some("/existing/path"));
     }
 
