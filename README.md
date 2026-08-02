@@ -21,7 +21,7 @@ Add to your `Cargo.toml`:
 
 ```toml
 [dependencies]
-fanotify-fid = "0.6.0"
+fanotify-fid = "0.7"
 ```
 
 ### Requirements

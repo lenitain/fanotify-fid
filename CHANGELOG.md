@@ -5,6 +5,28 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.7.0] - 2026-08-02
+
+### Added
+
+- `PathStore` trait: plug any handle->path cache (bounded, TTL, ...) into
+  `read_fid_events` / `resolve_with_cache` instead of the fixed `HashMap`.
+
+### Changed
+
+- `resolve_with_cache` now takes `mount_fds` and performs a three-tier
+  lookup: batch-internal knowledge + persistent cache, then an
+  `open_by_handle_at` syscall fallback for deleted objects. Pass `&[]` to
+  opt out of the syscall tier.
+- `read_fid_events`' cache parameter is generic over `PathStore`.
+- `resolve_file_handle` strips the `" (deleted)"` suffix that
+  `/proc/self/fd` appends to unlinked objects (consumers never want it).
+
+### Breaking
+
+- `resolve_with_cache` signature changed (added `mount_fds`, generic cache).
+- `read_fid_events` cache parameter type changed to `Option<&mut C: PathStore>`.
+
 ## [0.6.0] - 2026-07-27
 
 ### Breaking Changes
