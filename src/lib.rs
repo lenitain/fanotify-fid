@@ -89,7 +89,7 @@ pub mod prelude {
     pub use crate::handle::{name_to_handle_at, open_by_handle_at, resolve_file_handle};
     pub use crate::parse::parse_fid_events;
     pub use crate::read::{FdReader, read_fid_events, write_response};
-    pub use crate::types::{FanotifyResponse, FdEvent, FidEvent, HandleCache, HandleKey};
+    pub use crate::types::{FanotifyResponse, FdEvent, FidEvent, HandleCache, HandleKey, PathStore};
     pub use crate::{
         Fanotify, FanotifyBuilder, FanotifyError, fanotify_init, fanotify_mark, open_mount,
     };
