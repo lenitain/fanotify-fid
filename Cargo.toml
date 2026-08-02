@@ -14,8 +14,10 @@ authors = ["lenitain <xt.zhu@qq.com>"]
 include = [
     "Cargo.toml",
     "LICENSE",
+    "CHANGELOG.md",
     "README.md",
     "src/",
+    "tests/",
 ]
 
 [lib]
