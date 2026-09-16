@@ -160,6 +160,32 @@ pub const FAN_EVENT_INFO_TYPE_FID: u8 = 1;
 pub const FAN_EVENT_INFO_TYPE_DFID_NAME: u8 = 2;
 /// Info record contains a directory file handle (no name).
 pub const FAN_EVENT_INFO_TYPE_DFID: u8 = 3;
+/// Info record contains a pidfd for the process that caused the event.
+///
+/// Emitted when the group was created with `FAN_REPORT_PIDFD`.  Unlike
+/// `metadata.pid`, the pidfd is not subject to PID reuse — see
+/// [`FidEvent::pidfd`](crate::types::FidEvent::pidfd).
+pub const FAN_EVENT_INFO_TYPE_PIDFD: u8 = 4;
+/// Info record contains the filesystem error code and repeat count.
+///
+/// Emitted for `FAN_FS_ERROR` events — see
+/// [`FidEvent::fs_error`](crate::types::FidEvent::fs_error).
+pub const FAN_EVENT_INFO_TYPE_ERROR: u8 = 5;
+/// Info record contains the access range of a `FAN_PRE_ACCESS` event.
+pub const FAN_EVENT_INFO_TYPE_RANGE: u8 = 6;
+/// Info record contains the mount ID of a `FAN_MNT_ATTACH`/`FAN_MNT_DETACH`
+/// event.
+pub const FAN_EVENT_INFO_TYPE_MNT: u8 = 7;
+/// Info record contains the rename **source** parent handle + old name.
+///
+/// Emitted for `FAN_RENAME` — see
+/// [`FidEvent::rename_source`](crate::types::FidEvent::rename_source).
+pub const FAN_EVENT_INFO_TYPE_OLD_DFID_NAME: u8 = 10;
+/// Info record contains the rename **target** parent handle + new name.
+///
+/// Emitted for `FAN_RENAME` — see
+/// [`FidEvent::rename_target`](crate::types::FidEvent::rename_target).
+pub const FAN_EVENT_INFO_TYPE_NEW_DFID_NAME: u8 = 12;
 
 // ── Permission response flags (for writing to fanotify fd) ──
 

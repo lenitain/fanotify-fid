@@ -25,12 +25,14 @@
 
 #[cfg(test)]
 use std::collections::HashMap;
-use std::os::fd::OwnedFd;
+use std::os::fd::{FromRawFd, OwnedFd};
 use std::path::PathBuf;
 use std::ptr;
 
 use crate::consts::{
-    FAN_EVENT_INFO_TYPE_DFID, FAN_EVENT_INFO_TYPE_DFID_NAME, FAN_EVENT_INFO_TYPE_FID,
+    FAN_EVENT_INFO_TYPE_DFID, FAN_EVENT_INFO_TYPE_DFID_NAME, FAN_EVENT_INFO_TYPE_ERROR,
+    FAN_EVENT_INFO_TYPE_FID, FAN_EVENT_INFO_TYPE_NEW_DFID_NAME, FAN_EVENT_INFO_TYPE_OLD_DFID_NAME,
+    FAN_EVENT_INFO_TYPE_PIDFD,
 };
 use crate::handle::{resolve_file_handle, strip_deleted_suffix};
 use crate::types::{
@@ -79,6 +81,11 @@ pub fn parse_fid_events(buf: &[u8], mount_fds: &[OwnedFd]) -> Vec<FidEvent> {
         let mut dfid_name_handle: Option<HandleKey> = None;
         let mut dfid_name_filename: Option<String> = None;
         let mut self_handle: Option<HandleKey> = None;
+        let mut pidfd: Option<OwnedFd> = None;
+        let mut fs_error: Option<(i32, u32)> = None;
+        let mut rename_source: Option<(HandleKey, String)> = None;
+        let mut rename_target: Option<(HandleKey, String)> = None;
+        let mut unknown_info_records: Vec<(u8, Vec<u8>)> = Vec::new();
 
         let mut info_off = offset + meta.metadata_len as usize;
         let event_end = offset + event_len;
@@ -95,40 +102,130 @@ pub fn parse_fid_events(buf: &[u8], mount_fds: &[OwnedFd]) -> Vec<FidEvent> {
 
             match hdr.info_type {
                 FAN_EVENT_INFO_TYPE_DFID_NAME => {
-                    if let Some((key, filename, resolved)) =
-                        extract_dfid_name(buf, info_off, info_len, mount_fds)
-                    {
-                        dfid_name_handle = Some(key);
-                        dfid_name_filename = Some(filename);
-                        if let Some(p) = resolved {
-                            path = p;
+                    match extract_dfid_name(buf, info_off, info_len, mount_fds) {
+                        Some((key, filename, resolved)) => {
+                            dfid_name_handle = Some(key);
+                            dfid_name_filename = Some(filename);
+                            if let Some(p) = resolved {
+                                path = p;
+                            }
                         }
+                        None => preserve_unparsed(
+                            &mut unknown_info_records,
+                            buf,
+                            info_off,
+                            info_len,
+                            hdr.info_type,
+                        ),
                     }
                 }
                 FAN_EVENT_INFO_TYPE_FID | FAN_EVENT_INFO_TYPE_DFID => {
-                    if let Some((key, resolved)) = extract_fid(buf, info_off, info_len, mount_fds) {
-                        self_handle = Some(key);
-                        if path.as_os_str().is_empty()
-                            && let Some(p) = resolved
-                        {
-                            path = p;
+                    match extract_fid(buf, info_off, info_len, mount_fds) {
+                        Some((key, resolved)) => {
+                            self_handle = Some(key);
+                            if path.as_os_str().is_empty()
+                                && let Some(p) = resolved
+                            {
+                                path = p;
+                            }
                         }
+                        None => preserve_unparsed(
+                            &mut unknown_info_records,
+                            buf,
+                            info_off,
+                            info_len,
+                            hdr.info_type,
+                        ),
                     }
                 }
-                _ => {}
+                FAN_EVENT_INFO_TYPE_OLD_DFID_NAME => {
+                    match extract_dfid_name(buf, info_off, info_len, mount_fds) {
+                        Some((key, filename, _)) => rename_source = Some((key, filename)),
+                        None => preserve_unparsed(
+                            &mut unknown_info_records,
+                            buf,
+                            info_off,
+                            info_len,
+                            hdr.info_type,
+                        ),
+                    }
+                }
+                FAN_EVENT_INFO_TYPE_NEW_DFID_NAME => {
+                    match extract_dfid_name(buf, info_off, info_len, mount_fds) {
+                        Some((key, filename, _)) => rename_target = Some((key, filename)),
+                        None => preserve_unparsed(
+                            &mut unknown_info_records,
+                            buf,
+                            info_off,
+                            info_len,
+                            hdr.info_type,
+                        ),
+                    }
+                }
+                FAN_EVENT_INFO_TYPE_ERROR => {
+                    let parsed = extract_fs_error(buf, info_off, info_len);
+                    if parsed.is_none() {
+                        preserve_unparsed(
+                            &mut unknown_info_records,
+                            buf,
+                            info_off,
+                            info_len,
+                            hdr.info_type,
+                        );
+                    }
+                    fs_error = parsed;
+                }
+                FAN_EVENT_INFO_TYPE_PIDFD => {
+                    let parsed = extract_pidfd(buf, info_off, info_len);
+                    if parsed.is_none() {
+                        preserve_unparsed(
+                            &mut unknown_info_records,
+                            buf,
+                            info_off,
+                            info_len,
+                            hdr.info_type,
+                        );
+                    }
+                    pidfd = parsed;
+                }
+                other => {
+                    // Preserve records that have no typed field here (RANGE,
+                    // MNT, and anything a newer kernel adds) so the caller can
+                    // observe that data was not interpreted.
+                    preserve_unparsed(&mut unknown_info_records, buf, info_off, info_len, other);
+                }
             }
 
             info_off += info_len;
         }
 
-        events.push(FidEvent::new(
+        let mut event = FidEvent::new(
             meta.mask,
             meta.pid,
             path,
             dfid_name_handle,
             dfid_name_filename,
             self_handle,
-        ));
+        );
+        if let Some(error) = fs_error {
+            // The kernel reports a negative errno and the number of errors it
+            // merged into this event (fanotify_alloc_error_event()).
+            event = event.with_fs_error(error.0, error.1);
+        }
+        if let Some(fd) = pidfd {
+            event = event.with_pidfd(fd);
+        }
+        if let Some((handle, name)) = rename_source {
+            event = event.with_rename_source(handle, name);
+        }
+        if let Some((handle, name)) = rename_target {
+            event = event.with_rename_target(handle, name);
+        }
+        for (info_type, payload) in unknown_info_records {
+            event.push_unknown_info_record(info_type, payload);
+        }
+
+        events.push(event);
 
         offset += event_len;
     }
@@ -276,6 +373,81 @@ fn extract_dfid_name(
     Some((key, filename, full_path))
 }
 
+/// Keep a record this crate could not interpret, with its raw payload.
+///
+/// Called for record types that have no typed field here **and** for recognised
+/// types whose payload failed its bounds check.  Both cases are surfaced
+/// through [`FidEvent::unknown_info_records`] so that "the parser threw data
+/// away" is never silent.  `payload` excludes the 4-byte info header.
+fn preserve_unparsed(
+    sink: &mut Vec<(u8, Vec<u8>)>,
+    buf: &[u8],
+    info_off: usize,
+    info_len: usize,
+    info_type: u8,
+) {
+    sink.push((
+        info_type,
+        buf[info_off + INFO_HDR_SIZE..info_off + info_len].to_vec(),
+    ));
+}
+
+/// Parse a `FAN_EVENT_INFO_TYPE_PIDFD` record: take ownership of the pidfd.
+///
+/// Layout: `InfoHeader(4) | pidfd(4)`
+///
+/// The record's descriptor is owned by us once the event is read, so it is
+/// wrapped in an [`OwnedFd`] here and closed when the [`FidEvent`] drops.
+fn extract_pidfd(buf: &[u8], info_off: usize, info_len: usize) -> Option<OwnedFd> {
+    let pidfd_off = info_off + INFO_HDR_SIZE;
+    let record_end = info_off + info_len;
+
+    if pidfd_off + 4 > record_end {
+        return None;
+    }
+
+    // SAFETY: `copy_nonoverlapping` writes exactly 4 bytes into an aligned
+    // `i32`, so no alignment requirement is imposed on `buf`.
+    let pidfd: i32 = unsafe {
+        let mut value = std::mem::MaybeUninit::<i32>::uninit();
+        ptr::copy_nonoverlapping(
+            buf.as_ptr().add(pidfd_off),
+            value.as_mut_ptr() as *mut u8,
+            4,
+        );
+        value.assume_init()
+    };
+
+    if pidfd < 0 {
+        return None;
+    }
+
+    // SAFETY: the kernel put a live descriptor in this record; the caller of
+    // `parse_fid_events` consumed the event, so that reference is ours now and
+    // `OwnedFd` takes over closing it exactly once.
+    Some(unsafe { OwnedFd::from_raw_fd(pidfd) })
+}
+
+/// Parse a `FAN_EVENT_INFO_TYPE_ERROR` record: `(error, error_count)`.
+///
+/// Layout: `InfoHeader(4) | error(4) | error_count(4)`
+///
+/// `error` is a negative errno and `error_count` counts the errors the kernel
+/// merged into this event.
+fn extract_fs_error(buf: &[u8], info_off: usize, info_len: usize) -> Option<(i32, u32)> {
+    let error_off = info_off + INFO_HDR_SIZE;
+    let record_end = info_off + info_len;
+
+    if error_off + 8 > record_end {
+        return None;
+    }
+
+    let error = i32::from_ne_bytes(buf[error_off..error_off + 4].try_into().ok()?);
+    let error_count = u32::from_ne_bytes(buf[error_off + 4..error_off + 8].try_into().ok()?);
+
+    Some((error, error_count))
+}
+
 /// Parse a FID or DFID info record: extract self handle key and attempt path
 /// resolution.
 ///
@@ -310,6 +482,8 @@ fn extract_fid(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::consts::{FAN_EVENT_INFO_TYPE_MNT, FAN_EVENT_INFO_TYPE_RANGE};
+    use std::os::fd::AsRawFd;
 
     // ── Helpers to construct synthetic FID events ──
 
@@ -350,6 +524,14 @@ mod tests {
     }
 
     fn dfid_name_record(filename: &str, handle_payload: &[u8]) -> Vec<u8> {
+        dfid_name_record_with_type(FAN_EVENT_INFO_TYPE_DFID_NAME, filename, handle_payload)
+    }
+
+    /// Build a `DFID_NAME`-shaped record under an arbitrary info type.
+    ///
+    /// The rename record types (10 and 12) share this layout, which is why the
+    /// parser can reuse `extract_dfid_name` for them.
+    fn dfid_name_record_with_type(info_type: u8, filename: &str, handle_payload: &[u8]) -> Vec<u8> {
         let fh = build_file_handle(handle_payload);
         let name_bytes = filename.as_bytes();
         // null-terminated, padded to 4-byte alignment
@@ -359,7 +541,7 @@ mod tests {
         name_padded.resize(padded_len, 0);
 
         let payload_len = 8 + fh.len() + name_padded.len(); // fsid + fh + name
-        let mut hdr = build_info_header(FAN_EVENT_INFO_TYPE_DFID_NAME, payload_len as u16);
+        let mut hdr = build_info_header(info_type, payload_len as u16);
         hdr.extend_from_slice(&build_fsid(100, 200));
         hdr.extend_from_slice(&fh);
         hdr.extend_from_slice(&name_padded);
@@ -564,8 +746,9 @@ mod tests {
     }
 
     #[test]
-    fn test_unknown_info_type_skipped() {
-        // Info type 99 should be silently skipped
+    fn test_unknown_info_type_is_reported() {
+        // An unrecognised record must not vanish silently: the caller has to be
+        // able to tell "no data" apart from "the parser dropped data".
         let fh = build_file_handle(b"\x01\x02");
         let payload_len = 8 + fh.len();
         let mut info = build_info_header(99, payload_len as u16);
@@ -579,6 +762,219 @@ mod tests {
         let events = parse_fid_events(&buf, &[]);
         assert_eq!(events.len(), 1);
         assert!(events[0].self_handle().is_none());
+
+        let unknown = events[0].unknown_info_records();
+        assert_eq!(unknown.len(), 1, "the dropped record must be observable");
+        assert_eq!(unknown[0].0, 99);
+        assert_eq!(unknown[0].1.len(), payload_len);
+        // The raw payload keeps fsid + handle intact for the caller.
+        assert_eq!(unknown[0].1, &info[INFO_HDR_SIZE..]);
+    }
+
+    #[test]
+    fn test_known_event_has_no_unknown_records() {
+        let info = dfid_name_record("known.txt", b"\x05\x06");
+        let event_len = (META_SIZE + info.len()) as u32;
+        let mut buf = build_metadata(event_len, 0x0000_0100, 7);
+        buf.extend_from_slice(&info);
+
+        let events = parse_fid_events(&buf, &[]);
+        assert_eq!(events.len(), 1);
+        assert!(
+            events[0].unknown_info_records().is_empty(),
+            "a fully understood event must report no leftovers"
+        );
+    }
+
+    #[test]
+    fn test_rename_source_and_target() {
+        let mut buf = build_metadata(0, 0x1000_0000, 4242); // FAN_RENAME
+        let src =
+            dfid_name_record_with_type(FAN_EVENT_INFO_TYPE_OLD_DFID_NAME, "old.txt", b"\x11\x12");
+        let dst =
+            dfid_name_record_with_type(FAN_EVENT_INFO_TYPE_NEW_DFID_NAME, "new.txt", b"\x21\x22");
+        let event_len = (META_SIZE + src.len() + dst.len()) as u32;
+        buf[0..4].copy_from_slice(&event_len.to_ne_bytes());
+        buf.extend_from_slice(&src);
+        buf.extend_from_slice(&dst);
+
+        let events = parse_fid_events(&buf, &[]);
+        assert_eq!(events.len(), 1);
+        let ev = &events[0];
+        assert_eq!(ev.mask(), 0x1000_0000);
+        assert_eq!(ev.event_names().collect::<Vec<_>>(), vec!["RENAME"]);
+
+        let source = ev.rename_source().expect("source side must survive");
+        assert_eq!(source.name, "old.txt");
+        let target = ev.rename_target().expect("target side must survive");
+        assert_eq!(target.name, "new.txt");
+        assert_ne!(
+            source.handle, target.handle,
+            "old and new parent handles must stay distinct"
+        );
+
+        // The DFID_NAME accessors must not be overloaded with rename data.
+        assert!(ev.dfid_name_handle().is_none());
+        assert!(ev.dfid_name_filename().is_none());
+        assert!(ev.unknown_info_records().is_empty());
+    }
+
+    #[test]
+    fn test_rename_with_only_one_side() {
+        // A rename entering or leaving the watched subtree reports one side.
+        let dst = dfid_name_record_with_type(
+            FAN_EVENT_INFO_TYPE_NEW_DFID_NAME,
+            "incoming.txt",
+            b"\x31\x32",
+        );
+        let event_len = (META_SIZE + dst.len()) as u32;
+        let mut buf = build_metadata(event_len, 0x1000_0000, 9);
+        buf.extend_from_slice(&dst);
+
+        let events = parse_fid_events(&buf, &[]);
+        assert!(events[0].rename_source().is_none());
+        assert_eq!(
+            events[0].rename_target().map(|s| s.name.as_str()),
+            Some("incoming.txt")
+        );
+    }
+
+    #[test]
+    fn test_fs_error_payload_is_parsed() {
+        let mut info = build_info_header(FAN_EVENT_INFO_TYPE_ERROR, 8);
+        info.extend_from_slice(&(-5i32).to_ne_bytes()); // -EIO
+        info.extend_from_slice(&7u32.to_ne_bytes()); // error_count
+
+        let event_len = (META_SIZE + info.len()) as u32;
+        let mut buf = build_metadata(event_len, 0x0000_8000, 31337); // FAN_FS_ERROR
+        buf.extend_from_slice(&info);
+
+        let events = parse_fid_events(&buf, &[]);
+        assert_eq!(events.len(), 1);
+        assert_eq!(events[0].fs_error(), Some((-5, 7)));
+        assert!(events[0].unknown_info_records().is_empty());
+    }
+
+    #[test]
+    fn test_fs_error_truncated_payload_is_not_parsed() {
+        // 7 payload bytes instead of 8: must not read past the record.
+        let mut info = build_info_header(FAN_EVENT_INFO_TYPE_ERROR, 7);
+        info.extend_from_slice(&(-5i32).to_ne_bytes());
+        info.extend_from_slice(&[0u8; 3]);
+
+        let event_len = (META_SIZE + info.len()) as u32;
+        let mut buf = build_metadata(event_len, 0x0000_8000, 1);
+        buf.extend_from_slice(&info);
+
+        let events = parse_fid_events(&buf, &[]);
+        assert_eq!(events.len(), 1);
+        assert!(events[0].fs_error().is_none());
+        assert_eq!(events[0].unknown_info_records().len(), 1);
+    }
+
+    #[test]
+    fn test_pidfd_is_taken_over_by_the_event() {
+        // Use a real descriptor so the ownership transfer is observable.
+        let file = tempfile::tempfile().unwrap();
+        let raw = std::os::fd::IntoRawFd::into_raw_fd(file);
+
+        let mut info = build_info_header(FAN_EVENT_INFO_TYPE_PIDFD, 4);
+        info.extend_from_slice(&raw.to_ne_bytes());
+
+        let event_len = (META_SIZE + info.len()) as u32;
+        let mut buf = build_metadata(event_len, 0x0000_0100, 555);
+        buf.extend_from_slice(&info);
+
+        let events = parse_fid_events(&buf, &[]);
+        assert_eq!(events.len(), 1);
+
+        let pidfd = events[0].pidfd().expect("pidfd must be exposed");
+        assert_eq!(pidfd.as_raw_fd(), raw);
+        assert!(events[0].unknown_info_records().is_empty());
+
+        // Dropping the event closes the descriptor exactly once.
+        drop(events);
+        // SAFETY: only asks whether the descriptor is still open.
+        let still_open = unsafe { libc::fcntl(raw, libc::F_GETFD) };
+        assert_eq!(still_open, -1, "the event must close the pidfd on drop");
+        assert_eq!(
+            std::io::Error::last_os_error().raw_os_error(),
+            Some(libc::EBADF)
+        );
+    }
+
+    #[test]
+    fn test_pidfd_negative_is_ignored() {
+        let mut info = build_info_header(FAN_EVENT_INFO_TYPE_PIDFD, 4);
+        info.extend_from_slice(&(-1i32).to_ne_bytes());
+
+        let event_len = (META_SIZE + info.len()) as u32;
+        let mut buf = build_metadata(event_len, 0x0000_0100, 1);
+        buf.extend_from_slice(&info);
+
+        let events = parse_fid_events(&buf, &[]);
+        assert!(events[0].pidfd().is_none());
+        // A negative descriptor cannot be turned into an OwnedFd, but the
+        // record is still surfaced instead of being dropped.
+        assert_eq!(events[0].unknown_info_records().len(), 1);
+        assert_eq!(
+            events[0].unknown_info_records()[0].0,
+            FAN_EVENT_INFO_TYPE_PIDFD
+        );
+    }
+
+    #[test]
+    fn test_into_pidfd_transfers_ownership() {
+        let file = tempfile::tempfile().unwrap();
+        let raw = std::os::fd::IntoRawFd::into_raw_fd(file);
+
+        let mut info = build_info_header(FAN_EVENT_INFO_TYPE_PIDFD, 4);
+        info.extend_from_slice(&raw.to_ne_bytes());
+
+        let event_len = (META_SIZE + info.len()) as u32;
+        let mut buf = build_metadata(event_len, 0x0000_0100, 1);
+        buf.extend_from_slice(&info);
+
+        let mut events = parse_fid_events(&buf, &[]);
+        let owned = events.pop().unwrap().into_pidfd().expect("owned pidfd");
+        assert_eq!(owned.as_raw_fd(), raw);
+        drop(owned);
+        // SAFETY: only asks whether the descriptor is still open.
+        assert_eq!(unsafe { libc::fcntl(raw, libc::F_GETFD) }, -1);
+    }
+
+    #[test]
+    fn test_mnt_record_is_preserved_as_unknown() {
+        // No typed field for MNT yet, but the payload must still be reachable.
+        let mut info = build_info_header(FAN_EVENT_INFO_TYPE_MNT, 8);
+        info.extend_from_slice(&4242u64.to_ne_bytes());
+
+        let event_len = (META_SIZE + info.len()) as u32;
+        let mut buf = build_metadata(event_len, 0x0000_0000, 1);
+        buf.extend_from_slice(&info);
+
+        let events = parse_fid_events(&buf, &[]);
+        let unknown = events[0].unknown_info_records();
+        assert_eq!(unknown.len(), 1);
+        assert_eq!(unknown[0].0, FAN_EVENT_INFO_TYPE_MNT);
+        assert_eq!(unknown[0].1, 4242u64.to_ne_bytes());
+    }
+
+    #[test]
+    fn test_range_record_is_preserved_as_unknown() {
+        let mut info = build_info_header(FAN_EVENT_INFO_TYPE_RANGE, 20);
+        info.extend_from_slice(&0u32.to_ne_bytes()); // pad
+        info.extend_from_slice(&4096u64.to_ne_bytes()); // offset
+        info.extend_from_slice(&512u64.to_ne_bytes()); // count
+
+        let event_len = (META_SIZE + info.len()) as u32;
+        let mut buf = build_metadata(event_len, 0x0000_0000, 1);
+        buf.extend_from_slice(&info);
+
+        let events = parse_fid_events(&buf, &[]);
+        let unknown = events[0].unknown_info_records();
+        assert_eq!(unknown[0].0, FAN_EVENT_INFO_TYPE_RANGE);
+        assert_eq!(unknown[0].1.len(), 20);
     }
 
     #[test]
