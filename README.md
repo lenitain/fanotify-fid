@@ -28,7 +28,22 @@ fanotify-fid = "0.7"
 
 - Linux kernel **≥ 5.1** for FID mode (`FAN_REPORT_FID`)
 - Linux kernel **≥ 5.15** for `FAN_REPORT_TARGET_FID`
-- **`CAP_SYS_ADMIN`** capability (run as root or with `cap_sys_admin+ep`)
+
+No privilege is needed to *create* a `FAN_CLASS_NOTIF` FID group and receive
+events — an unprivileged process can pass `FAN_REPORT_FID |
+FAN_REPORT_DIR_FID | FAN_REPORT_NAME` to `fanotify_init`.  `CAP_SYS_ADMIN`
+(run as root or with `cap_sys_admin+ep`) is needed for the surrounding features:
+
+| Needs `CAP_SYS_ADMIN` | Why |
+|---|---|
+| `FAN_MARK_MOUNT`, `FAN_MARK_FILESYSTEM` | unprivileged groups may only place inode marks |
+| `FAN_UNLIMITED_MARKS`, `FAN_UNLIMITED_QUEUE` | admin-only init flags |
+| `FAN_REPORT_PIDFD`, `FAN_REPORT_TID` | admin-only init flags |
+| `FAN_CLASS_CONTENT`, `FAN_CLASS_PRE_CONTENT` | admin-only classes |
+
+The example below uses `FAN_MARK_FILESYSTEM`, which is why it must run as root.
+Without privilege the kernel also blanks `metadata.pid` for events caused by
+other processes, so `pid` attribution degrades to `0`.
 
 This crate is Linux-only and will fail to compile on other platforms.
 
