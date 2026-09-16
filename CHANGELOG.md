@@ -7,21 +7,21 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [0.7.1] - 2026-09-16
 
-Closes the six findings of the `KNOWN-ISSUES.md` audit.  The parser previously
-recognised three of the eight info record types the kernel defines and dropped
-everything else through `_ => {}` — silently, with no return value, counter or
-log line to tell a caller that data had been discarded.  `FAN_RENAME` was the
-worst case: its entire payload lives in two records that were dropped, so the
-event arrived as a bare mask.
-
-**No breaking changes.**  This release only adds API.  `FidEvent::new`'s
-signature is unchanged, `FidEvent`'s fields are private, and every item that
-existed in 0.7.0 still exists with the same name and signature — so an existing
-caller compiles and behaves as before.  The version is bumped because the
-release adds public API, not because anything stopped working.
+No breaking changes — this release only adds API.  `FidEvent::new`'s signature is
+unchanged, `FidEvent`'s fields are private, and every item that existed in 0.7.0
+still exists with the same name and signature, so an existing caller compiles and
+behaves as before.  The version moves because the release adds public API, not
+because anything stopped working.
 
 ### Added
 
+- `handle_from_fd()`: the descriptor-based counterpart of `name_to_handle_at`,
+  for an object the caller already has open.  It encodes the same handle bytes a
+  FID event carries, without re-resolving a path — so it cannot be raced by a
+  concurrent rename, needs no privileges, and lets a caller priming a
+  handle->path cache do it in the same pass as a tree walk instead of a second
+  one by path.  `name_to_handle_at` keeps its exact behaviour; both now share one
+  implementation of the syscall and its `EOVERFLOW` retry.
 - Constants `FAN_EVENT_INFO_TYPE_PIDFD` (4), `_ERROR` (5), `_RANGE` (6),
   `_MNT` (7), `_OLD_DFID_NAME` (10) and `_NEW_DFID_NAME` (12).
 - `FAN_RENAME` payloads are parsed: `FidEvent::rename_source()` and
@@ -45,14 +45,8 @@ release adds public API, not because anything stopped working.
   `with_rename_target` and `push_unknown_info_record` for constructing events
   by hand.
 - `FidEvent::set_dfid_name` and `set_self_handle`, so a caller can synthesise
-  one event from another while keeping the handle/name pair that path
-  resolution relies on.
-- `handle_from_fd()`: the descriptor-based counterpart of
-  `name_to_handle_at`.  It encodes a handle for an object the caller already has
-  open, without re-resolving a path, so it cannot be raced by a concurrent
-  rename and needs no privileges.  `name_to_handle_at` itself is unchanged
-  behaviourally; both now share one implementation of the syscall and its
-  `EOVERFLOW` retry.
+  one event from another while keeping the handle/name pair that path resolution
+  relies on.
 
 ### Changed
 
@@ -70,6 +64,11 @@ release adds public API, not because anything stopped working.
 
 ### Fixed
 
+- The parser previously recognised three of the eight info record types the
+  kernel defines and dropped everything else through `_ => {}` — silently, with
+  no return value, counter or log line to tell a caller that data had been
+  discarded.  `FAN_RENAME` was the worst case: its entire payload lives in two
+  records that were dropped, so the event arrived as a bare mask.
 - `FAN_RENAME` events no longer resolve to an empty path with no name.
 - The pidfd from a `FAN_REPORT_PIDFD` record is no longer leaked.
 
