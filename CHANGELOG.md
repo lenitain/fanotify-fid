@@ -5,6 +5,74 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.7.1] - 2026-09-16
+
+Closes the six findings of the `KNOWN-ISSUES.md` audit.  The parser previously
+recognised three of the eight info record types the kernel defines and dropped
+everything else through `_ => {}` — silently, with no return value, counter or
+log line to tell a caller that data had been discarded.  `FAN_RENAME` was the
+worst case: its entire payload lives in two records that were dropped, so the
+event arrived as a bare mask.
+
+**No breaking changes.**  This release only adds API.  `FidEvent::new`'s
+signature is unchanged, `FidEvent`'s fields are private, and every item that
+existed in 0.7.0 still exists with the same name and signature — so an existing
+caller compiles and behaves as before.  The version is bumped because the
+release adds public API, not because anything stopped working.
+
+### Added
+
+- Constants `FAN_EVENT_INFO_TYPE_PIDFD` (4), `_ERROR` (5), `_RANGE` (6),
+  `_MNT` (7), `_OLD_DFID_NAME` (10) and `_NEW_DFID_NAME` (12).
+- `FAN_RENAME` payloads are parsed: `FidEvent::rename_source()` and
+  `FidEvent::rename_target()` each return a `RenameSide { handle, name }`.  The
+  handle identifies the parent directory and `name` the entry within it, matching
+  the kernel's use of `fanotify_event_info_fid` for record types 10 and 12.
+  These are deliberately **not** overloaded onto `dfid_name_handle()` /
+  `dfid_name_filename()`.
+- `FAN_REPORT_PIDFD` payloads are parsed: `FidEvent::pidfd()` returns
+  `Option<BorrowedFd<'_>>` and `FidEvent::into_pidfd()` transfers the
+  `OwnedFd`.  The descriptor is owned by the event and closed on drop, so it no
+  longer leaks.
+- `FAN_FS_ERROR` payloads are parsed: `FidEvent::fs_error()` returns
+  `Option<(i32, u32)>` (negative errno, merged error count).
+- `FidEvent::unknown_info_records()` exposes `&[(u8, Vec<u8>)]` — every record
+  the parser had no typed field for, as `(info_type, payload)`.  This covers
+  `RANGE`, `MNT`, any future kernel type, **and** recognised types whose payload
+  failed its bounds check, so "data was dropped" is observable rather than
+  silent.  An empty slice means the event was fully understood.
+- `FidEvent::with_pidfd`, `with_fs_error`, `with_rename_source`,
+  `with_rename_target` and `push_unknown_info_record` for constructing events
+  by hand.
+- `FidEvent::set_dfid_name` and `set_self_handle`, so a caller can synthesise
+  one event from another while keeping the handle/name pair that path
+  resolution relies on.
+- `handle_from_fd()`: the descriptor-based counterpart of
+  `name_to_handle_at`.  It encodes a handle for an object the caller already has
+  open, without re-resolving a path, so it cannot be raced by a concurrent
+  rename and needs no privileges.  `name_to_handle_at` itself is unchanged
+  behaviourally; both now share one implementation of the syscall and its
+  `EOVERFLOW` retry.
+
+### Changed
+
+- `FidEvent`'s `PartialEq` is written out by hand instead of derived, because
+  `OwnedFd` has no `PartialEq` to derive through.  For any event obtainable
+  before this release the result is identical: the fields it adds compare equal
+  when empty, which is always the case for events built through
+  `FidEvent::new`.  `Clone` is still derived — with a pidfd present it shares the
+  descriptor rather than closing it twice.
+- `src/lib.rs` and `README.md` no longer claim a blanket `CAP_SYS_ADMIN`
+  requirement.  Creating a `FAN_CLASS_NOTIF` FID group needs no privilege; only
+  mount/filesystem marks, the unlimited-resource flags, `FAN_REPORT_PIDFD` /
+  `FAN_REPORT_TID` and the permission classes do.  Both docs now state which is
+  which.
+
+### Fixed
+
+- `FAN_RENAME` events no longer resolve to an empty path with no name.
+- The pidfd from a `FAN_REPORT_PIDFD` record is no longer leaked.
+
 ## [0.7.0] - 2026-08-02
 
 ### Added
