@@ -14,8 +14,31 @@
 //! ## Requirements
 //!
 //! - Linux kernel **≥ 5.1** (FID mode), **≥ 5.15** (`FAN_REPORT_TARGET_FID`)
-//! - **`CAP_SYS_ADMIN`** capability (run as root)
 //! - Minimum Rust version: **1.85** (edition 2024)
+//!
+//! ## Privileges
+//!
+//! Creating a `FAN_CLASS_NOTIF` group in FID mode needs **no** privilege: an
+//! unprivileged process can call `fanotify_init` with
+//! `FAN_REPORT_FID | FAN_REPORT_DIR_FID | FAN_REPORT_NAME` and receive FID
+//! events.  `CAP_SYS_ADMIN` is required for the things around it:
+//!
+//! | Needs `CAP_SYS_ADMIN` | Why |
+//! |---|---|
+//! | [`FAN_MARK_MOUNT`], [`FAN_MARK_FILESYSTEM`] | unprivileged groups may only place inode marks |
+//! | [`FAN_UNLIMITED_MARKS`], [`FAN_UNLIMITED_QUEUE`] | admin-only init flags |
+//! | [`FAN_REPORT_PIDFD`], `FAN_REPORT_TID` | admin-only init flags |
+//! | permission-event classes (`FAN_CLASS_CONTENT`, `FAN_CLASS_PRE_CONTENT`) | admin-only classes |
+//!
+//! An unprivileged group still receives events, but the kernel blanks
+//! `metadata.pid` for events caused by *other* processes, so process
+//! attribution degrades to `0`.
+//!
+//! [`FAN_MARK_MOUNT`]: crate::consts::FAN_MARK_MOUNT
+//! [`FAN_MARK_FILESYSTEM`]: crate::consts::FAN_MARK_FILESYSTEM
+//! [`FAN_UNLIMITED_MARKS`]: crate::consts::FAN_UNLIMITED_MARKS
+//! [`FAN_UNLIMITED_QUEUE`]: crate::consts::FAN_UNLIMITED_QUEUE
+//! [`FAN_REPORT_PIDFD`]: crate::consts::FAN_REPORT_PIDFD
 //!
 //! ## Error handling
 //!
@@ -86,11 +109,13 @@ pub use sys::{fanotify_init, fanotify_mark, open_mount};
 /// Convenience re-exports for the most common types and constants.
 pub mod prelude {
     pub use crate::consts::*;
-    pub use crate::handle::{name_to_handle_at, open_by_handle_at, resolve_file_handle};
+    pub use crate::handle::{
+        handle_from_fd, name_to_handle_at, open_by_handle_at, resolve_file_handle,
+    };
     pub use crate::parse::parse_fid_events;
     pub use crate::read::{FdReader, read_fid_events, write_response};
     pub use crate::types::{
-        FanotifyResponse, FdEvent, FidEvent, HandleCache, HandleKey, PathStore,
+        FanotifyResponse, FdEvent, FidEvent, HandleCache, HandleKey, PathStore, RenameSide,
     };
     pub use crate::{
         Fanotify, FanotifyBuilder, FanotifyError, fanotify_init, fanotify_mark, open_mount,

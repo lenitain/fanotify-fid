@@ -21,6 +21,30 @@ fn test_name_to_handle_at_real_path() {
     assert!(!h.is_empty());
 }
 
+/// `handle_from_fd` must produce exactly what the path-based form does.
+///
+/// This is the invariant a caller relies on to populate a handle→path cache
+/// from the directory descriptors its marking walk already holds: if the two
+/// disagreed, the cache would be keyed on handles that never appear in events.
+///
+/// Unprivileged: `name_to_handle_at` needs no capability on a filesystem that
+/// can encode handles.
+#[test]
+fn test_handle_from_fd_matches_path_form() {
+    let dir = tmpdir();
+    let sub = dir.path().join("sub");
+    fs::create_dir(&sub).unwrap();
+
+    let by_path = name_to_handle_at(&sub).expect("name_to_handle_at");
+    let file = fs::File::open(&sub).expect("open dir");
+    let by_fd = fanotify_fid::handle::handle_from_fd(&file).expect("handle_from_fd");
+
+    assert_eq!(
+        by_path, by_fd,
+        "fd-derived handle must equal path-derived handle byte for byte"
+    );
+}
+
 #[test]
 #[ignore]
 fn test_open_by_handle_at_resolve() {

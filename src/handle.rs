@@ -6,16 +6,122 @@
 use std::ffi::CString;
 use std::fs;
 use std::io;
-use std::os::fd::{AsRawFd, FromRawFd, OwnedFd};
+use std::os::fd::{AsFd, AsRawFd, FromRawFd, OwnedFd};
 use std::path::{Path, PathBuf};
 
 use crate::types::{FH_HDR_SIZE, HandleKey};
+
+/// Shared body of the `name_to_handle_at` wrappers.
+///
+/// `dfd`/`path`/`flags` are passed through unchanged, so `path` may be empty
+/// when `flags` contains `AT_EMPTY_PATH` — that is how the descriptor-based
+/// variant names its target.
+///
+/// Retries once on `EOVERFLOW`, which is the kernel asking for a bigger buffer.
+fn name_to_handle_at_raw(
+    dfd: libc::c_int,
+    path: *const libc::c_char,
+    flags: libc::c_int,
+) -> io::Result<HandleKey> {
+    // First call to determine required size (common case: 128 is plenty).
+    let mut buf = vec![0u8; 128];
+    let mut mount_id: libc::c_int = 0;
+
+    // Set handle_bytes to available payload space (total buf - 8 byte header).
+    // struct file_handle { u32 handle_bytes; i32 handle_type; u8 f_handle[]; };
+    let payload_bytes = (buf.len() - 8) as u32;
+    buf[0..4].copy_from_slice(&payload_bytes.to_ne_bytes());
+
+    // SAFETY: the caller guarantees `path` is a valid C string (or NULL under
+    // AT_EMPTY_PATH) and `dfd` a usable dirfd; `buf` is large enough to hold the
+    // handle header we advertise in its first 4 bytes.
+    let ret = unsafe {
+        libc::name_to_handle_at(
+            dfd,
+            path,
+            buf.as_mut_ptr() as *mut libc::file_handle,
+            &mut mount_id,
+            flags,
+        )
+    };
+
+    if ret != 0 {
+        let err = io::Error::last_os_error();
+        // If buffer was too small, retry with the size the kernel wrote
+        if err.raw_os_error() == Some(libc::EOVERFLOW) {
+            let needed = u32::from_ne_bytes(buf[0..4].try_into().unwrap()) as usize;
+            let mut buf = vec![0u8; needed + 64];
+            let payload_bytes = (buf.len() - 8) as u32;
+            buf[0..4].copy_from_slice(&payload_bytes.to_ne_bytes());
+            // SAFETY: same as above — same path/dfd, buffer sized per the kernel's request.
+            let ret = unsafe {
+                libc::name_to_handle_at(
+                    dfd,
+                    path,
+                    buf.as_mut_ptr() as *mut libc::file_handle,
+                    &mut mount_id,
+                    flags,
+                )
+            };
+            if ret != 0 {
+                return Err(io::Error::last_os_error());
+            }
+            let handle_bytes = u32::from_ne_bytes(buf[0..4].try_into().unwrap()) as usize;
+            buf.truncate(8 + handle_bytes);
+            return Ok(buf);
+        }
+        return Err(err);
+    }
+
+    let handle_bytes = u32::from_ne_bytes(buf[0..4].try_into().unwrap()) as usize;
+    buf.truncate(8 + handle_bytes);
+    Ok(buf)
+}
+
+/// Look up the file handle for an **open file descriptor**.
+///
+/// This is the descriptor-based counterpart of [`name_to_handle_at`]: it calls
+/// `name_to_handle_at(fd, "", ..., AT_EMPTY_PATH)` and returns the same handle
+/// bytes a fanotify FID event would carry for that object.
+///
+/// # Why prefer this over the path-based form
+///
+/// It never re-resolves a path, so it cannot be raced by a concurrent rename or
+/// `rmdir`, and it needs no path walk.  A caller that already holds a directory
+/// descriptor — a recursive marking walk, for instance — can populate a
+/// handle→path cache in the same pass instead of walking the tree a second time
+/// by path.
+///
+/// # Errors
+///
+/// Returns an `io::Error` if the descriptor is not a directory or file the
+/// filesystem can encode a handle for, or if the kernel does not support the
+/// syscall (requires Linux 2.6.39+).
+///
+/// # Example
+///
+/// ```rust,no_run
+/// use fanotify_fid::handle::handle_from_fd;
+///
+/// let dir = std::fs::File::open("/tmp").unwrap();
+/// let key = handle_from_fd(&dir).unwrap();
+/// println!("{} handle bytes", key.len());
+/// ```
+pub fn handle_from_fd<F: AsFd>(fd: F) -> io::Result<HandleKey> {
+    // Empty path is only valid in combination with AT_EMPTY_PATH; the kernel
+    // then uses `dfd` itself as the target object.
+    name_to_handle_at_raw(fd.as_fd().as_raw_fd(), c"".as_ptr(), libc::AT_EMPTY_PATH)
+}
 
 /// Look up the file handle for a path.
 ///
 /// Calls `name_to_handle_at(AT_FDCWD, path, ...)` and returns the raw file
 /// handle bytes, which can be used as a [`HandleKey`] or passed to
 /// [`open_by_handle_at`].
+///
+/// If you already have an open descriptor for the object, prefer
+/// [`handle_from_fd`]: it avoids re-resolving the path, so it cannot be raced by
+/// a concurrent rename.
 ///
 /// # Errors
 ///
@@ -35,58 +141,7 @@ pub fn name_to_handle_at(path: &Path) -> io::Result<HandleKey> {
     let c_path = CString::new(path.as_os_str().as_encoded_bytes())
         .map_err(|_| io::Error::new(io::ErrorKind::InvalidInput, "path contains null byte"))?;
 
-    // First call to determine required size (common case: 128 is plenty).
-    let mut buf = vec![0u8; 128];
-    let mut mount_id: libc::c_int = 0;
-
-    // Set handle_bytes to available payload space (total buf - 8 byte header).
-    // struct file_handle { u32 handle_bytes; i32 handle_type; u8 f_handle[]; };
-    let payload_bytes = (buf.len() - 8) as u32;
-    buf[0..4].copy_from_slice(&payload_bytes.to_ne_bytes());
-
-    // SAFETY: `name_to_handle_at` is a pure syscall; we pass a valid C string
-    // and a buffer large enough to hold the handle.
-    let ret = unsafe {
-        libc::name_to_handle_at(
-            libc::AT_FDCWD,
-            c_path.as_ptr(),
-            buf.as_mut_ptr() as *mut libc::file_handle,
-            &mut mount_id,
-            0,
-        )
-    };
-
-    if ret != 0 {
-        let err = io::Error::last_os_error();
-        // If buffer was too small, retry with the size the kernel wrote
-        if err.raw_os_error() == Some(libc::EOVERFLOW) {
-            let needed = u32::from_ne_bytes(buf[0..4].try_into().unwrap()) as usize;
-            let mut buf = vec![0u8; needed + 64];
-            let payload_bytes = (buf.len() - 8) as u32;
-            buf[0..4].copy_from_slice(&payload_bytes.to_ne_bytes());
-            // SAFETY: same as above — valid C string, buffer sized per kernel's request.
-            let ret = unsafe {
-                libc::name_to_handle_at(
-                    libc::AT_FDCWD,
-                    c_path.as_ptr(),
-                    buf.as_mut_ptr() as *mut libc::file_handle,
-                    &mut mount_id,
-                    0,
-                )
-            };
-            if ret != 0 {
-                return Err(io::Error::last_os_error());
-            }
-            let handle_bytes = u32::from_ne_bytes(buf[0..4].try_into().unwrap()) as usize;
-            buf.truncate(8 + handle_bytes);
-            return Ok(buf);
-        }
-        return Err(err);
-    }
-
-    let handle_bytes = u32::from_ne_bytes(buf[0..4].try_into().unwrap()) as usize;
-    buf.truncate(8 + handle_bytes);
-    Ok(buf)
+    name_to_handle_at_raw(libc::AT_FDCWD, c_path.as_ptr(), 0)
 }
 
 /// Open a file by its kernel file handle.
