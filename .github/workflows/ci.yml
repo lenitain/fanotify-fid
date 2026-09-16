@@ -10,14 +10,52 @@ env:
 
 jobs:
   test:
-    name: Test (stable)
+    name: Test (unprivileged)
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
       - uses: Swatinem/rust-cache@v2
       - run: cargo build
-      - run: cargo test --lib
+      # --all-targets, not --lib: the integration tests in tests/ are the only
+      # ones that touch a real kernel, and `cargo test --lib` skips every one of
+      # them.  FID mode needs no capability, so this job covers the whole
+      # parse-and-resolve pipeline without root.
+      - run: cargo test --all-targets
+
+  test-privileged:
+    name: Test (privileged)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      # Reaches what an unprivileged job cannot: open_by_handle_at
+      # (CAP_DAC_READ_SEARCH), permission events and both response forms, every
+      # admin-gated anchor, and the mount-identity row.  Without this job those
+      # paths have no executed coverage at all.
+      #
+      # --test-threads=1: these tests place real marks on real filesystems and
+      # read real event queues; serialising them keeps attribution unambiguous.
+      # --nocapture: a skipped test prints its reason, which the check below
+      # reads.  A skip still exits 0, so without this the job could pass while
+      # running none of the tests it exists for.
+      - name: Run privileged tests
+        run: |
+          set -o pipefail
+          cargo test --all-targets -- --ignored --test-threads=1 --nocapture 2>&1 \
+            | tee /tmp/privileged.log
+          if grep -q "SKIPPED:" /tmp/privileged.log; then
+            echo "::error::a privileged test skipped inside the privileged job"
+            grep "SKIPPED:" /tmp/privileged.log
+            exit 1
+          fi
+      # The non-ignored tests again, as root.  They are not a repeat: several of
+      # them branch on CapEff and assert the *privileged* verdict where the
+      # unprivileged job asserts EPERM, so a green unprivileged run says nothing
+      # about whether the combination is legal once the capability is present.
+      - name: Run the same tests as root
+        run: cargo test --all-targets -- --test-threads=1
 
   fmt:
     name: Format
@@ -39,3 +77,18 @@ jobs:
           components: clippy
       - uses: Swatinem/rust-cache@v2
       - run: cargo clippy --all-targets -- -D warnings
+
+  docs:
+    name: Docs and doctests
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - run: cargo doc --no-deps
+        env:
+          # Broken intra-doc links are documentation bugs, not style nits.
+          RUSTDOCFLAGS: "-D warnings"
+      # Doctests, including README.md (included through src/lib.rs).  These are
+      # what force the documented examples to keep compiling against the API.
+      - run: cargo test --doc

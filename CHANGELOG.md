@@ -5,42 +5,93 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [Unreleased]
+
+### Changed
+
+- **Parsing borrows the read buffer.** `FidEvent` now carries a lifetime —
+  `FidEvent<'buf>` — and its handle, name, rename-side and unknown-record bytes
+  are `Cow<'buf, [u8]>`, so a parse copies no record's bytes and the only
+  allocation left is growing the event `Vec`. `Fanotify::read_events` returns
+  `Vec<FidEvent<'_>>` for the same reason: the events are consumed inside the
+  read loop, and `FidEvent::into_owned` is the explicit conversion for one that
+  has to outlive the buffer. `parse_fid_events_into` refills an existing `Vec`
+  in place, keeping each event's unknown-record allocation. The lifetime model
+  is in the `fid` module docs.
+- `FanotifyResponse::allow` / `deny` / `deny_errno` / `audit_rule` are now sugar
+  over two low-level constructors, `FanotifyResponse::raw` (an arbitrary
+  decision word) and `FanotifyResponse::info` (an arbitrary record type and
+  payload), so a record type a newer kernel adds needs no crate release.
+  `FanotifyResponse::with_fd` attaches the descriptor a record-carrying
+  response is matched against; without one the kernel validates the record and
+  answers nothing.  The response documentation now states what `fanotify_write`
+  actually validates; in particular it corrects the earlier claim that the
+  `FAN_INFO` form answers the oldest pending event — the kernel matches every
+  response by the event's descriptor, and `FAN_AUDIT` (not `FAN_INFO`) is what
+  needs `FAN_ENABLE_AUDIT`.
+- `FanotifyError`, `Pidfd`, `EventResolution` and `EventStop` are
+  `#[non_exhaustive]`: the kernel surface they describe grows by addition, and a
+  caller matching exhaustively today should not be broken by one.
+- `FidEvent::set_dfid_name` and `set_self_handle` take any `Cow` input, so a
+  borrowed handle or name is stored without a copy.
+
+### Added
+
+- `ParseReport` and `EventStop`, plus the walk-reporting entry points
+  `parse_fid_events_reported`, `parse_fid_events_into`,
+  `Fanotify::read_events_reported`, and — for the fd format — `parse_fd_events`,
+  `parse_fd_events_into` and `Fanotify::read_fd_events_reported`.
+  `bytes_left > 0` now says that the tail was not interpreted, instead of a
+  truncated buffer merely yielding fewer events.
+- `FidEvent::set_fd_error`, and `FdEvent::new` / `FdEvent::set_fd_field` for
+  synthesising both event formats without a kernel. `FdEvent::new` accepts only
+  an `OwnedFd`; `set_fd_field` changes the reported number and claims nothing.
+- `Fanotify::mark_fd`: place a mark on the object a descriptor names, with no
+  path resolution at all. The kernel's descriptor form is a `NULL` pathname,
+  which also means an `O_PATH` descriptor is refused with `EBADF` — documented,
+  and asserted against the kernel in `tests/group.rs`.
+- `consts::AT_EMPTY_PATH` (`0x1000`), the flag `handle_from_fd` already used.
+- `fuzz/` with three cargo-fuzz targets (`parse_fid_events`, `parse_fd_events`,
+  `resolve_dir`) and `tests/properties.rs`, which checks the
+  `without_deleted_suffix`, resolver-convergence and parser-totality properties
+  in every `cargo test` run.
+
 ## [0.7.1] - 2026-09-16
 
-No breaking changes — this release only adds API.  `FidEvent::new`'s signature is
+No breaking changes — this release only adds API. `FidEvent::new`'s signature is
 unchanged, `FidEvent`'s fields are private, and every item that existed in 0.7.0
 still exists with the same name and signature, so an existing caller compiles and
-behaves as before.  The version moves because the release adds public API, not
+behaves as before. The version moves because the release adds public API, not
 because anything stopped working.
 
 ### Added
 
 - `handle_from_fd()`: the descriptor-based counterpart of `name_to_handle_at`,
-  for an object the caller already has open.  It encodes the same handle bytes a
+  for an object the caller already has open. It encodes the same handle bytes a
   FID event carries, without re-resolving a path — so it cannot be raced by a
   concurrent rename, needs no privileges, and lets a caller priming a
   handle->path cache do it in the same pass as a tree walk instead of a second
-  one by path.  `name_to_handle_at` keeps its exact behaviour; both now share one
+  one by path. `name_to_handle_at` keeps its exact behaviour; both now share one
   implementation of the syscall and its `EOVERFLOW` retry.
 - Constants `FAN_EVENT_INFO_TYPE_PIDFD` (4), `_ERROR` (5), `_RANGE` (6),
   `_MNT` (7), `_OLD_DFID_NAME` (10) and `_NEW_DFID_NAME` (12).
 - `FAN_RENAME` payloads are parsed: `FidEvent::rename_source()` and
-  `FidEvent::rename_target()` each return a `RenameSide { handle, name }`.  The
+  `FidEvent::rename_target()` each return a `RenameSide { handle, name }`. The
   handle identifies the parent directory and `name` the entry within it, matching
   the kernel's use of `fanotify_event_info_fid` for record types 10 and 12.
   These are deliberately **not** overloaded onto `dfid_name_handle()` /
   `dfid_name_filename()`.
 - `FAN_REPORT_PIDFD` payloads are parsed: `FidEvent::pidfd()` returns
   `Option<BorrowedFd<'_>>` and `FidEvent::into_pidfd()` transfers the
-  `OwnedFd`.  The descriptor is owned by the event and closed on drop, so it no
+  `OwnedFd`. The descriptor is owned by the event and closed on drop, so it no
   longer leaks.
 - `FAN_FS_ERROR` payloads are parsed: `FidEvent::fs_error()` returns
   `Option<(i32, u32)>` (negative errno, merged error count).
 - `FidEvent::unknown_info_records()` exposes `&[(u8, Vec<u8>)]` — every record
-  the parser had no typed field for, as `(info_type, payload)`.  This covers
+  the parser had no typed field for, as `(info_type, payload)`. This covers
   `RANGE`, `MNT`, any future kernel type, **and** recognised types whose payload
   failed its bounds check, so "data was dropped" is observable rather than
-  silent.  An empty slice means the event was fully understood.
+  silent. An empty slice means the event was fully understood.
 - `FidEvent::with_pidfd`, `with_fs_error`, `with_rename_source`,
   `with_rename_target` and `push_unknown_info_record` for constructing events
   by hand.
@@ -51,15 +102,15 @@ because anything stopped working.
 ### Changed
 
 - `FidEvent`'s `PartialEq` is written out by hand instead of derived, because
-  `OwnedFd` has no `PartialEq` to derive through.  For any event obtainable
+  `OwnedFd` has no `PartialEq` to derive through. For any event obtainable
   before this release the result is identical: the fields it adds compare equal
   when empty, which is always the case for events built through
-  `FidEvent::new`.  `Clone` is still derived — with a pidfd present it shares the
+  `FidEvent::new`. `Clone` is still derived — with a pidfd present it shares the
   descriptor rather than closing it twice.
 - `src/lib.rs` and `README.md` no longer claim a blanket `CAP_SYS_ADMIN`
-  requirement.  Creating a `FAN_CLASS_NOTIF` FID group needs no privilege; only
+  requirement. Creating a `FAN_CLASS_NOTIF` FID group needs no privilege; only
   mount/filesystem marks, the unlimited-resource flags, `FAN_REPORT_PIDFD` /
-  `FAN_REPORT_TID` and the permission classes do.  Both docs now state which is
+  `FAN_REPORT_TID` and the permission classes do. Both docs now state which is
   which.
 
 ### Fixed
@@ -67,7 +118,7 @@ because anything stopped working.
 - The parser previously recognised three of the eight info record types the
   kernel defines and dropped everything else through `_ => {}` — silently, with
   no return value, counter or log line to tell a caller that data had been
-  discarded.  `FAN_RENAME` was the worst case: its entire payload lives in two
+  discarded. `FAN_RENAME` was the worst case: its entire payload lives in two
   records that were dropped, so the event arrived as a bare mask.
 - `FAN_RENAME` events no longer resolve to an empty path with no name.
 - The pidfd from a `FAN_REPORT_PIDFD` record is no longer leaked.
@@ -155,6 +206,7 @@ assert!(ev.fd().is_none());
 ### Migration Guide
 
 **Struct field access** (breaking):
+
 ```rust
 // Before (0.4.x)
 let ev: FidEvent = ...;
@@ -166,6 +218,7 @@ println!("pid={} path={}", ev.pid(), ev.path().display());
 ```
 
 **Struct construction** (breaking):
+
 ```rust
 // Before (0.4.x)
 let resp = FanotifyResponse { fd: 5, response: FAN_ALLOW };
@@ -251,10 +304,10 @@ let resp = FanotifyResponse::new(5, FAN_ALLOW);
   ```rust
   // Basic usage
   let events = FdReader::new().read(&fan_fd)?;
-  
+
   // Custom buffer size (default: 200 events)
   let events = FdReader::new().event_count(500).read(&fan_fd)?;
-  
+
   // Callback mode
   FdReader::new().read_do(&fan_fd, |ev| { ... })?;
   ```

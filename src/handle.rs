@@ -1,234 +1,701 @@
-//! Safe wrappers around `name_to_handle_at` and `open_by_handle_at`.
+//! File handles: the syscalls that produce and consume the identity a FID event
+//! carries.
 //!
-//! These two syscalls are needed to convert the file handles received in
-//! fanotify FID events back into filesystem paths.
+//! A FID event does not name a file by path or by descriptor.  It carries an
+//! **fsid** and a **file handle** — an opaque byte string the filesystem
+//! produced — and that pair is all the kernel reports.  Four syscalls make the
+//! pair usable:
+//!
+//! | Call | Direction |
+//! |---|---|
+//! | [`name_to_handle_at`] | path → handle |
+//! | [`handle_from_fd`] | open descriptor → handle |
+//! | [`open_by_handle_at`] | handle + mount descriptor → open descriptor |
+//! | [`fsid_of_path`] / [`fsid_of_fd`] | path or descriptor → fsid |
+//!
+//! # Two facts that decide how you use these
+//!
+//! **A handle is only meaningful together with its filesystem.**  The bytes
+//! carry no filesystem identity of their own, and unrelated filesystems really
+//! do produce identical bytes for different objects: every filesystem that falls
+//! back to the kernel's synthetic `FILEID_INO64_GEN` encoding (procfs, sysfs,
+//! debugfs, tracefs, bpf, devpts) hands out the same bytes for its root.
+//! [`resolve_file_handle`] therefore takes the fsid as an optional filter —
+//! `Some(fsid)` from the event is the correct answer, and `None` means "try
+//! every mount descriptor", which is what you want only when you have one
+//! filesystem.  [`Mounts`] carries that pairing, and [`PathStore`] is where an
+//! answer, once learned, can be kept — see
+//! [`PathResolver`](crate::resolve::PathResolver) for the two used together.
+//!
+//! **Opening by handle needs `CAP_DAC_READ_SEARCH`**, which an unprivileged
+//! process can never hold: the call bypasses path permissions by design, so the
+//! kernel does not let it be used without them, and it is not a permission a
+//! caller can otherwise arrange — ownership, file mode and `CAP_DAC_OVERRIDE`
+//! are not substitutes.  This is not a gap in the crate.  The events themselves
+//! carry the handle, the parent handle and the entry name, and those need no
+//! privilege at all — a consumer that keeps its own index, or asks
+//! [`handle_from_fd`] about directories it can already open, never has to call
+//! [`open_by_handle_at`].
+//!
+//! # Paths from handles are best-effort, and cannot be otherwise
+//!
+//! The only way to turn an open descriptor back into a path is
+//! `readlink("/proc/self/fd/N")`, which is what [`resolve_file_handle`] does.
+//! Two consequences follow, and neither has a workaround:
+//!
+//! * On a busy filesystem the object may be renamed between the open and the
+//!   `readlink`, so the answer describes a moment, not an invariant.
+//! * `/proc` appends `" (deleted)"` to the link target of an unlinked object —
+//!   and a file may legitimately *be* named `foo (deleted)`, in which case the
+//!   marker is doubled and stripping it once names a different, possibly
+//!   existing, file.  Nothing in the string distinguishes the two, so this
+//!   module does not guess: it returns exactly what `/proc` reported.
 
 use std::ffi::CString;
 use std::fs;
 use std::io;
-use std::os::fd::{AsFd, AsRawFd, FromRawFd, OwnedFd};
+use std::os::fd::{AsFd, AsRawFd, BorrowedFd, FromRawFd, OwnedFd};
 use std::path::{Path, PathBuf};
 
-use crate::types::{FH_HDR_SIZE, HandleKey};
+use crate::consts::{AT_EMPTY_PATH, AT_HANDLE_FID, MAX_HANDLE_SZ};
+use crate::sys::errno;
 
-/// Shared body of the `name_to_handle_at` wrappers.
+/// A filesystem id, as a FID info record reports it: the two `int`s of
+/// `statfs(2)`'s `f_fsid`.
+pub type Fsid = (i32, i32);
+
+/// A raw file handle: the bytes of `struct file_handle`, header included.
 ///
-/// `dfd`/`path`/`flags` are passed through unchanged, so `path` may be empty
-/// when `flags` contains `AT_EMPTY_PATH` — that is how the descriptor-based
-/// variant names its target.
+/// This is exactly what [`open_by_handle_at`] takes and exactly what a FID info
+/// record carries, with no wrapper and no normalisation — the bytes are the
+/// filesystem's, and reinterpreting them here would only add a way to be wrong.
+pub type FileHandle = Vec<u8>;
+
+/// Size of `struct file_handle`'s fixed part: `handle_bytes` (u32) +
+/// `handle_type` (i32).
+pub const FILE_HANDLE_HEADER_SIZE: usize = 8;
+
+/// The largest buffer `name_to_handle_at` accepts: the header plus
+/// [`MAX_HANDLE_SZ`] bytes of payload.
+pub const MAX_FILE_HANDLE_SIZE: usize = FILE_HANDLE_HEADER_SIZE + MAX_HANDLE_SZ;
+
+/// What a caller already knows about handles, kept across calls.
 ///
-/// Retries once on `EOVERFLOW`, which is the kernel asking for a bigger buffer.
+/// A handle costs a privileged `open_by_handle_at` plus a `readlink` to become a
+/// path, and an event stream asks about the *same* directory handle again and
+/// again — every event about a child of one directory names that directory.  The
+/// store is where that knowledge lives between calls, which makes it the thing
+/// that turns "one syscall per event" into "one syscall per directory".
+///
+/// # It holds what the kernel said, and nothing else
+///
+/// A stored path is the raw `readlink` result, so an unlinked object is stored
+/// with the `" (deleted)"` marker `/proc` appends.  The store does not clean
+/// that up, and must not: see [`crate::fid::FidEvent::without_deleted_suffix`]
+/// for why the decision belongs to the caller, and
+/// [`PathResolver`](crate::resolve::PathResolver) for how it is kept consistent.
+///
+/// # Implementing it
+///
+/// Only three operations are required, and two are already what a map does.
+/// Implement it to bound the cache (an LRU that drops the oldest entries), to
+/// share it (a handle behind a lock), to persist it, to forget on demand, or to
+/// keep nothing at all ([`NoCache`]) — none of which this crate can choose for
+/// you, because each is a policy about memory, staleness or concurrency.
+///
+/// A hit is used as the answer and no syscall is spent; a miss means "ask the
+/// filesystem".  So a store that expires, forgets or declines to answer costs a
+/// privileged call rather than producing a wrong path, while a store that *does*
+/// answer is what keeps two events about one handle from contradicting each
+/// other.
+///
+/// The key is the **pair** of fsid and handle, not the handle alone: handle
+/// bytes are only meaningful together with their filesystem.  Two filesystems
+/// that both fall back to the kernel's synthetic `FILEID_INO64_GEN` encoding
+/// (procfs, sysfs, tracefs, …) hand out identical bytes for their roots, so a
+/// store keyed on bytes alone answers with another filesystem's path.
+pub trait PathStore {
+    /// The path already known for this handle, if any.
+    fn get(&self, fsid: Fsid, handle: &[u8]) -> Option<PathBuf>;
+
+    /// Record a path for this handle.
+    ///
+    /// Called with what the filesystem reported, including any `" (deleted)"`
+    /// marker.  While the entry is there, later lookups of the same handle
+    /// return what was recorded, so that every reader of one handle sees one
+    /// answer; [`forget`](Self::forget) is how a caller replaces it.
+    fn insert(&mut self, fsid: Fsid, handle: &[u8], path: PathBuf);
+
+    /// Drop what is known about this handle, so the next lookup asks the
+    /// filesystem again.
+    ///
+    /// The way to answer *where is it now*: a handle's path can change — a
+    /// rename is exactly that — and this store holds the answer from when it
+    /// was learned.  Forgetting before the next resolution makes the resolver
+    /// spend the syscall, which is what a caller that has just seen a rename
+    /// event wants.
+    fn forget(&mut self, fsid: Fsid, handle: &[u8]);
+}
+
+/// The store this crate uses when the caller has no reason to choose one.
+///
+/// An unbounded [`HashMap`](std::collections::HashMap) — the simplest thing that
+/// makes repeated handles cheap.  Unbounded is a real property and not an oversight: this crate cannot
+/// know how many handles a long-running process will see, so a bound would be a
+/// guess that silently discards knowledge.  A caller that needs one implements
+/// [`PathStore`] over an LRU or a TTL map and passes that instead.
+pub type HandleCache = std::collections::HashMap<(Fsid, FileHandle), PathBuf>;
+
+impl PathStore for HandleCache {
+    fn get(&self, fsid: Fsid, handle: &[u8]) -> Option<PathBuf> {
+        // Fully qualified: `self.get(..)` here would be this trait method, not
+        // the map's, and would recurse until the stack ran out.
+        std::collections::HashMap::get(self, &(fsid, handle.to_vec())).cloned()
+    }
+
+    fn insert(&mut self, fsid: Fsid, handle: &[u8], path: PathBuf) {
+        std::collections::HashMap::insert(self, (fsid, handle.to_vec()), path);
+    }
+
+    fn forget(&mut self, fsid: Fsid, handle: &[u8]) {
+        // Fully qualified for the same reason as `get` above.
+        std::collections::HashMap::remove(self, &(fsid, handle.to_vec()));
+    }
+}
+
+/// A store that remembers nothing, so every resolution asks the filesystem.
+///
+/// The answer is then the path as of the call rather than as of the first event
+/// about that handle: what a caller watching for renames wants, and what a
+/// caller that needs no consistency across events pays for with one
+/// [`open_by_handle_at`] per handle.  [`HandleCache`] is the opposite choice,
+/// and [`PathStore::forget`] is the middle one — keep the cache, drop what a
+/// rename invalidated.
+#[derive(Debug, Clone, Copy, Default)]
+pub struct NoCache;
+
+impl PathStore for NoCache {
+    /// Nothing is ever known.
+    fn get(&self, _fsid: Fsid, _handle: &[u8]) -> Option<PathBuf> {
+        None
+    }
+
+    /// Nothing is recorded: keeping it is the one thing this store does not do.
+    fn insert(&mut self, _fsid: Fsid, _handle: &[u8], _path: PathBuf) {}
+
+    /// Nothing to forget.
+    fn forget(&mut self, _fsid: Fsid, _handle: &[u8]) {}
+}
+
+/// Look up the file handle of an **open descriptor**.
+///
+/// The descriptor-based form of [`name_to_handle_at`]: it resolves no path, so
+/// it cannot be raced by a concurrent rename, and it reaches objects a path
+/// cannot — a file in a directory the caller may not read, or one with no
+/// remaining name at all.
+///
+/// The bytes returned are the ones a FID event reports for the same object, so
+/// this is how a caller learns the handle of something it can already open: a
+/// directory it is watching, a file it just created.
+///
+/// # Errors
+///
+/// `EOPNOTSUPP` if the filesystem cannot encode handles at all (a pipe, a
+/// socket, or some pseudo-filesystems), `ENOTDIR`/`EBADF` if the descriptor is
+/// not usable, `ENOSYS` on a kernel without the call (pre-2.6.39).
+///
+/// ```rust,no_run
+/// use fanotify_fid::handle::handle_from_fd;
+///
+/// let dir = std::fs::File::open("/tmp")?;
+/// let handle = handle_from_fd(&dir)?;
+/// println!("{} bytes of handle", handle.len());
+/// # Ok::<(), std::io::Error>(())
+/// ```
+pub fn handle_from_fd<Fd: AsFd>(fd: Fd) -> io::Result<FileHandle> {
+    // An empty path is only valid together with `AT_EMPTY_PATH`; the kernel
+    // then uses the descriptor itself as the object to encode.
+    name_to_handle_at_raw(fd.as_fd().as_raw_fd(), c"".as_ptr(), AT_EMPTY_PATH)
+}
+
+/// Look up the file handle of a **path**.
+///
+/// Asks for a FID rather than an openable handle, because a FID is what fanotify
+/// reports: on filesystems with no `fh_to_dentry` operation a plain request
+/// fails with `EOPNOTSUPP` while a FID request succeeds.  On filesystems that
+/// support both, the two requests produce identical bytes, so there is nothing
+/// to choose between them and this picks the one that always works.
+///
+/// Prefer [`handle_from_fd`] when you hold a descriptor: this call resolves the
+/// path again, and that resolution can be raced.
+///
+/// # Errors
+///
+/// Any `name_to_handle_at` errno — `ENOENT`, `EACCES`, `EOPNOTSUPP`, `EPERM`
+/// for a path that requires `CAP_DAC_READ_SEARCH` to walk.
+///
+/// ```rust,no_run
+/// use fanotify_fid::handle::name_to_handle_at;
+///
+/// let handle = name_to_handle_at(std::path::Path::new("/tmp"))?;
+/// # Ok::<(), std::io::Error>(())
+/// ```
+pub fn name_to_handle_at<P: AsRef<Path> + ?Sized>(path: &P) -> io::Result<FileHandle> {
+    let c_path = c_path(path.as_ref())?;
+    name_to_handle_at_raw(libc::AT_FDCWD, c_path.as_ptr(), 0)
+}
+
+/// `name_to_handle_at` with an explicit anchor, asking for a FID.
+///
+/// `AT_HANDLE_FID` is only understood from Linux 6.13; older kernels report
+/// `EINVAL` for a flag they do not know, so that specific error is retried
+/// without it.  The retry cannot mask a real `EINVAL`: the only other thing
+/// `EINVAL` means here is a capacity problem, and the capacity is fixed at the
+/// maximum the kernel accepts.
 fn name_to_handle_at_raw(
-    dfd: libc::c_int,
+    dir_fd: i32,
     path: *const libc::c_char,
-    flags: libc::c_int,
-) -> io::Result<HandleKey> {
-    // First call to determine required size (common case: 128 is plenty).
-    let mut buf = vec![0u8; 128];
+    flags: i32,
+) -> io::Result<FileHandle> {
+    match name_to_handle_at_flags(dir_fd, path, flags | AT_HANDLE_FID) {
+        Err(e) if e.raw_os_error() == Some(libc::EINVAL) => {
+            name_to_handle_at_flags(dir_fd, path, flags)
+        }
+        other => other,
+    }
+}
+
+/// One `name_to_handle_at` attempt with exactly the given flags.
+fn name_to_handle_at_flags(
+    dir_fd: i32,
+    path: *const libc::c_char,
+    flags: i32,
+) -> io::Result<FileHandle> {
+    // Advertise the largest capacity the kernel accepts, so a filesystem whose
+    // handle does not fit is refusing the request rather than being asked twice.
+    let mut buf = vec![0u8; MAX_FILE_HANDLE_SIZE];
     let mut mount_id: libc::c_int = 0;
+    // `struct file_handle { u32 handle_bytes; i32 handle_type; u8 f_handle[]; }`
+    // — on the way in, `handle_bytes` is the *capacity* of `f_handle`.
+    buf[0..4].copy_from_slice(&(MAX_HANDLE_SZ as u32).to_ne_bytes());
 
-    // Set handle_bytes to available payload space (total buf - 8 byte header).
-    // struct file_handle { u32 handle_bytes; i32 handle_type; u8 f_handle[]; };
-    let payload_bytes = (buf.len() - 8) as u32;
-    buf[0..4].copy_from_slice(&payload_bytes.to_ne_bytes());
-
-    // SAFETY: the caller guarantees `path` is a valid C string (or NULL under
-    // AT_EMPTY_PATH) and `dfd` a usable dirfd; `buf` is large enough to hold the
-    // handle header we advertise in its first 4 bytes.
+    // SAFETY: `path` is a NUL-terminated string owned by the caller (or an
+    // empty one under `AT_EMPTY_PATH`, where the kernel does not read it), and
+    // `buf` is at least as large as the capacity its first four bytes
+    // advertise, which is what the kernel writes the handle into.
     let ret = unsafe {
         libc::name_to_handle_at(
-            dfd,
+            dir_fd,
             path,
             buf.as_mut_ptr() as *mut libc::file_handle,
             &mut mount_id,
             flags,
         )
     };
-
     if ret != 0 {
-        let err = io::Error::last_os_error();
-        // If buffer was too small, retry with the size the kernel wrote
-        if err.raw_os_error() == Some(libc::EOVERFLOW) {
-            let needed = u32::from_ne_bytes(buf[0..4].try_into().unwrap()) as usize;
-            let mut buf = vec![0u8; needed + 64];
-            let payload_bytes = (buf.len() - 8) as u32;
-            buf[0..4].copy_from_slice(&payload_bytes.to_ne_bytes());
-            // SAFETY: same as above — same path/dfd, buffer sized per the kernel's request.
-            let ret = unsafe {
-                libc::name_to_handle_at(
-                    dfd,
-                    path,
-                    buf.as_mut_ptr() as *mut libc::file_handle,
-                    &mut mount_id,
-                    flags,
-                )
-            };
-            if ret != 0 {
-                return Err(io::Error::last_os_error());
-            }
-            let handle_bytes = u32::from_ne_bytes(buf[0..4].try_into().unwrap()) as usize;
-            buf.truncate(8 + handle_bytes);
-            return Ok(buf);
-        }
-        return Err(err);
+        return Err(io::Error::from_raw_os_error(errno()));
     }
 
-    let handle_bytes = u32::from_ne_bytes(buf[0..4].try_into().unwrap()) as usize;
-    buf.truncate(8 + handle_bytes);
+    // On success the kernel writes back the *used* length.  Clamp it to the
+    // capacity offered so a bogus reply cannot produce a longer slice than the
+    // buffer holds.
+    let used = u32::from_ne_bytes(buf[0..4].try_into().unwrap()) as usize;
+    buf.truncate(FILE_HANDLE_HEADER_SIZE + used.min(MAX_HANDLE_SZ));
     Ok(buf)
 }
 
-/// Look up the file handle for an **open file descriptor**.
+/// Open a file from its handle, against a mount descriptor on its filesystem.
 ///
-/// This is the descriptor-based counterpart of [`name_to_handle_at`]: it calls
-/// `name_to_handle_at(fd, "", ..., AT_EMPTY_PATH)` and returns the same handle
-/// bytes a fanotify FID event would carry for that object.
+/// `mount_fd` must be a directory descriptor on the filesystem that produced
+/// the handle — any directory on it, not necessarily its mount point.
 ///
-/// # Why prefer this over the path-based form
-///
-/// It never re-resolves a path, so it cannot be raced by a concurrent rename or
-/// `rmdir`, and it needs no path walk.  A caller that already holds a directory
-/// descriptor — a recursive marking walk, for instance — can populate a
-/// handle→path cache in the same pass instead of walking the tree a second time
-/// by path.
+/// The returned descriptor is opened `O_PATH`, so it names the object and can
+/// be `readlink`ed through `/proc/self/fd`, but cannot be read or written.
 ///
 /// # Errors
 ///
-/// Returns an `io::Error` if the descriptor is not a directory or file the
-/// filesystem can encode a handle for, or if the kernel does not support the
-/// syscall (requires Linux 2.6.39+).
+/// `EPERM` without `CAP_DAC_READ_SEARCH` — the expected answer for an
+/// unprivileged caller, and not a defect to work around.
 ///
-/// # Example
+/// `ESTALE` is how the kernel reports **every** way this can fail to decode: the
+/// object was deleted, the handle belongs to a different filesystem, or this
+/// filesystem has no `fh_to_dentry` operation at all.  All three arrive as the
+/// same errno, so they cannot be told apart from it — `ENOENT` and
+/// `EOPNOTSUPP` are not in this call's vocabulary, even though
+/// [`name_to_handle_at`] does use the second.
 ///
-/// ```rust,no_run
-/// use fanotify_fid::handle::handle_from_fd;
-///
-/// let dir = std::fs::File::open("/tmp").unwrap();
-/// let key = handle_from_fd(&dir).unwrap();
-/// println!("{} handle bytes", key.len());
-/// ```
-pub fn handle_from_fd<F: AsFd>(fd: F) -> io::Result<HandleKey> {
-    // Empty path is only valid in combination with AT_EMPTY_PATH; the kernel
-    // then uses `dfd` itself as the target object.
-    name_to_handle_at_raw(fd.as_fd().as_raw_fd(), c"".as_ptr(), libc::AT_EMPTY_PATH)
-}
-
-/// Look up the file handle for a path.
-///
-/// Calls `name_to_handle_at(AT_FDCWD, path, ...)` and returns the raw file
-/// handle bytes, which can be used as a [`HandleKey`] or passed to
-/// [`open_by_handle_at`].
-///
-/// If you already have an open descriptor for the object, prefer
-/// [`handle_from_fd`]: it avoids re-resolving the path, so it cannot be raced by
-/// a concurrent rename.
-///
-/// # Errors
-///
-/// Returns an `io::Error` if the path does not exist, the process lacks
-/// permission, or the kernel does not support `name_to_handle_at` (requires
-/// Linux 2.6.39+).
-///
-/// # Example
-///
-/// ```rust,no_run
-/// use fanotify_fid::handle::name_to_handle_at;
-/// use std::path::Path;
-///
-/// let key = name_to_handle_at(Path::new("/tmp")).unwrap();
-/// ```
-pub fn name_to_handle_at(path: &Path) -> io::Result<HandleKey> {
-    let c_path = CString::new(path.as_os_str().as_encoded_bytes())
-        .map_err(|_| io::Error::new(io::ErrorKind::InvalidInput, "path contains null byte"))?;
-
-    name_to_handle_at_raw(libc::AT_FDCWD, c_path.as_ptr(), 0)
-}
-
-/// Open a file by its kernel file handle.
-///
-/// Calls `open_by_handle_at(mount_fd, fh_data, O_PATH)` and returns an
-/// [`OwnedFd`] for the opened file.
-///
-/// `mount_fd` must be an open file descriptor referencing a mount point on the
-/// same filesystem that originally produced the handle.  `fh_data` is the raw
-/// handle bytes from a fanotify FID info record or from [`name_to_handle_at`].
-///
-/// The returned fd is opened with `O_PATH`, so it can be used with
-/// `readlink("/proc/self/fd/N")` to recover the path, but not for I/O.
-///
-/// # Errors
-///
-/// Returns an `io::Error` if the handle is invalid, the mount fd does not
-/// belong to the right filesystem, or the file has been deleted.
-pub fn open_by_handle_at(mount_fd: i32, fh_data: &[u8]) -> io::Result<OwnedFd> {
-    if fh_data.len() < FH_HDR_SIZE {
+/// `EINVAL` for malformed bytes.  `EXDEV` when the mount descriptor is on a
+/// different filesystem.  `ENOSYS` on a kernel without the call.
+pub fn open_by_handle_at<Fd: AsFd>(mount_fd: Fd, handle: &[u8]) -> io::Result<OwnedFd> {
+    if handle.len() < FILE_HANDLE_HEADER_SIZE || handle.len() > MAX_FILE_HANDLE_SIZE {
         return Err(io::Error::new(
             io::ErrorKind::InvalidInput,
-            "file_handle data too short",
+            "handle must be a struct file_handle: an 8-byte header plus at most MAX_HANDLE_SZ bytes",
         ));
     }
 
-    // SAFETY: `open_by_handle_at` is a pure kernel syscall.  `mount_fd` must
-    // be a valid fd referencing a mount point on the same filesystem as the
-    // handle.  The caller guarantees this by providing the mount fd from
-    // `open_mount()` or similar.  The kernel validates internally.
+    // SAFETY: `handle` is a byte slice of at least the header size and at most
+    // the maximum the kernel accepts, which is exactly what the kernel reads
+    // through the `*mut file_handle`; `mount_fd` is borrowed for the call.
+    // The kernel does not write through the pointer despite the non-const type.
     let fd = unsafe {
         libc::open_by_handle_at(
-            mount_fd,
-            fh_data.as_ptr() as *mut libc::file_handle,
-            libc::O_PATH,
+            mount_fd.as_fd().as_raw_fd(),
+            handle.as_ptr() as *mut libc::file_handle,
+            libc::O_PATH | libc::O_CLOEXEC,
         )
     };
-
     if fd < 0 {
-        return Err(io::Error::last_os_error());
+        return Err(io::Error::from_raw_os_error(errno()));
     }
-
-    // SAFETY: `fd` was just returned by a successful `open_by_handle_at` call
-    // and is therefore a valid, owned file descriptor.
+    // SAFETY: a non-negative return from `open_by_handle_at` is a descriptor
+    // this process owns and nothing else refers to.
     Ok(unsafe { OwnedFd::from_raw_fd(fd) })
 }
 
-/// Resolve a file handle to an absolute path by trying each mount fd.
+/// The filesystem id of a path, as a FID record would report it.
 ///
-/// Iterates through `mount_fds`, attempting [`open_by_handle_at`] on each
-/// until one succeeds.  On success, reads the path via
-/// `readlink("/proc/self/fd/{fd}")`.
+/// This is `statfs(path).f_fsid`.  Use it to recognise which of your mount
+/// descriptors belongs to an event, since that is what decides whether a handle
+/// may be opened against it.
 ///
-/// Returns `None` if no mount fd can resolve the handle (e.g. the file was
-/// deleted, or none of the mount fds belong to the right filesystem).
+/// # Errors
 ///
-/// This is a best-effort function: on a busy system, the file may be deleted
-/// between resolution and path read.
-/// Remove the trailing " (deleted)" marker that `/proc/self/fd` appends to
-/// symlinks of unlinked objects.
-pub fn strip_deleted_suffix(path: PathBuf) -> PathBuf {
-    let s = path.to_string_lossy();
-    match s.strip_suffix(" (deleted)") {
-        Some(stripped) => PathBuf::from(stripped),
-        None => path,
+/// `ENOENT` if the path does not exist, `EACCES` if it cannot be reached.
+pub fn fsid_of_path<P: AsRef<Path> + ?Sized>(path: &P) -> io::Result<Fsid> {
+    let c_path = c_path(path.as_ref())?;
+    // SAFETY: `statfs` fills a struct this process owns, and `c_path` is a
+    // NUL-terminated string alive for the call.
+    let mut st: libc::statfs = unsafe { std::mem::zeroed() };
+    // SAFETY: as above; the return value is checked before `st` is read.
+    let ret = unsafe { libc::statfs(c_path.as_ptr(), &mut st) };
+    if ret != 0 {
+        return Err(io::Error::from_raw_os_error(errno()));
+    }
+    Ok(fsid_of_statfs(&st))
+}
+
+/// The filesystem id of an open descriptor.
+///
+/// Cheaper than [`fsid_of_path`] when a descriptor is already held, and it
+/// cannot be raced by a path change.
+pub fn fsid_of_fd<Fd: AsFd>(fd: Fd) -> io::Result<Fsid> {
+    // SAFETY: `fstatfs` fills a struct this process owns.
+    let mut st: libc::statfs = unsafe { std::mem::zeroed() };
+    // SAFETY: as above; the return value is checked before `st` is read.
+    let ret = unsafe { libc::fstatfs(fd.as_fd().as_raw_fd(), &mut st) };
+    if ret != 0 {
+        return Err(io::Error::from_raw_os_error(errno()));
+    }
+    Ok(fsid_of_statfs(&st))
+}
+
+/// `f_fsid` as the `(i32, i32)` pair a FID record carries.
+///
+/// `libc` keeps `fsid_t`'s only field private, so the two words are read by
+/// representation.  `__kernel_fsid_t` is defined as exactly two `int`s and the
+/// size assertion fails the build if that ever stops being true.
+fn fsid_of_statfs(st: &libc::statfs) -> Fsid {
+    const _: () = assert!(std::mem::size_of::<libc::fsid_t>() == 8);
+    // SAFETY: `fsid_t` is two `c_int`s with no padding, read by value.
+    let words: [i32; 2] = unsafe { std::mem::transmute_copy(&st.f_fsid) };
+    (words[0], words[1])
+}
+
+/// Turn a handle into a path, by opening it and reading `/proc/self/fd`.
+///
+/// `fsid` filters the candidate mount descriptors: only those on that
+/// filesystem are tried.  Pass the fsid the event reported.  `None` means "this
+/// handle may be on any filesystem you gave me a descriptor for", which is only
+/// sound when every descriptor belongs to one filesystem — otherwise the same
+/// bytes can resolve to a *different, existing* file on another one.
+///
+/// Which filesystem each descriptor is on has to be **asked of the kernel**
+/// ([`fsid_of_fd`]) — a descriptor the caller supplies carries no such fact — and
+/// a descriptor whose fsid cannot be read is tried anyway: not knowing is not
+/// evidence of a mismatch.  [`Mounts`] exists to learn each fsid once instead of
+/// once per call.
+///
+/// # Errors
+///
+/// The errno of the last attempt on a matching filesystem: `EPERM` without
+/// `CAP_DAC_READ_SEARCH`, `ESTALE` if the object is gone.  `EXDEV` when no
+/// descriptor was on `fsid` at all — a caller mistake, not a property of the
+/// handle.  `EINVAL` if `mount_fds` is empty or the handle is malformed.
+///
+/// # The path is best-effort
+///
+/// See the module docs: the answer comes from `/proc/self/fd` after the open, so
+/// it is the path *at that moment*, and an unlinked object keeps its
+/// `" (deleted)"` marker rather than being guessed at.
+pub fn resolve_file_handle(
+    mount_fds: &[OwnedFd],
+    fsid: Option<Fsid>,
+    handle: &[u8],
+) -> io::Result<PathBuf> {
+    if mount_fds.is_empty() {
+        return Err(io::Error::from_raw_os_error(libc::EINVAL));
+    }
+    let candidates: Vec<Candidate<'_>> = mount_fds
+        .iter()
+        .map(|fd| Candidate {
+            fd: fd.as_fd(),
+            fsid: fsid_of_fd(fd).ok(),
+        })
+        .collect();
+    resolve_in(&candidates, fsid, handle)
+}
+
+/// One descriptor a handle may be opened against, with what is known about the
+/// filesystem it is on.
+///
+/// The fsid is what makes the filter sound: `open_by_handle_at` on a descriptor
+/// from another filesystem can open the same bytes as a *different, existing*
+/// file, and nothing in the answer says so.  `None` is "not known", which is not
+/// the same as "does not match" — see [`wanted_filesystem`].
+pub(crate) struct Candidate<'a> {
+    pub(crate) fd: BorrowedFd<'a>,
+    pub(crate) fsid: Option<Fsid>,
+}
+
+/// Whether a descriptor on `known` may be tried for a handle reported on
+/// `wanted`.
+///
+/// An unknown fsid on either side matches: no evidence is not evidence against,
+/// and refusing to try would turn a descriptor whose filesystem could not be
+/// queried into a resolution that never happened.  This is the rule
+/// [`Mounts`] pre-filters by, so the selection it hands over is exactly the
+/// selection this tries.
+fn wanted_filesystem(known: Option<Fsid>, wanted: Option<Fsid>) -> bool {
+    match (wanted, known) {
+        (Some(want), Some(on)) => want == on,
+        _ => true,
     }
 }
 
-pub fn resolve_file_handle(mount_fds: &[OwnedFd], fh_data: &[u8]) -> Option<PathBuf> {
-    if fh_data.len() < FH_HDR_SIZE {
-        return None;
+/// [`resolve_file_handle`]'s implementation, over descriptors whose filesystems
+/// are already known.
+///
+/// Split out so [`Mounts`] and [`PathResolver`](crate::resolve::PathResolver)
+/// hand over a selection they have **already** probed: probing here would spend
+/// an `fstatfs` per candidate to learn what the caller just looked up.
+///
+/// A malformed handle is `EINVAL` — a property of the argument.  An empty
+/// selection, or one whose descriptors are all on other filesystems, is `EXDEV`:
+/// nothing was on that filesystem, which is a registration gap and not a
+/// property of the handle.
+pub(crate) fn resolve_in(
+    candidates: &[Candidate<'_>],
+    fsid: Option<Fsid>,
+    handle: &[u8],
+) -> io::Result<PathBuf> {
+    if handle.len() < FILE_HANDLE_HEADER_SIZE || handle.len() > MAX_FILE_HANDLE_SIZE {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "handle must be a struct file_handle: an 8-byte header plus at most MAX_HANDLE_SZ bytes",
+        ));
     }
 
-    for mfd in mount_fds {
-        match open_by_handle_at(mfd.as_raw_fd(), fh_data) {
-            Ok(fd) => {
-                let result = fs::read_link(format!("/proc/self/fd/{}", fd.as_raw_fd()));
-                // fd is closed by OwnedFd::drop
-                if let Ok(p) = result {
-                    // `/proc/self/fd` appends " (deleted)" for unlinked
-                    // objects; consumers never want the suffix.
-                    return Some(strip_deleted_suffix(p));
-                }
-            }
-            Err(_) => continue,
+    let mut attempted = false;
+    let mut last = libc::EXDEV;
+    for candidate in candidates {
+        if !wanted_filesystem(candidate.fsid, fsid) {
+            continue;
+        }
+        attempted = true;
+        match open_by_handle_at(candidate.fd, handle) {
+            Ok(fd) => match fs::read_link(format!("/proc/self/fd/{}", fd.as_raw_fd())) {
+                Ok(path) => return Ok(path),
+                Err(e) => last = e.raw_os_error().unwrap_or(libc::EIO),
+            },
+            Err(e) => last = e.raw_os_error().unwrap_or(libc::EIO),
         }
     }
 
-    None
+    if !attempted {
+        // Nothing was tried — no descriptor on the wanted filesystem, or none at
+        // all.  Reporting the last errno would blame the handle for a descriptor
+        // that never got used.
+        return Err(io::Error::from_raw_os_error(libc::EXDEV));
+    }
+    Err(io::Error::from_raw_os_error(last))
+}
+
+/// A path as a C string, rejecting an interior NUL byte.
+fn c_path(path: &Path) -> io::Result<CString> {
+    CString::new(path.as_os_str().as_encoded_bytes())
+        .map_err(|_| io::Error::new(io::ErrorKind::InvalidInput, "path contains a null byte"))
+}
+
+/// The mount descriptors a caller can resolve handles against, each paired with
+/// the filesystem it is on.
+///
+/// [`open_by_handle_at`] takes a descriptor on the handle's own filesystem, and
+/// [`resolve_file_handle`] filters by fsid so it does not open the same bytes
+/// against the wrong one.  Both need the same fact — *which filesystem is this
+/// descriptor on* — and that fact is a property of the descriptor, not of any
+/// one call.  Keeping the pair here is what stops every caller from maintaining
+/// a parallel array of fsids and getting it out of step.
+///
+/// # The fsid is learned once, from the descriptor itself
+///
+/// [`add`](Self::add) asks the kernel ([`fsid_of_fd`]) instead of taking the
+/// caller's word for it, because a mismatch is silent: the handle opens, the
+/// `readlink` succeeds, and the path names a **different existing file** on
+/// another filesystem.  Probing costs one `fstatfs` per descriptor, once.
+///
+/// # An open descriptor, not a path
+///
+/// `add` takes anything [`AsFd`], so a caller can pass a directory it already
+/// has open, or open one at the mount point.  No path is stored, so a mount that
+/// moves does not leave this collection pointing somewhere stale.
+///
+/// ```
+/// use fanotify_fid::handle::Mounts;
+///
+/// let dir = std::fs::File::open("/tmp")?;
+/// let mounts = Mounts::new().with_fd(&dir)?;
+/// assert_eq!(mounts.len(), 1);
+/// # Ok::<(), std::io::Error>(())
+/// ```
+#[derive(Debug, Default)]
+pub struct Mounts {
+    fds: Vec<OwnedFd>,
+    /// The fsid of each descriptor, when the kernel would answer.  Empty means
+    /// "not known", which is not the same as "does not match" — see
+    /// [`on_filesystem`](Self::on_filesystem).
+    fsids: Vec<Option<Fsid>>,
+}
+
+impl Mounts {
+    /// An empty collection.
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// Add a descriptor, learning its fsid from the kernel.
+    ///
+    /// The fsid is recorded as unknown if `fstatfs` fails, which costs only the
+    /// pre-filter below — resolution still tries the descriptor.
+    ///
+    /// # Errors
+    ///
+    /// The descriptor is duplicated (`F_DUPFD_CLOEXEC`), so this fails with
+    /// `EMFILE`/`ENFILE` when the process is out of descriptors.
+    pub fn add<Fd: AsFd>(&mut self, fd: Fd) -> io::Result<&mut Self> {
+        self.fsids.push(fsid_of_fd(&fd).ok());
+        self.fds.push(fd.as_fd().try_clone_to_owned()?);
+        Ok(self)
+    }
+
+    /// [`add`](Self::add), for building a collection in one expression.
+    pub fn with_fd<Fd: AsFd>(mut self, fd: Fd) -> io::Result<Self> {
+        self.add(fd)?;
+        Ok(self)
+    }
+
+    /// Add a descriptor whose filesystem is already known.
+    ///
+    /// For a caller that has just called [`fsid_of_fd`] or
+    /// [`fsid_of_path`] itself and would rather not spend a second `fstatfs`.
+    /// Passing the wrong fsid here is the one way to get the silent mismatch
+    /// [`add`](Self::add) exists to prevent, so prefer `add` unless the value
+    /// came from this crate.
+    ///
+    /// # Errors
+    ///
+    /// As [`add`](Self::add): the descriptor is duplicated.
+    pub fn add_with_fsid<Fd: AsFd>(&mut self, fd: Fd, fsid: Fsid) -> io::Result<&mut Self> {
+        self.fsids.push(Some(fsid));
+        self.fds.push(fd.as_fd().try_clone_to_owned()?);
+        Ok(self)
+    }
+
+    /// The descriptors on this filesystem, in the order they were added.
+    ///
+    /// A descriptor whose fsid could not be learned is included: its filesystem
+    /// cannot be shown to differ, and skipping it would refuse a resolution this
+    /// crate has no evidence is wrong.  An empty result therefore means "none
+    /// known to match", not "none can match" — the caller decides what to do
+    /// with that.
+    pub fn on_filesystem(&self, fsid: Fsid) -> Vec<BorrowedFd<'_>> {
+        // Filtered here rather than through `matching`: that returns borrowed
+        // descriptors tied to a temporary `Vec`, which cannot be handed out.
+        self.fds
+            .iter()
+            .zip(&self.fsids)
+            .filter(|(_, known)| wanted_filesystem(**known, Some(fsid)))
+            .map(|(fd, _)| fd.as_fd())
+            .collect()
+    }
+
+    /// The descriptors on this filesystem, as references for a resolution call.
+    ///
+    /// [`on_filesystem`](Self::on_filesystem) returns borrowed descriptors,
+    /// which is what an event loop wants; this returns the owned ones in a plain
+    /// `Vec`, which is what asking the filesystem wants.  Both select the same
+    /// descriptors.
+    pub fn matching(&self, fsid: Fsid) -> Vec<&OwnedFd> {
+        self.fds
+            .iter()
+            .zip(&self.fsids)
+            .filter(|(_, known)| wanted_filesystem(**known, Some(fsid)))
+            .map(|(fd, _)| fd)
+            .collect()
+    }
+
+    /// The descriptors with what is known about each one's filesystem, for a
+    /// resolution call.
+    ///
+    /// Crate-internal because the fsid it carries is what stops [`resolve_in`]
+    /// from spending a second `fstatfs` per candidate: a descriptor whose fsid
+    /// was learned by [`add`](Self::add) is already known to be on it or not.  A
+    /// caller that wants the descriptors themselves has
+    /// [`on_filesystem`](Self::on_filesystem) and [`iter`](Self::iter).
+    pub(crate) fn candidates(&self) -> impl Iterator<Item = Candidate<'_>> {
+        self.fds
+            .iter()
+            .zip(&self.fsids)
+            .map(|(fd, known)| Candidate {
+                fd: fd.as_fd(),
+                fsid: *known,
+            })
+    }
+
+    /// Every descriptor, for iteration when the fsid is not in question.
+    pub fn iter(&self) -> impl Iterator<Item = BorrowedFd<'_>> {
+        self.fds.iter().map(AsFd::as_fd)
+    }
+
+    /// The descriptors themselves, for passing to [`resolve_file_handle`].
+    ///
+    /// That function takes `&[OwnedFd]` because it may need to try several; this
+    /// exposes the collection in that shape without the caller having to keep a
+    /// second copy of what it already put here.
+    pub fn as_owned_fds(&self) -> &[OwnedFd] {
+        &self.fds
+    }
+
+    /// How many descriptors were added.
+    pub fn len(&self) -> usize {
+        self.fds.len()
+    }
+
+    /// Whether none were added.
+    pub fn is_empty(&self) -> bool {
+        self.fds.is_empty()
+    }
+
+    /// The fsid learned for the descriptor at `index`, if it was learned.
+    pub fn fsid_at(&self, index: usize) -> Option<Fsid> {
+        self.fsids.get(index).copied().flatten()
+    }
+}
+
+impl std::ops::Index<usize> for Mounts {
+    type Output = OwnedFd;
+
+    fn index(&self, index: usize) -> &OwnedFd {
+        &self.fds[index]
+    }
 }

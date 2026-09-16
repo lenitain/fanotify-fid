@@ -1,7 +1,8 @@
 [package]
 name = "fanotify-fid"
-version = "0.7.1"
+version = "0.8.0"
 edition = "2024"
+rust-version = "1.88"
 license = "MIT"
 description = "Linux fanotify FID (File Identifier) mode event parser and file handle utilities"
 documentation = "https://docs.rs/fanotify-fid"
@@ -18,6 +19,7 @@ include = [
     "README.md",
     "src/",
     "tests/",
+    "examples/",
 ]
 
 [lib]
@@ -26,7 +28,6 @@ path = "src/lib.rs"
 
 [dependencies]
 libc = "0.2"
-smallvec = { version = "1", features = ["const_generics"] }
 
 [dev-dependencies]
 tempfile = "3"

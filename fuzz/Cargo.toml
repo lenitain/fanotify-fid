@@ -1,0 +1,35 @@
+[package]
+name = "fanotify-fid-fuzz"
+version = "0.0.0"
+publish = false
+edition = "2024"
+
+[package.metadata]
+cargo-fuzz = true
+
+[dependencies]
+libfuzzer-sys = "0.4"
+
+[dependencies.fanotify-fid]
+path = ".."
+
+[[bin]]
+name = "parse_fid_events"
+path = "fuzz_targets/parse_fid_events.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "parse_fd_events"
+path = "fuzz_targets/parse_fd_events.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "resolve_dir"
+path = "fuzz_targets/resolve_dir.rs"
+test = false
+doc = false
+bench = false
