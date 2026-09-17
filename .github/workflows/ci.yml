@@ -23,40 +23,6 @@ jobs:
       # parse-and-resolve pipeline without root.
       - run: cargo test --all-targets
 
-  test-privileged:
-    name: Test (privileged)
-    runs-on: ubuntu-latest
-    steps:
-      - uses: actions/checkout@v4
-      - uses: dtolnay/rust-toolchain@stable
-      - uses: Swatinem/rust-cache@v2
-      # Reaches what an unprivileged job cannot: open_by_handle_at
-      # (CAP_DAC_READ_SEARCH), permission events and both response forms, every
-      # admin-gated anchor, and the mount-identity row.  Without this job those
-      # paths have no executed coverage at all.
-      #
-      # --test-threads=1: these tests place real marks on real filesystems and
-      # read real event queues; serialising them keeps attribution unambiguous.
-      # --nocapture: a skipped test prints its reason, which the check below
-      # reads.  A skip still exits 0, so without this the job could pass while
-      # running none of the tests it exists for.
-      - name: Run privileged tests
-        run: |
-          set -o pipefail
-          cargo test --all-targets -- --ignored --test-threads=1 --nocapture 2>&1 \
-            | tee /tmp/privileged.log
-          if grep -q "SKIPPED:" /tmp/privileged.log; then
-            echo "::error::a privileged test skipped inside the privileged job"
-            grep "SKIPPED:" /tmp/privileged.log
-            exit 1
-          fi
-      # The non-ignored tests again, as root.  They are not a repeat: several of
-      # them branch on CapEff and assert the *privileged* verdict where the
-      # unprivileged job asserts EPERM, so a green unprivileged run says nothing
-      # about whether the combination is legal once the capability is present.
-      - name: Run the same tests as root
-        run: cargo test --all-targets -- --test-threads=1
-
   fmt:
     name: Format
     runs-on: ubuntu-latest

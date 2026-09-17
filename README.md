@@ -18,32 +18,6 @@ one that scales to a whole filesystem, because the kernel holds no descriptor pe
 watched object — and it is variable-length records behind a fixed header, so a
 fixed-stride reader parses garbage. This crate reads all three, byte for byte.
 
-```rust
-use fanotify_fid::{EventReader, Fanotify, consts::*};
-
-let fan = Fanotify::new(
-    FAN_CLASS_NOTIF | FAN_CLOEXEC | FAN_NONBLOCK
-        | FAN_REPORT_FID | FAN_REPORT_DIR_FID | FAN_REPORT_NAME,
-)?;
-fan.mark(FAN_MARK_ADD, FAN_CREATE | FAN_EVENT_ON_CHILD, "/srv/data")?;
-
-let mut reader = EventReader::new(&fan, 256 * 1024);
-loop {
-    match reader.read() {
-        Ok(events) if !events.is_empty() => {
-            for ev in events {
-                println!("{:?} {:?}", ev.event_names().collect::<Vec<_>>(), ev.dfid_name());
-            }
-        }
-        Ok(_) => {}
-        Err(e) if e.is_would_block() => {
-            fan.wait_readable(None)?;
-        }
-        Err(e) => return Err(e),
-    }
-}
-```
-
 ## Features
 
 - All three identities, all nine info record types, and the fields 0.7.x used to

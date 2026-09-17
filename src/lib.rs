@@ -274,8 +274,10 @@
 #[cfg(not(target_os = "linux"))]
 compile_error!("fanotify-fid only supports Linux");
 
-// The README is compiled as a doctest, so its examples cannot drift away from
-// the API.  They are `no_run` because most of them need privilege.
+// The README is compiled as a doctest, so any example added to it is checked
+// against the API rather than drifting silently.  The README currently carries
+// no Rust example; when one comes back it must be `no_run`, because a real
+// example needs privilege and a real path.
 #[doc = include_str!("../README.md")]
 #[cfg(doctest)]
 pub struct ReadmeDoctests;
