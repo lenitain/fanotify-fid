@@ -652,11 +652,13 @@ impl AsFd for Fanotify {
 /// ```rust,no_run
 /// use fanotify_fid::fid::FidEvent;
 /// use fanotify_fid::resolve::PathResolver;
-/// use fanotify_fid::handle::Mounts;
+/// use fanotify_fid::handle::{HandleCache, Mounts};
 /// use fanotify_fid::{EventReader, Fanotify, FanotifyError, consts::*};
 ///
 /// # let fan = Fanotify::new(FAN_CLASS_NOTIF | FAN_REPORT_FID)?;
-/// # let mut resolver = PathResolver::new(Mounts::new());
+/// # let store = HandleCache::new();
+/// # let mounts = Mounts::new();
+/// # let resolver = PathResolver::new(&store, &mounts);
 /// let mut reader = EventReader::new(&fan, 256 * 1024);
 /// loop {
 ///     match reader.read() {
@@ -809,7 +811,7 @@ impl<'fan> EventReader<'fan> {
     /// # Errors
     ///
     /// The syscall's errno, and nothing else: an error here means no bytes were
-    /// read, so [`raw_bytes`](Self::raw_bytes) and the events are both empty and
+    /// read, so the buffer and the events are both empty and
     /// nothing of the previous read is still reachable.  An unknown `vers` in a
     /// *successful* read is not an error here — it is the `EventStop` in the
     /// returned [`ParseReport`], with the events parsed before it still in the
@@ -820,10 +822,10 @@ impl<'fan> EventReader<'fan> {
         // Both halves of "what the last read produced" are cleared *before* the
         // read, not after it succeeds.  A failed read — the `EAGAIN` of an empty
         // queue, an `EINVAL` for an oversized event — produced nothing, so
-        // `raw_bytes` must not go on answering with the previous batch and these
+        // the buffer must not go on holding the previous batch and these
         // events must not go on holding its pidfds.  Clearing after the `?` would
         // leave exactly that stale state behind, and a caller that copies
-        // `raw_bytes` on the error path would process the previous batch twice.
+        // a stale buffer on the error path would process the previous batch twice.
         self.bytes_read = 0;
         self.events.clear();
 
@@ -885,28 +887,17 @@ impl<'fan> EventReader<'fan> {
         Ok((events, report))
     }
 
-    /// The bytes the last read produced, marker for marker as the kernel wrote
-    /// them.
-    ///
-    /// For a caller that records raw input: what a parse could not interpret, or
-    /// what a version this crate does not know looks like, is still here.  This
-    /// is also the escape hatch for an architecture that cannot keep events alive
-    /// across the next read — copy this slice once and parse it on another
-    /// thread, rather than paying [`FidEvent::into_owned`] per event; see
-    /// `examples/batch_to_worker.rs`.
-    ///
-    /// # It belongs to the last read that succeeded
-    ///
-    /// A read that returned an error is not a read: `EAGAIN` on an empty queue,
-    /// `EINVAL` for an event larger than the buffer, or any other errno leaves
-    /// this **empty**, and the events of the previous batch are gone with it.  So
-    /// what a caller sees here is always the batch the `Ok` it just matched
-    /// described, never an older one — including on the error path of a loop that
-    /// copies these bytes, which is the mistake this rule exists to make
-    /// impossible.
-    pub fn raw_bytes(&self) -> &[u8] {
-        &self.buf[..self.bytes_read]
-    }
+    // There is deliberately no `raw_bytes` here.
+    //
+    // This reader owns its buffer, and the events it hands out borrow that
+    // buffer.  Handing out `&[u8]` as well is therefore not a missing accessor
+    // but an unsound one: the two borrows cannot both be live, and a method that
+    // returned the bytes *without* reborrowing the events would be returning a
+    // slice the next read may overwrite while the events still point into it.
+    // Rather than document that trap, this type does not offer it — a caller that
+    // needs the bytes uses the stateless form, `Fanotify::read_events` or
+    // `read_events_reported`, where the buffer is the caller's own `Vec` and the
+    // borrow checker can see the whole picture.  See `examples/batch_to_worker.rs`.
 
     /// The capacity chosen for the read buffer, which is the read size.
     pub fn capacity(&self) -> usize {
@@ -1114,7 +1105,7 @@ impl<'fan> FdEventReader<'fan> {
     /// [`parse_fd_events`](crate::fd::parse_fd_events) wherever you like.
     ///
     /// Empty after a read that returned an error, exactly as in
-    /// [`EventReader::raw_bytes`]: a failed read produced nothing, so the
+    /// [`Fanotify::read_events`]: a failed read produced nothing, so the
     /// previous batch does not linger here for a caller to process twice.
     pub fn raw_bytes(&self) -> &[u8] {
         &self.buf[..self.bytes_read]

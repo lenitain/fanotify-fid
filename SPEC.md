@@ -102,33 +102,35 @@ These are not gaps to be filled. The kernel is the authority on them, and the cr
 1. **A parsed event borrows the buffer it was parsed from.** `FidEvent<'buf>`'s handle and name fields are `Cow<'buf, [u8]>` and are `Cow::Borrowed` for every event `parse_fid_events` produces. *Consequence:* the buffer must outlive the events, the borrow checker enforces it, and the buffer cannot be read into again while events from it are alive.
 2. **Parsing copies no record bytes and allocates nothing per record.** The only allocation is the outer event `Vec`, plus the `unknown_info_records` `Vec` of an event that had a record preserved; `parse_fid_events_into` reuses both, so on a buffer of already-seen shape it does no allocation at all. *Consequence:* a whole-filesystem event rate costs no per-event heap traffic.
 3. **An event that must outlive the buffer is made owned explicitly.** `FidEvent::into_owned` returns `FidEvent<'static>`, copying exactly the fields that were borrowed; `RenameSide::into_owned` does the same for one side of a rename. An event built by hand (`FidEvent::new` plus setters) is owned from the start.
-4. **A `Vec<FidEvent<'buf>>` cannot be reused across two different reads.** The events borrow `buf`, so the `Vec` pins that borrow for as long as it lives, and a read needs the buffer mutably. Reuse within one buffer's lifetime is supported; reuse across reads is `EventReader`'s job, because it owns the buffer and the `Vec` together.
+4. **A `Vec<FidEvent<'buf>>` cannot be reused across two different reads.** The events borrow `buf`, so the `Vec` pins that borrow for as long as it lives, and a read needs the buffer mutably. Reuse within one buffer's lifetime is supported; reuse across reads is `EventReader`'s job, because it owns the buffer and the `Vec` together. *Consequence:* a batch that has to outlive the buffer is either made owned per event (`FidEvent::into_owned`) or copied as **bytes** once, by the caller, through the stateless `Fanotify::read_events*` forms — the crate never guesses which, and `EventReader` deliberately exposes no `raw_bytes` to make the second choice look free when the events still borrow it.
 5. **Truncation and malformation are reported, not silent.** `parse_fid_events_reported` and `parse_fid_events_into` return a `ParseReport` whose `bytes_consumed`, `bytes_left` and `EventStop` say how far the walk got and why it stopped; `is_complete()` is true only for `EventStop::End` with `bytes_left == 0`. `parse_fid_events` (and `read_events`) returns an error only for `EventStop::UnknownVersion`, the one condition nothing can be recovered from. *Consequence:* an empty queue and a short buffer cannot be confused.
 6. **No input can panic, read out of bounds, or loop forever.** An event whose `event_len` does not fit the buffer stops the walk; a record whose `len` does not fit its event stops that event's record walk with the remainder preserved; a record whose payload is too short is preserved rather than interpreted. Property tests assert this over arbitrary bytes on every `cargo test` run.
 7. **A record the crate does not recognise is preserved verbatim, header included**, in `FidEvent::unknown_info_records`, borrowed like every other field, so a type a newer kernel adds survives the parser. The one entry whose bytes are not a single record is a record whose `len` failed its bounds check: that entry holds the rest of the event from that record's header, because the length it claims cannot be walked past.
 
 ### 3.2 Reading
 
-1. **A reader owns its storage.** `EventReader` and `FdEventReader` own a fixed `Box<[u8]>` read buffer and their event storage, both allocated by `new`.
+1. **A reader owns its storage.** `EventReader` and `FdEventReader` own their read buffer and their event storage, both allocated by `new` and reused by every read after it.
 2. **After setup, a read allocates nothing.** The read path only moves the buffer's length; it never grows it. `EventReader`'s event `Vec` grows on the first read that produces events (setup); `FdEventReader` reserves its upper bound (`capacity / 24` slots) in `new`. *Consequence:* an empty-queue read — the `EAGAIN` retry a non-blocking loop makes on every wake-up — costs no allocation, asserted over a thousand reads.
 3. **The buffer capacity is the read size and is fixed for a reader's life.** `new(group, capacity)` treats a capacity of zero as 64 KiB. For the stateless `read_events(&self, buf)` forms, the caller's `Vec` capacity is the read size and a zero-capacity `Vec` is grown to 64 KiB; the buffer's contents are otherwise ignored.
 4. **The kernel never delivers a partial event.** A buffer too small for the next event earns `EINVAL`; the remedy is a larger buffer, and `capacity()` reports the size in use.
-5. **`raw_bytes()` is the bytes of the last successful read**, exactly as the kernel wrote them, for recording or for replay through the public pure parsers.
-6. **A read that fails leaves nothing behind.** Both readers clear the byte count and the event storage *before* the read, so a failure — `EAGAIN` on an empty queue, `EINVAL` for an oversized event, any other errno — yields empty `raw_bytes`, no events, and (for `FdEventReader`) closes the previous batch's descriptors. *Consequence:* a loop that copies `raw_bytes` on the error path cannot dispatch the previous batch twice.
+5. **`FdEventReader::raw_bytes()` is the bytes of the last successful read**, exactly as the kernel wrote them, for recording or for replay through the public pure parsers. `EventReader` has no such accessor: its events borrow the same buffer, so the two borrows cannot both be live.
+6. **A read that fails leaves nothing behind.** Both readers clear the byte count and the event storage *before* the read, so a failure — `EAGAIN` on an empty queue, `EINVAL` for an oversized event, any other errno — yields no events, and (for `FdEventReader`) empty `raw_bytes` and the previous batch's descriptors closed. *Consequence:* a loop that copies the batch on the error path cannot dispatch the previous one twice.
 7. **A signal is retried, not reported.** The crate's own `read` retries `EINTR` internally, so a caller never sees it and no read error means "a signal arrived". `wait_readable` reports `EINTR` instead of retrying, because retrying there would be a decision about the caller's loop.
 8. **An empty queue on a non-blocking group is `EAGAIN`, not an empty list.** `FanotifyError::is_would_block()` is true for exactly that case (`Read(EAGAIN)`) and false for the same errno from any other operation. `Fanotify::wait_readable(timeout)` waits for readability (`None` waits indefinitely) and returns whether there is something to read.
 9. **Only the read path adopts descriptors.** `Fanotify::read_events` and `EventReader` turn a non-negative pidfd number into `Pidfd::Fd`; a repeated number within one buffer is left unowned, so one descriptor is never closed from two owners. `parse_fid_events` — handed a `&[u8]`, which proves nothing about where its bytes came from — reports `Pidfd::Unavailable(n)` and adopts nothing; `parse_fd_events` reports the `fd` field in `FdEvent::fd_field` and leaves `FdEvent::fd()` as `None`.
 10. **An fd-based batch's descriptors are live until the next read replaces them**, or until `FdEvent::into_fd` takes one out. `FdEventReader::read` returns `&[FdEvent]` and `EventReader::read` returns `&mut [FidEvent<'_>]`, so a resolver can write paths in place and no copy per event is needed.
+11. **`FdEventReader::raw_bytes` exists and `EventReader`'s does not.** An `FdEvent` owns what it reports, so the bytes of the last read are an independent fact; a `FidEvent` borrows the buffer, so handing out the same bytes would be handing out a second borrow the first one forbids. `FdEventReader::raw_bytes()` is the bytes of the last successful read, empty after a failure.
 
 ### 3.3 Path resolution
 
 1. **`PathResolver` is where learned knowledge lives between calls.** `PathResolver<C: PathStore>` holds a store (default `HandleCache`), the `Mounts` it may resolve against, and a syscall-fallback switch. Its reason to exist is the guarantee "one handle resolves to one answer, consistently": while the store holds an answer, every caller of that handle gets it.
-2. **A store hit spends no syscall.** `PathStore` is three operations: `get(&mut self, fsid, handle) -> Option<PathBuf>`, `insert(&mut self, fsid, handle, &Path)`, `forget(&mut self, fsid, handle)`. `get` takes `&mut self` and returns an owned path because the stores worth having — an LRU whose hit updates recency, a map behind a lock whose guard cannot travel with a reference — need both. `HandleCache` is an unbounded two-level map and adds the zero-allocation borrowed lookup `path_of`; `NoCache` keeps nothing, so every resolution asks the filesystem.
-3. **The fsid filter decides which descriptors may answer.** Only candidates whose fsid matches the event's are tried; an unknown fsid on either side matches, because no evidence is not evidence against. *Consequence:* a descriptor whose fsid could not be read is tried rather than skipped, and the filter's cost is at most one descriptor too many tried, never a wrong path.
+2. **A store hit spends no syscall, and reading one costs no copy.** `PathStore` is one operation for reading — `with_path(&self, fsid, handle, f: impl FnOnce(&Path) -> R) -> Option<R>` — and `PathMemo: PathStore` is the separate capability for writing: `remember(&self, fsid, handle, &Path)` and `forget(&self, fsid, handle)`. The closure is what lets a store behind a lock answer without copying and without leaking a guard, while a store whose values are owned in place answers from a plain borrow; both take `&self`, because a resolver holds **one** reference to the store and cannot hold a mutable one for writing beside it. `HandleCache` is an unbounded two-level map behind a `RwLock` (so one `&HandleCache` reads and records) and adds `path_of` for an owned answer; `NoCache` keeps nothing, so every resolution asks the filesystem.
+3. **A resolution writes nothing unless a `PathMemo` is passed.** With one, a `DFID_NAME` resolution records the entry's own handle (so a later `FID` record about the same object resolves from the store) and `resolve_dir` records the parent directory it decoded by syscall. Without one, the store is only ever read, which is why the read-only form takes `&self` and can run while the caller holds any number of shared borrows of it.
+4. **The fsid filter decides which descriptors may answer.** Only candidates whose fsid matches the event's are tried; an unknown fsid on either side matches, because no evidence is not evidence against. *Consequence:* a descriptor whose fsid could not be read is tried rather than skipped, and the filter's cost is at most one descriptor too many tried, never a wrong path.
 4. **`EXDEV` means no candidate was on that filesystem at all** — a registration gap, not a property of the handle. With `set_syscall_fallback(false)` the resolver answers only from its store and never calls `open_by_handle_at`, so an unprivileged process gets `EXDEV` instead of `EPERM` whenever the store has not been taught the answer. Otherwise the error is the last errno of the attempts on a matching filesystem: `EPERM` without `CAP_DAC_READ_SEARCH`, `ESTALE` for a handle the filesystem cannot decode, `EINVAL` for a malformed handle.
 5. **`resolve_dir` appends one path component and validates it.** An empty name or `.` returns the directory itself, byte for byte. A name containing `/` or NUL, or equal to `..`, is `InvalidInput` rather than something spliced into the path. The directory half is resolved before the name is validated.
-6. **`resolve_event` tries three shapes in order** and lands the first that answers on the event as `FidEvent::path`: the parent handle plus entry name of a `DFID_NAME` record; the source side of a `FAN_RENAME` event; the object's own handle from a `FID`/`DFID` record. It returns an `EventResolution` (`Resolved`, `AlreadyResolved`, `NothingToResolve`, `Unresolvable`) rather than an errno, so "nothing to resolve" and "the answer was unavailable" stay apart. A rename's target side is resolved by the separate `resolve_rename_target`, because it names a different parent and costs a syscall the event itself does not imply.
-7. **`resolve_events` repeats until no further event can be resolved**, because one pass is not enough when an event's parent is learned only after another event resolved it. The `Resolution` it returns describes the last pass that resolved something — `resolved`, `already_resolved`, `unresolved` — while `passes` counts every pass including the confirming one. *Consequence:* a second call on a settled batch reports `resolved == 0`, which is what makes the number usable as a progress check.
+6. **`resolve_event` tries three shapes in order** and lands the first that answers on the event as `FidEvent::path`: the parent handle plus entry name of a `DFID_NAME` record; the source side of a `FAN_RENAME` event; the object's own handle from a `FID`/`DFID` record. It returns an `EventResolution` (`Resolved`, `AlreadyResolved`, `NothingToResolve`, `Unresolvable`) rather than an errno, so "nothing to resolve" and "the answer was unavailable" stay apart. It takes `&self` and never records; `resolve_event_memo` is the same call with a `PathMemo` to teach. A rename's target side is resolved by the separate `resolve_rename_target`, because it names a different parent and costs a syscall the event itself does not imply.
+7. **`resolve_events` makes one pass; `resolve_events_memo` repeats until no further event can be resolved.** Repeating is only meaningful when the batch records what it learned — without a memo the second pass would ask the filesystem the same questions again — so the loop belongs to the memo form. The `Resolution` both return describes the last pass that resolved something — `resolved`, `already_resolved`, `unresolved`, and `passes` as that pass's own number, so a batch settled on the first pass reports `passes == 1`. *Consequence:* a second call on a settled batch reports `resolved == 0`, which is what makes the number usable as a progress check.
 8. **`resolve_file_handle` and `resolve_file_handle_in` are the same resolution over different inputs.** The first takes a bare `&[OwnedFd]`, which carries no fsid, so it asks the kernel once per descriptor **per call**; the second takes `Candidate`s whose fsids were learned when the descriptors were added (`Mounts::candidates()`), so the filter costs nothing. Prefer the second whenever the descriptors outlive the call.
 9. **`Mounts::add` learns each descriptor's fsid from the kernel** (`fsid_of_fd`), records it as unknown if the probe fails, and duplicates the descriptor (`F_DUPFD_CLOEXEC`). `add` is the safe form; `add_with_fsid` exists for a caller that already probed, and a wrong fsid passed there is the one way to get a silent mismatch — the handle opens, the `readlink` succeeds, and the path names a *different, existing* file on another filesystem.
 10. **Paths are best-effort and cannot be otherwise.** The only way back from an open handle is `open_by_handle_at` followed by `readlink("/proc/self/fd/N")`, so the answer is the path at that moment; a concurrent rename between the open and the readlink makes it a description of a moment, not an invariant. An unlinked object keeps its `" (deleted)"` marker (section 3.4).
@@ -227,7 +229,7 @@ A user namespace is not a privileged environment: `CapEff` inside a nested user 
 | `FidEvent`, `Pidfd`, `RenameSide`, `parse_fid_events`, `parse_fid_events_into`, `parse_fid_events_reported` *prelude* | FID-format events and their parsers |
 | `FdEvent`, `parse_fd_events` *prelude* | fd-format events and the non-adopting byte walk |
 | `parse::EventStop`, `parse::ParseReport` *prelude* | how far an event walk got, and why it stopped |
-| `handle::{Fsid, FileHandle, Candidate, HandleCache, Mounts, NoCache, PathStore, resolve_file_handle, resolve_file_handle_in}` *prelude* | handle identity and the syscalls around it |
+| `handle::{Fsid, FileHandle, Candidate, HandleCache, Mounts, NoCache, PathStore, PathMemo, resolve_file_handle, resolve_file_handle_in}` *prelude* | handle identity, where paths are kept, and the syscalls around it |
 | `resolve::{PathResolver, Resolution, EventResolution}` *prelude* | batch resolution over a store |
 | `response::FanotifyResponse` *prelude* | a permission decision |
 | `FanotifyError`, `Result` *prelude* | the error type and the crate's `Result` alias |
@@ -277,8 +279,7 @@ impl<'fan> EventReader<'fan> {
     pub fn new(group: &'fan Fanotify, capacity: usize) -> Self;
     pub fn read(&mut self) -> Result<&mut [FidEvent<'_>]>;
     pub fn read_reported(&mut self) -> Result<(&mut [FidEvent<'_>], ParseReport)>;
-    pub fn raw_bytes(&self) -> &[u8];      pub fn capacity(&self) -> usize;
-    pub fn event_capacity(&self) -> usize;
+    pub fn capacity(&self) -> usize;       pub fn event_capacity(&self) -> usize;
 }
 impl<'fan> FdEventReader<'fan> {
     pub fn new(group: &'fan Fanotify, capacity: usize) -> Self;
@@ -327,21 +328,29 @@ pub fn resolve_file_handle_in<'a, I: IntoIterator<Item = Candidate<'a>>>(
 
 ```rust
 pub trait PathStore {
-    fn get(&mut self, fsid: Fsid, handle: &[u8]) -> Option<PathBuf>;
-    fn insert(&mut self, fsid: Fsid, handle: &[u8], path: &Path);
-    fn forget(&mut self, fsid: Fsid, handle: &[u8]);
+    // Read.  The closure receives the path for the duration of the call, which is
+    // what lets a store behind a lock answer without copying and without leaking.
+    fn with_path<R>(&self, fsid: Fsid, handle: &[u8], f: impl FnOnce(&Path) -> R) -> Option<R>;
+}
+impl<T: PathStore + ?Sized> PathStore for &T;   // so `&store` and `store` are one call
+
+pub trait PathMemo: PathStore {
+    fn remember(&self, fsid: Fsid, handle: &[u8], path: &Path);   // default: nothing
+    fn forget(&self, fsid: Fsid, handle: &[u8]);                  // default: nothing
 }
 pub struct Candidate<'a> { pub fd: BorrowedFd<'a>, pub fsid: Option<Fsid> }
 
-impl HandleCache {   // Default, Debug, Clone; the PathStore default
+impl HandleCache {   // Default, Debug; the PathStore default
     pub fn new() -> Self;
     pub fn len(&self) -> usize;                    pub fn is_empty(&self) -> bool;
-    pub fn filesystems(&self) -> usize;            pub fn clear(&mut self);
-    pub fn forget_filesystem(&mut self, fsid: Fsid);
-    pub fn iter(&self) -> impl Iterator<Item = (Fsid, &[u8], &Path)>;
-    pub fn path_of(&self, fsid: Fsid, handle: &[u8]) -> Option<&Path>;  // borrowed, zero-allocation
+    pub fn filesystems(&self) -> usize;            pub fn clear(&self);
+    pub fn forget_filesystem(&self, fsid: Fsid);
+    pub fn entries(&self) -> Vec<(Fsid, FileHandle, PathBuf)>;   // copied out, for inspection
+    pub fn with_path<R>(&self, fsid: Fsid, handle: &[u8], f: impl FnOnce(&Path) -> R) -> Option<R>;
+    pub fn path_of(&self, fsid: Fsid, handle: &[u8]) -> Option<PathBuf>;  // owned, for a keeper
 }
-pub struct NoCache;  // keeps nothing
+impl Clone for HandleCache;   // a copy of the entries, not a shared handle
+pub struct NoCache;  // keeps nothing, implements PathStore only
 
 impl Mounts {
     pub fn new() -> Self;
@@ -361,21 +370,26 @@ impl Index<usize> for Mounts { type Output = OwnedFd; }
 ### `resolve`
 
 ```rust
-pub struct PathResolver<C = HandleCache> { /* store, mounts, syscall_fallback */ }
-impl PathResolver<HandleCache> { pub fn new(mounts: Mounts) -> Self; }
-impl Default for PathResolver<HandleCache>
+// Borrows, not ownership: the store and the mounts live with the caller.
+pub struct PathResolver<'a, C: ?Sized = HandleCache> { /* &store, &mounts, syscall_fallback */ }
 
-impl<C: PathStore> PathResolver<C> {
-    pub fn with_store(mounts: Mounts, store: C) -> Self;
+impl<'a, C: PathStore + ?Sized> PathResolver<'a, C> {
+    pub fn new(store: &'a C, mounts: &'a Mounts) -> Self;
     pub fn set_syscall_fallback(&mut self, enabled: bool) -> &mut Self;
-    pub fn store(&self) -> &C;                     pub fn store_mut(&mut self) -> &mut C;
-    pub fn mounts(&self) -> &Mounts;               pub fn mounts_mut(&mut self) -> &mut Mounts;
-    pub fn resolve_handle(&mut self, fsid: Fsid, handle: &[u8]) -> io::Result<PathBuf>;
-    pub fn resolve_dir(&mut self, fsid: Fsid, handle: &[u8], name: &[u8]) -> io::Result<PathBuf>;
-    pub fn resolve_event(&mut self, event: &mut FidEvent<'_>) -> EventResolution;
-    pub fn resolve_rename_target(&mut self, event: &FidEvent<'_>) -> Option<io::Result<PathBuf>>;
-    pub fn known(&mut self, fsid: Fsid, handle: &[u8]) -> Option<PathBuf>;
-    pub fn resolve_events(&mut self, events: &mut [FidEvent<'_>]) -> Resolution;
+    pub fn store(&self) -> &C;                     pub fn mounts(&self) -> &Mounts;
+
+    // Reading: never records, takes `&self`, so the store can be borrowed freely.
+    pub fn resolve_handle(&self, fsid: Fsid, handle: &[u8]) -> io::Result<PathBuf>;
+    pub fn resolve_dir(&self, fsid: Fsid, handle: &[u8], name: &[u8]) -> io::Result<PathBuf>;
+    pub fn resolve_event(&self, event: &mut FidEvent<'_>) -> EventResolution;
+    pub fn resolve_rename_target(&self, event: &FidEvent<'_>) -> Option<io::Result<PathBuf>>;
+    pub fn known(&self, fsid: Fsid, handle: &[u8]) -> Option<PathBuf>;
+    pub fn resolve_events(&self, events: &mut [FidEvent<'_>]) -> Resolution;
+
+    // Recording: the same calls with a memo to teach, and one pass more.
+    pub fn resolve_handle_memo<M: PathMemo + ?Sized>(&self, memo: &M, fsid: Fsid, handle: &[u8]) -> io::Result<PathBuf>;
+    pub fn resolve_event_memo<M: PathMemo + ?Sized>(&self, memo: &M, event: &mut FidEvent<'_>) -> EventResolution;
+    pub fn resolve_events_memo<M: PathMemo + ?Sized>(&self, memo: &M, events: &mut [FidEvent<'_>]) -> Resolution;
 }
 
 pub struct Resolution { pub resolved: usize, pub already_resolved: usize,
@@ -413,7 +427,7 @@ Each is the syscall and nothing else: arguments unchanged, return value an `Owne
 
 ### `prelude`
 
-`prelude::*` re-exports `consts::*`; `Candidate`, `FileHandle`, `Fsid`, `HandleCache`, `Mounts`, `NoCache`, `PathStore`, `fsid_of_fd`, `fsid_of_path`, `handle_from_fd`, `name_to_handle_at`, `open_by_handle_at`, `resolve_file_handle`, `resolve_file_handle_in`; `EventResolution`, `PathResolver`, `Resolution`; `fanotify_init`, `fanotify_mark`; and `EventReader`, `EventStop`, `Fanotify`, `FanotifyError`, `FanotifyResponse`, `FdEvent`, `FdEventReader`, `FidEvent`, `ParseReport`, `Pidfd`, `RenameSide`, `Result`, `parse_fd_events`, `parse_fid_events`, `parse_fid_events_into`, `parse_fid_events_reported`.
+`prelude::*` re-exports `consts::*`; `Candidate`, `FileHandle`, `Fsid`, `HandleCache`, `Mounts`, `NoCache`, `PathMemo`, `PathStore`, `fsid_of_fd`, `fsid_of_path`, `handle_from_fd`, `name_to_handle_at`, `open_by_handle_at`, `resolve_file_handle`, `resolve_file_handle_in`; `EventResolution`, `PathResolver`, `Resolution`; `fanotify_init`, `fanotify_mark`; and `EventReader`, `EventStop`, `Fanotify`, `FanotifyError`, `FanotifyResponse`, `FdEvent`, `FdEventReader`, `FidEvent`, `ParseReport`, `Pidfd`, `RenameSide`, `Result`, `parse_fd_events`, `parse_fid_events`, `parse_fid_events_into`, `parse_fid_events_reported`.
 
 It is curated rather than `pub use crate::*`: the modules `fd`, `fid`, `handle`, `resolve` and `response` stay unglobbed, so a caller that wants an item outside the list names its module.
 
@@ -422,7 +436,7 @@ It is curated rather than `pub use crate::*`: the modules `fd`, `fid`, `handle`,
 **Contracts.** A caller may rely on these, and a change to one is a breaking change:
 
 * the API in section 7 — item names, signatures, types and trait implementations;
-* the behavioral statements in section 3: the borrowing model and the reported parse vocabulary, the readers' ownership and per-read allocation behavior, the raw-bytes and failed-read rules, the deleted-marker rules, the response forms and descriptor matching, and the errno pass-through with `is_would_block`;
+* the behavioral statements in section 3: the borrowing model and the reported parse vocabulary, the readers' ownership and per-read allocation behavior, the raw-bytes rule (fd reader only) and the failed-read rule, the deleted-marker rules, the response forms and descriptor matching, and the errno pass-through with `is_would_block`;
 * the privilege and enforcement tables in sections 2 and 4 as descriptions of the kernel's rules: the crate does not enforce them, so what a caller relies on is that the crate does not get in their way;
 * the `prelude` contents;
 * the wire formats, which are the kernel's: `struct fanotify_event_metadata`, `fanotify_event_info_header`, `fanotify_response`, the info record payloads, and `struct file_handle`.
@@ -430,7 +444,7 @@ It is curated rather than `pub use crate::*`: the modules `fd`, `fid`, `handle`,
 **Implementation details.** These are current behavior and may change without a breaking release, provided the contracts above still hold:
 
 * the default read size (64 KiB for a zero-capacity buffer or reader) and the number of event slots a reader pre-allocates (`capacity / 24` for `FdEventReader`);
-* that `HandleCache` is an unbounded two-level `HashMap`, that `EventReader` stores its buffer as a fixed `Box<[u8]>` with a lifetime erasure, and that `parse_fid_events_into` reuses an existing event `Vec`;
+* that `HandleCache` is an unbounded two-level map behind an `RwLock`, that `EventReader` stores its buffer with a lifetime erasure, and that `parse_fid_events_into` reuses an existing event `Vec`;
 * the exact `Display` text and errno-description wording;
 * that `resolve_file_handle` probes each descriptor's fsid once per call, and that a failure whose errno the platform did not report surfaces as `EIO` from `resolve_file_handle_in`;
 * that `name_to_handle_at` retries without `AT_HANDLE_FID` on `EINVAL`;

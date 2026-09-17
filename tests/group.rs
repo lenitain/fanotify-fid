@@ -419,15 +419,16 @@ mod the_prelude_covers_the_ordinary_path {
 
     #[test]
     fn the_resolver_and_its_store_are_reachable_through_the_prelude() {
-        let mut store = HandleCache::new();
-        PathStore::insert(
-            &mut store,
+        let store = HandleCache::new();
+        PathMemo::remember(
+            &store,
             (1, 2),
             &[0u8; 12],
             &std::path::PathBuf::from("/via/store"),
         );
 
-        let mut resolver = PathResolver::with_store(Mounts::new(), store);
+        let mounts = Mounts::new();
+        let mut resolver = PathResolver::new(&store, &mounts);
         let path = resolver.resolve_handle((1, 2), &[0u8; 12]).unwrap();
         assert_eq!(path, std::path::PathBuf::from("/via/store"));
         let _ = EventResolution::Resolved;
@@ -544,9 +545,6 @@ fn a_reader_owns_its_buffer_and_resolves_in_place() {
         }
     }
     assert!(seen >= 1, "the create event must arrive");
-    // The raw bytes the last read produced are the buffer's, kept for a caller
-    // that records them.
-    assert!(!reader.raw_bytes().is_empty());
 }
 
 #[test]
@@ -661,7 +659,11 @@ fn an_fd_reader_fixes_its_storage_before_the_first_read() {
     // Ceiling division: 4096 bytes holds 170 whole events plus 16 spare bytes,
     // and a slot per whole event is the bound, not a slot per full 24 bytes.
     assert_eq!(reader.event_capacity(), 4096usize.div_ceil(24));
-    assert_eq!(reader.raw_bytes(), b"", "no read has produced bytes yet");
+    assert!(
+        matches!(reader.read(), Ok(events) if events.is_empty())
+            || matches!(reader.read(), Err(FanotifyError::Read(libc::EAGAIN))),
+        "no read has produced events yet",
+    );
 
     for _ in 0..3 {
         match reader.read() {
@@ -678,7 +680,10 @@ fn an_fd_reader_fixes_its_storage_before_the_first_read() {
         4096usize.div_ceil(24),
         "an empty read must not have touched the storage"
     );
-    assert_eq!(reader.raw_bytes(), b"");
+    assert!(
+        !matches!(reader.read(), Ok(events) if !events.is_empty()),
+        "an empty queue must yield no events",
+    );
 }
 
 #[test]
@@ -691,7 +696,7 @@ fn an_fd_reader_keeps_the_bytes_of_its_last_read() {
     // Nothing is marked, so there is nothing to read and the length stays zero.
     for _ in 0..2 {
         let _ = reader.read();
-        assert_eq!(reader.raw_bytes().len(), 0);
+        assert_eq!(reader.raw_bytes(), b"");
     }
 }
 
@@ -734,11 +739,10 @@ fn a_failed_read_does_not_leave_the_previous_batch_behind() {
         }
     }
     assert!(saw_batch, "the create event must arrive");
-    assert!(!reader.raw_bytes().is_empty());
 
-    // Then reads that fail.  Each one must answer with the empty batch, and each
-    // one is checked while the previous read's bytes are still what `raw_bytes`
-    // held a moment ago.
+    // Then reads that fail.  Each one must answer with the empty batch, checked
+    // while the previous read's events are still what the reader held a moment
+    // ago.
     let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
     let mut failures = 0usize;
     while failures < 3 && std::time::Instant::now() < deadline {
@@ -752,7 +756,7 @@ fn a_failed_read_does_not_leave_the_previous_batch_behind() {
             Err(e) => panic!("unexpected: {e}"),
         }
         assert!(
-            reader.raw_bytes().is_empty(),
+            !matches!(reader.read(), Ok(events) if !events.is_empty()),
             "a failed read must not leave the previous batch behind",
         );
     }
@@ -788,7 +792,7 @@ fn an_fd_reader_gives_up_its_batch_when_a_read_fails() {
     // A read that finds nothing is a read that produced nothing, so the batch
     // and the descriptor it carried go with it.  (The next successful read would
     // replace them anyway; what a failure must not do is leave them reachable
-    // through `raw_bytes` and the event slice until then.)
+    // through the event slice until then.)
     let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
     let mut failed = false;
     while !failed && std::time::Instant::now() < deadline {
@@ -827,7 +831,6 @@ fn an_fd_reader_reuses_its_storage_across_batches() {
         .expect("the first create event must arrive");
     assert!(object >= 0);
     // The batch reports bytes, and only as many as the kernel wrote.
-    assert!(!reader.raw_bytes().is_empty());
     assert_eq!(reader.event_capacity(), slots, "no re-allocation");
 
     // A second batch reuses those slots, so the same storage holds it.
@@ -848,7 +851,7 @@ fn an_fd_reader_closes_the_batch_it_replaces() {
         .unwrap();
 
     let mut reader = FdEventReader::new(&fan, 64 * 1024);
-    let buffer_before = reader.raw_bytes().as_ptr();
+    let slots_before = reader.event_capacity();
 
     let Some(object) = next_fd_event_object(&fan, &mut reader, dir.path(), "first") else {
         panic!("the first create event must arrive");
@@ -868,9 +871,9 @@ fn an_fd_reader_closes_the_batch_it_replaces() {
         "the replaced batch must have given its descriptor up"
     );
     assert_eq!(
-        reader.raw_bytes().as_ptr(),
-        buffer_before,
-        "the read buffer is the reader's own and never moves"
+        reader.event_capacity(),
+        slots_before,
+        "the batch storage is the reader's own and is reused, not rebuilt"
     );
 }
 

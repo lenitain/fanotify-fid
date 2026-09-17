@@ -29,7 +29,8 @@ use common::{Capabilities, mount_fd_of, tmpdir};
 use fanotify_fid::consts::*;
 use fanotify_fid::fid::FidEvent;
 use fanotify_fid::handle::{
-    FileHandle, Fsid, HandleCache, Mounts, PathStore, handle_from_fd, resolve_file_handle_in,
+    FileHandle, Fsid, HandleCache, Mounts, NoCache, PathMemo, handle_from_fd,
+    resolve_file_handle_in,
 };
 use fanotify_fid::resolve::{EventResolution, PathResolver};
 
@@ -59,15 +60,11 @@ fn a_known_handle_is_answered_without_asking_the_filesystem() {
     // resolved from the store, because nothing else could have answered it.
     // Named as the trait method so the test reads the same whichever store is
     // substituted here.
-    let mut store = HandleCache::new();
-    PathStore::insert(
-        &mut store,
-        fsid,
-        &handle,
-        &PathBuf::from("/learned/elsewhere"),
-    );
+    let store = HandleCache::new();
+    PathMemo::remember(&store, fsid, &handle, &PathBuf::from("/learned/elsewhere"));
 
-    let mut resolver = PathResolver::with_store(Mounts::new(), store);
+    let mounts = Mounts::new();
+    let resolver = PathResolver::new(&store, &mounts);
     assert_eq!(
         resolver.resolve_handle(fsid, &handle).unwrap(),
         PathBuf::from("/learned/elsewhere"),
@@ -82,7 +79,8 @@ fn a_known_handle_is_answered_without_asking_the_filesystem() {
 
 #[test]
 fn with_the_syscall_refused_a_store_miss_is_exdev_rather_than_a_silent_none() {
-    let mut resolver = PathResolver::new(Mounts::new());
+    let mounts = Mounts::new();
+    let mut resolver = PathResolver::new(&NoCache, &mounts);
     resolver.set_syscall_fallback(false);
     let err = resolver
         .resolve_handle((1, 2), &[0u8; 12])
@@ -94,10 +92,11 @@ fn with_the_syscall_refused_a_store_miss_is_exdev_rather_than_a_silent_none() {
 fn knowledge_survives_across_calls_and_across_events() {
     let fsid: Fsid = (7, 7);
     let handle: FileHandle = vec![1, 1, 1, 1, 1, 1, 1, 1];
-    let mut store = HandleCache::new();
-    PathStore::insert(&mut store, fsid, &handle, &PathBuf::from("/one/answer"));
+    let store = HandleCache::new();
+    PathMemo::remember(&store, fsid, &handle, &PathBuf::from("/one/answer"));
 
-    let mut resolver = PathResolver::with_store(Mounts::new(), store);
+    let mounts = Mounts::new();
+    let resolver = PathResolver::new(&store, &mounts);
     for _ in 0..3 {
         assert_eq!(
             resolver.resolve_handle(fsid, &handle).unwrap(),
@@ -107,7 +106,7 @@ fn knowledge_survives_across_calls_and_across_events() {
     // And a caller can read the store back out, which is what makes pre-seeding
     // and inspection possible.
     assert_eq!(
-        PathStore::get(resolver.store_mut(), fsid, &handle),
+        resolver.known(fsid, &handle),
         Some(PathBuf::from("/one/answer")),
     );
 }
@@ -127,7 +126,8 @@ fn a_real_directory_handle_resolves_and_then_costs_no_further_syscall() {
     let mounts = Mounts::new()
         .with_fd(mount_fd_of(dir.path()).unwrap())
         .unwrap();
-    let mut resolver = PathResolver::new(mounts);
+    let store = HandleCache::new();
+    let mut resolver = PathResolver::new(&store, &mounts);
 
     let first = resolver.resolve_handle(fsid, &handle).unwrap();
     assert_eq!(
@@ -166,7 +166,8 @@ fn a_batch_resolves_every_event_that_names_an_entry_in_a_marked_directory() {
     let mounts = Mounts::new()
         .with_fd(mount_fd_of(dir.path()).unwrap())
         .unwrap();
-    let mut resolver = PathResolver::new(mounts);
+    let store = HandleCache::new();
+    let resolver = PathResolver::new(&store, &mounts);
     let resolved = resolver.resolve_events(&mut events);
     assert_eq!(
         resolved.resolved,
@@ -188,10 +189,9 @@ fn a_batch_resolves_every_event_that_names_an_entry_in_a_marked_directory() {
         .filter_map(|e| e.fsid().zip(e.dfid_name_handle().map(<[u8]>::to_vec)))
         .collect();
     assert!(!parents.is_empty(), "the events must name a parent");
-    let store = resolver.store_mut();
     for (fsid, handle) in parents {
         assert!(
-            store.get(fsid, &handle).is_some(),
+            resolver.known(fsid, &handle).is_some(),
             "the parent handle must be in the store after resolution",
         );
     }
@@ -336,16 +336,16 @@ fn one_handles_bytes_on_two_filesystems_are_two_entries() {
     // out the same bytes for its root — so a store keyed on bytes alone would
     // answer with another filesystem's path.
     let handle: FileHandle = vec![4, 4, 4, 4, 4, 4, 4, 4];
-    let mut store = HandleCache::new();
-    PathStore::insert(&mut store, (1, 0), &handle, &PathBuf::from("/fs-one/root"));
-    PathStore::insert(&mut store, (2, 0), &handle, &PathBuf::from("/fs-two/root"));
+    let store = HandleCache::new();
+    PathMemo::remember(&store, (1, 0), &handle, &PathBuf::from("/fs-one/root"));
+    PathMemo::remember(&store, (2, 0), &handle, &PathBuf::from("/fs-two/root"));
 
     assert_eq!(
-        PathStore::get(&mut store, (1, 0), &handle),
+        store.path_of((1, 0), &handle),
         Some(PathBuf::from("/fs-one/root")),
     );
     assert_eq!(
-        PathStore::get(&mut store, (2, 0), &handle),
+        store.path_of((2, 0), &handle),
         Some(PathBuf::from("/fs-two/root")),
     );
 }
@@ -354,7 +354,8 @@ fn one_handles_bytes_on_two_filesystems_are_two_entries() {
 
 #[test]
 fn an_event_that_names_no_object_is_not_reported_as_a_failure() {
-    let mut resolver = PathResolver::new(Mounts::new());
+    let mounts = Mounts::new();
+    let resolver = PathResolver::new(&NoCache, &mounts);
     // An overflow event: a mask, no identity record, no fsid.
     let mut overflow = FidEvent::new();
     overflow.set_mask(FAN_Q_OVERFLOW);
@@ -379,7 +380,8 @@ fn an_event_whose_answer_is_unavailable_is_distinguishable_from_one_with_nothing
     let dir = tmpdir();
     let mut event = event_for(dir.path(), "entry");
     // No mounts and no store: the identity is there, the answer is not.
-    let mut resolver = PathResolver::new(Mounts::new());
+    let mounts = Mounts::new();
+    let resolver = PathResolver::new(&NoCache, &mounts);
     assert_eq!(
         resolver.resolve_event(&mut event),
         EventResolution::Unresolvable,
@@ -396,7 +398,8 @@ fn an_event_that_already_carries_a_path_is_not_resolved_twice() {
     let mut event = event_for(dir.path(), "entry");
     event.set_path(PathBuf::from("/already/known"));
 
-    let mut resolver = PathResolver::new(Mounts::new());
+    let mounts = Mounts::new();
+    let resolver = PathResolver::new(&NoCache, &mounts);
     assert_eq!(
         resolver.resolve_event(&mut event),
         EventResolution::AlreadyResolved,
@@ -419,7 +422,8 @@ fn an_event_that_already_carries_a_path_is_not_resolved_twice() {
 fn a_resolution_failure_is_not_reported_as_an_io_error() {
     // The confusion this guards against: `resolve_handle` fails with EPERM and
     // the caller concludes the *event* was malformed.  It was not.
-    let mut resolver = PathResolver::new(Mounts::new());
+    let mounts = Mounts::new();
+    let resolver = PathResolver::new(&NoCache, &mounts);
     let err = resolver
         .resolve_handle((3, 4), &[0u8; 4])
         .expect_err("four bytes is not a file handle");
@@ -434,9 +438,10 @@ fn a_directorys_own_entry_name_does_not_end_up_in_the_path() {
     // to a `HashMap` key, or to any consumer that compares bytes.
     let fsid: Fsid = (3, 4);
     let handle: FileHandle = vec![2, 2, 2, 2, 2, 2, 2, 2];
-    let mut store = HandleCache::new();
-    PathStore::insert(&mut store, fsid, &handle, &PathBuf::from("/srv/data"));
-    let mut resolver = PathResolver::with_store(Mounts::new(), store);
+    let store = HandleCache::new();
+    PathMemo::remember(&store, fsid, &handle, &PathBuf::from("/srv/data"));
+    let mounts = Mounts::new();
+    let resolver = PathResolver::new(&store, &mounts);
 
     let path = resolver.resolve_dir(fsid, &handle, b".").unwrap();
     assert_eq!(path, PathBuf::from("/srv/data"));
@@ -454,9 +459,10 @@ fn resolve_events_separates_resolving_from_re_seeing() {
     let known: FileHandle = vec![1, 2, 3, 4, 5, 6, 7, 8];
     let unknown: FileHandle = vec![8, 7, 6, 5, 4, 3, 2, 1];
 
-    let mut store = HandleCache::new();
-    PathStore::insert(&mut store, fsid, &known, &PathBuf::from("/known"));
-    let mut resolver = PathResolver::with_store(Mounts::new(), store);
+    let store = HandleCache::new();
+    PathMemo::remember(&store, fsid, &known, &PathBuf::from("/known"));
+    let mounts = Mounts::new();
+    let mut resolver = PathResolver::new(&store, &mounts);
     resolver.set_syscall_fallback(false);
 
     let mut events = vec![
@@ -493,9 +499,10 @@ fn resolve_events_counts_a_pass_per_level_of_recovery() {
     let fsid: Fsid = (7, 8);
     let root: FileHandle = vec![1, 1, 1, 1, 1, 1, 1, 1];
 
-    let mut store = HandleCache::new();
-    PathStore::insert(&mut store, fsid, &root, &PathBuf::from("/root"));
-    let mut resolver = PathResolver::with_store(Mounts::new(), store);
+    let store = HandleCache::new();
+    PathMemo::remember(&store, fsid, &root, &PathBuf::from("/root"));
+    let mounts = Mounts::new();
+    let mut resolver = PathResolver::new(&store, &mounts);
     resolver.set_syscall_fallback(false);
 
     let mut events = vec![naming(fsid, &root, "one")];
@@ -529,32 +536,32 @@ fn forgetting_the_last_handle_of_a_filesystem_drops_its_level() {
     let one: FileHandle = vec![1; 8];
     let two: FileHandle = vec![2; 8];
 
-    let mut store = HandleCache::new();
-    PathStore::insert(&mut store, fsid, &one, &PathBuf::from("/one"));
-    PathStore::insert(&mut store, fsid, &two, &PathBuf::from("/two"));
-    PathStore::insert(&mut store, other, &one, &PathBuf::from("/other-one"));
+    let store = HandleCache::new();
+    PathMemo::remember(&store, fsid, &one, &PathBuf::from("/one"));
+    PathMemo::remember(&store, fsid, &two, &PathBuf::from("/two"));
+    PathMemo::remember(&store, other, &one, &PathBuf::from("/other-one"));
     assert_eq!(store.len(), 3);
     assert_eq!(store.filesystems(), 2);
 
-    PathStore::forget(&mut store, fsid, &one);
-    assert_eq!(PathStore::get(&mut store, fsid, &one), None);
+    PathMemo::forget(&store, fsid, &one);
+    assert_eq!(store.path_of(fsid, &one), None);
     assert_eq!(
-        PathStore::get(&mut store, fsid, &two),
+        store.path_of(fsid, &two),
         Some(PathBuf::from("/two")),
         "the other handle of the same filesystem must survive",
     );
     assert_eq!(
-        PathStore::get(&mut store, other, &one),
+        store.path_of(other, &one),
         Some(PathBuf::from("/other-one")),
         "the same bytes on another filesystem are a different entry",
     );
     assert_eq!(store.filesystems(), 2, "one handle left on each filesystem");
 
-    PathStore::forget(&mut store, fsid, &two);
+    PathMemo::forget(&store, fsid, &two);
     assert_eq!(store.filesystems(), 1, "the emptied level is gone");
     assert!(!store.is_empty(), "the other filesystem is still known");
 
-    PathStore::forget(&mut store, other, &one);
+    PathMemo::forget(&store, other, &one);
     assert!(store.is_empty(), "nothing is known now");
     assert_eq!(store.len(), 0);
     assert_eq!(store.filesystems(), 0);
@@ -565,17 +572,16 @@ fn known_answers_without_spending_a_syscall_and_keeps_no_borrow() {
     // `known` is the "do I already know?" question: it consults the store and
     // nothing else, so a miss is `None` rather than a resolution.
     //
-    // It returns an owned path because the store may be one that cannot hand out
-    // a borrow — see `PathStore` — which is also why it takes `&mut self`: a
-    // store with a recency or expiry policy may write on a hit.  What that buys
-    // the caller is asserted here: the answer outlives the resolver's next use,
-    // so a batch naming one parent handle can hold it while the resolver keeps
-    // working.
+    // It returns an owned path — the caller asked to be told the path, so it
+    // keeps the copy.  Resolution does not go through it: `resolve_dir` reads
+    // through `PathStore::with_path`, which hands the borrow to a closure for
+    // the duration of the call, so a resolution that only reads copies nothing.
     let fsid: Fsid = (4, 2);
     let handle: FileHandle = vec![6; 8];
-    let mut store = HandleCache::new();
-    PathStore::insert(&mut store, fsid, &handle, &PathBuf::from("/known/answer"));
-    let mut resolver = PathResolver::with_store(Mounts::new(), store);
+    let store = HandleCache::new();
+    PathMemo::remember(&store, fsid, &handle, &PathBuf::from("/known/answer"));
+    let mounts = Mounts::new();
+    let resolver = PathResolver::new(&store, &mounts);
 
     let known: PathBuf = resolver.known(fsid, &handle).unwrap();
     assert_eq!(known, PathBuf::from("/known/answer"));
@@ -583,19 +589,24 @@ fn known_answers_without_spending_a_syscall_and_keeps_no_borrow() {
 
     // The path is the caller's now, not a borrow of the store: invalidating the
     // entry does not reach it.
-    PathStore::forget(resolver.store_mut(), fsid, &handle);
+    PathMemo::forget(resolver.store(), fsid, &handle);
     assert_eq!(resolver.known(fsid, &handle), None);
     assert_eq!(known, PathBuf::from("/known/answer"));
 
-    // The zero-allocation form is the default store's own inherent accessor,
-    // which is a borrow and therefore needs no copy and no `&mut self`.
-    PathStore::insert(
-        resolver.store_mut(),
-        fsid,
-        &handle,
-        &PathBuf::from("/known/answer"),
+    // And what resolution reads through: the borrow lives for the call, so a
+    // store behind a lock can answer without copying and without leaking.
+    let seen = resolver
+        .store()
+        .with_path(fsid, &handle, |p| p.to_path_buf());
+    assert_eq!(seen, None, "the entry was forgotten above");
+    PathMemo::remember(resolver.store(), fsid, &handle, Path::new("/known/answer"));
+    let seen = resolver
+        .store()
+        .with_path(fsid, &handle, |p| p == Path::new("/known/answer"));
+    assert_eq!(seen, Some(true));
+    assert_eq!(
+        resolver.store().with_path(fsid, &[0u8; 8], |_| ()),
+        None,
+        "an unknown handle runs the closure for nothing"
     );
-    let borrowed: &Path = resolver.store().path_of(fsid, &handle).unwrap();
-    assert_eq!(borrowed, Path::new("/known/answer"));
-    assert_eq!(resolver.store().path_of(fsid, &[0u8; 8]), None);
 }

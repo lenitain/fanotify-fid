@@ -14,7 +14,7 @@
 
 use fanotify_fid::consts::*;
 use fanotify_fid::fid::FidEvent;
-use fanotify_fid::handle::{FileHandle, Fsid, HandleCache, Mounts, PathStore};
+use fanotify_fid::handle::{FileHandle, Fsid, HandleCache, Mounts, PathMemo};
 use fanotify_fid::resolve::{EventResolution, PathResolver};
 use std::path::{Path, PathBuf};
 
@@ -167,9 +167,10 @@ fn resolving_a_batch_converges_and_a_second_pass_changes_nothing() {
         // Only the one handle is known, and no syscall may be spent, so what
         // resolves is exactly what the store can answer — a deterministic
         // fixture for a property about the resolver's own bookkeeping.
-        let mut store = HandleCache::new();
-        PathStore::insert(&mut store, fsid, &known, &PathBuf::from("/known"));
-        let mut resolver = PathResolver::with_store(Mounts::new(), store);
+        let store = HandleCache::new();
+        PathMemo::remember(&store, fsid, &known, &PathBuf::from("/known"));
+        let mounts = Mounts::new();
+        let mut resolver = PathResolver::new(&store, &mounts);
         resolver.set_syscall_fallback(false);
 
         let first = resolver.resolve_events(&mut events);
@@ -234,9 +235,10 @@ fn resolve_event_says_exactly_whether_the_event_ended_with_a_path() {
         };
         let mut event = event_naming(fsid, handle, "entry");
 
-        let mut store = HandleCache::new();
-        PathStore::insert(&mut store, fsid, &known, &PathBuf::from("/known"));
-        let mut resolver = PathResolver::with_store(Mounts::new(), store);
+        let store = HandleCache::new();
+        PathMemo::remember(&store, fsid, &known, &PathBuf::from("/known"));
+        let mounts = Mounts::new();
+        let mut resolver = PathResolver::new(&store, &mounts);
         resolver.set_syscall_fallback(false);
 
         let outcome = resolver.resolve_event(&mut event);

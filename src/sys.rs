@@ -232,11 +232,11 @@ pub(crate) fn read_events(fanotify_fd: &OwnedFd, buf: &mut Vec<u8>) -> Result<()
 /// who has handed out borrows of it has nothing to fear from the next read.
 ///
 /// `buf` must be **initialized**, which is why the slice form is `&mut [u8]` and
-/// not `&mut [MaybeUninit<u8>]`: a zeroed buffer is a buffer the caller can also
-/// hand to [`crate::EventReader::raw_bytes`] without a second thought, and bytes
-/// the kernel is about to overwrite do not need to be *uninitialized* to be
-/// free.  A caller coming from an uninitialized allocation can reach this
-/// through [`read_events`], which is where that case is handled.
+/// not `&mut [MaybeUninit<u8>]`: a zeroed buffer is a buffer the caller can read
+/// as bytes without a second thought, and bytes the kernel is about to overwrite
+/// do not need to be *uninitialized* to be free.  A caller coming from an
+/// uninitialized allocation can reach this through [`read_events`], which is
+/// where that case is handled.
 ///
 /// # Errors
 ///

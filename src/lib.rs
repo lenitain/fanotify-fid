@@ -75,9 +75,10 @@
 //!   [`FidEvent::mnt_id`]).  A FID event **borrows the buffer it was parsed
 //!   from**, so a stream of handles and names costs no per-record allocation;
 //!   [`FidEvent::into_owned`] is the explicit conversion for an event that has
-//!   to outlive the read, and
-//!   [`EventReader::raw_bytes`] is the cheaper one for a whole batch that has to
-//!   (see `examples/batch_to_worker.rs`).  Both formats have a `*_reported`
+//!   to outlive the read, and the stateless [`Fanotify::read_events`] is the
+//!   cheaper one for a whole batch that has to, because there the buffer is the
+//!   caller's own and the batch is copied **once as bytes** (see
+//!   `examples/batch_to_worker.rs`).  Both formats have a `*_reported`
 //!   entry point whose [`ParseReport`] says whether the buffer was walked to the
 //!   end, because a truncated buffer and an empty queue must not look alike;
 //! * **the two ways to answer a permission event** — matched by descriptor, or
@@ -274,10 +275,11 @@
 #[cfg(not(target_os = "linux"))]
 compile_error!("fanotify-fid only supports Linux");
 
-// The README is compiled as a doctest, so any example added to it is checked
-// against the API rather than drifting silently.  The README currently carries
-// no Rust example; when one comes back it must be `no_run`, because a real
-// example needs privilege and a real path.
+// Including the README here is what puts any Rust example in it through the
+// doctest runner, so an example cannot drift from the API without failing
+// `cargo test --doc`.  It currently carries none: a real example needs privilege
+// and a real path, so it would have to be `no_run` and would assert nothing.  The
+// compile-checked examples live in `examples/` instead.
 #[doc = include_str!("../README.md")]
 #[cfg(doctest)]
 pub struct ReadmeDoctests;
@@ -301,8 +303,8 @@ pub use fid::{
 };
 pub use group::{EventReader, Fanotify, FdEventReader};
 pub use handle::{
-    Candidate, FileHandle, Fsid, HandleCache, Mounts, NoCache, PathStore, resolve_file_handle,
-    resolve_file_handle_in,
+    Candidate, FileHandle, Fsid, HandleCache, Mounts, NoCache, PathMemo, PathStore,
+    resolve_file_handle, resolve_file_handle_in,
 };
 pub use parse::{EventStop, ParseReport};
 pub use resolve::{EventResolution, PathResolver, Resolution};
@@ -336,7 +338,7 @@ pub use response::FanotifyResponse;
 pub mod prelude {
     pub use crate::consts::*;
     pub use crate::handle::{
-        Candidate, FileHandle, Fsid, HandleCache, Mounts, NoCache, PathStore, fsid_of_fd,
+        Candidate, FileHandle, Fsid, HandleCache, Mounts, NoCache, PathMemo, PathStore, fsid_of_fd,
         fsid_of_path, handle_from_fd, name_to_handle_at, open_by_handle_at, resolve_file_handle,
         resolve_file_handle_in,
     };

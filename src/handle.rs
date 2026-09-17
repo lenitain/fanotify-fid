@@ -105,14 +105,43 @@ pub const MAX_FILE_HANDLE_SIZE: usize = FILE_HANDLE_HEADER_SIZE + MAX_HANDLE_SZ;
 /// for why the decision belongs to the caller, and
 /// [`PathResolver`](crate::resolve::PathResolver) for how it is kept consistent.
 ///
+/// # Reading is not writing, and the trait says so
+///
+/// A store answers one question — *what path is this handle?* — and the answer is
+/// read out of what the store already holds.  Nothing about the question requires
+/// ownership of the answer, and nothing about it requires the right to modify the
+/// store, so [`with_path`](PathStore::with_path) is `&self` and hands the borrow
+/// to a closure that runs while the store still has it.
+///
+/// That shape is deliberate, and it is what an earlier `get(&mut self) ->
+/// Option<PathBuf>` could not express.  Returning an owned path costs one
+/// allocation and one `memcpy` **per event**, on the hottest path there is: a
+/// batch of a thousand events about one directory asks one question a thousand
+/// times, and every answer was copied out only to be used and dropped.  Taking
+/// `&mut self` to answer it cost more than the copy: it made the store
+/// exclusively borrowed for the whole resolution, so a caller that kept its
+/// store in the same struct as its reader — which is the ordinary shape — could
+/// not resolve at all without restructuring.
+///
+/// Recording is the other capability, and it is separate because it is a
+/// different operation with a different frequency: [`PathMemo::remember`] runs
+/// once per handle learned, which is once per syscall spent, and never on the
+/// read path at all.
+///
 /// # Implementing it
 ///
-/// Three operations are required: record ([`insert`](Self::insert)), answer
-/// ([`get`](Self::get)) and drop ([`forget`](Self::forget)).  Implement them to
-/// bound the cache (an LRU that drops the oldest entries), to share it (a handle
-/// behind a lock), to persist it, to forget on demand, or to keep nothing at all
-/// ([`NoCache`]) — none of which this crate can choose for you, because each is a
-/// policy about memory, staleness or concurrency.
+/// One method is required, the borrowed lookup.  Implement the store to bound
+/// the cache (an LRU that drops the oldest entries), to share it (a map behind a
+/// lock), to persist it, or to keep nothing at all ([`NoCache`]) — none of which
+/// this crate can choose for you, because each is a policy about memory,
+/// staleness or concurrency.
+///
+/// A store whose hits update a recency, an expiry or a counter needs interior
+/// mutability to do it — a `Cell`, a lock, or an atomic — because a `&self`
+/// lookup is what the read path can afford.  That is a real cost, and it is the
+/// cost this design chooses: a store that would rather not pay it either declines
+/// the recency policy ([`HandleCache`] keeps none) or keeps the mutation on the
+/// write side, where it is once per handle instead of once per event.
 ///
 /// A hit is used as the answer and no syscall is spent; a miss means "ask the
 /// filesystem".  So a store that expires, forgets or declines to answer costs a
@@ -120,32 +149,7 @@ pub const MAX_FILE_HANDLE_SIZE: usize = FILE_HANDLE_HEADER_SIZE + MAX_HANDLE_SZ;
 /// answer is what keeps two events about one handle from contradicting each
 /// other.
 ///
-/// # Why a hit hands over an owned path
-///
-/// [`get`](Self::get) returns `Option<PathBuf>` rather than a borrow, and that
-/// is the shape the policies above actually need.  A borrow would rule out the
-/// two stores most worth having:
-///
-/// * **a handle behind a lock.**  A reference into a `Mutex<HashMap>` cannot
-///   outlive the guard that produced it, and no signature taking `&self` and
-///   returning `Option<&Path>` can express "the guard travels with the
-///   answer".  A store in that shape can only answer by copying.
-/// * **an LRU, or any store with a recency or expiry policy.**  A hit is what
-///   *updates* the policy, so a lookup is a write — `lru::LruCache::get` takes
-///   `&mut self` — and a `&self` method cannot call it.
-///
-/// So the trait asks for the copy, and the copy is cheap next to what it buys:
-/// a hit still skips `open_by_handle_at` and a `readlink`, which is the whole
-/// reason the store exists.  A store that *can* hand out a reference — one whose
-/// values are already owned in place, with no policy to update — should say so
-/// with an **inherent** method, and only that way: [`HandleCache::path_of`] is
-/// this crate's own example, and it is what
-/// [`PathResolver::known`](crate::resolve::PathResolver::known) sends a caller to
-/// for the zero-allocation look.  A `&self` method on this trait could not serve
-/// that purpose, because the stores that need the copy are exactly the ones that
-/// need `&mut self` or a guard — so a trait-level borrow would either exclude
-/// them or be silently useless for them.  What a store must not do is pretend a
-/// `&self` borrow covers a store that needs `&mut self` or a guard.
+/// # The key is the pair
 ///
 /// The key is the **pair** of fsid and handle, not the handle alone: handle
 /// bytes are only meaningful together with their filesystem.  Two filesystems
@@ -155,7 +159,7 @@ pub const MAX_FILE_HANDLE_SIZE: usize = FILE_HANDLE_HEADER_SIZE + MAX_HANDLE_SZ;
 ///
 /// # The pair is only as good as the fsid
 ///
-/// The split above is what makes one handle resolve to one answer **across
+/// The key above is what makes one handle resolve to one answer **across
 /// filesystems**, and it holds except where the kernel's fsid stops
 /// distinguishing them: a filesystem that reports `f_fsid` zero — `fuse(4)` is
 /// the documented case — is one `(0, 0)` to this key no matter how many instances
@@ -165,19 +169,70 @@ pub const MAX_FILE_HANDLE_SIZE: usize = FILE_HANDLE_HEADER_SIZE + MAX_HANDLE_SZ;
 /// caller in that position keeps one store per filesystem, the same way it keeps
 /// one [`Mounts`] per filesystem.
 pub trait PathStore {
-    /// The path already known for this handle, if any.
+    /// Hand the path known for this handle to `f`, or answer `None`.
     ///
-    /// Owned, because the stores this trait exists for cannot hand out a
-    /// reference: see the type-level docs on why.  A store that can — an
-    /// in-place map — is free to add an inherent borrowing accessor alongside
-    /// this method, and should, because that accessor is the only zero-allocation
-    /// way to ask.
+    /// The closure is not ceremony — it is the only shape that serves both kinds
+    /// of store without costing either one.  A map whose values are owned in
+    /// place can hand out a plain borrow; a map behind a lock cannot, because the
+    /// guard cannot travel with the answer.  Handing the borrow to a closure for
+    /// the duration of the call is something *both* can do, so neither has to
+    /// copy a path it already holds and neither has to leak one to fake a
+    /// lifetime it cannot express.
     ///
-    /// Takes `&mut self`: a hit is what updates a recency, an expiry or a
-    /// counter, so a lookup may legitimately write.  A store with no policy to
-    /// update ignores the mutability.
-    fn get(&mut self, fsid: Fsid, handle: &[u8]) -> Option<PathBuf>;
+    /// What the caller does inside is the caller's business — read it, compare
+    /// it, join a name onto it — and the borrow ends with the call, which is why
+    /// a resolution can append a path component without ever giving the store a
+    /// copy to keep.
+    ///
+    /// `f` runs at most once.
+    fn with_path<R>(&self, fsid: Fsid, handle: &[u8], f: impl FnOnce(&Path) -> R) -> Option<R>;
+}
 
+/// A [`PathStore`] is a `PathStore`, so a resolver generic over `&C` and one
+/// generic over `&&C` are the same call.
+impl<T: PathStore + ?Sized> PathStore for &T {
+    fn with_path<R>(&self, fsid: Fsid, handle: &[u8], f: impl FnOnce(&Path) -> R) -> Option<R> {
+        (**self).with_path(fsid, handle, f)
+    }
+}
+/// Recording what a resolution learned.
+///
+/// A store answers from [`PathStore::with_path`]; this is the other half, and it
+/// is a separate trait because it is a separate operation: a reader resolving a
+/// batch only ever *reads*, and asking it for the right to write would make the
+/// store exclusively borrowed for the whole resolution.  So the resolver holds one
+/// shared reference and does both through it, and a store that keeps what it
+/// learns owns the mutability that implies.
+///
+/// Both methods have defaults that do nothing, so a store that keeps nothing
+/// implements only [`PathStore`] — and a resolver that should not learn anything
+/// is simply never asked to record.
+///
+/// # Why these take `&self` too
+///
+/// Because a resolver holds **one** reference to the store, not two, and it
+/// cannot hold both: an `&mut C` and the `&C` it reads through are the same
+/// object, so a resolution that reads and records through different references
+/// is rejected by the borrow checker before it can be wrong at run time.  That
+/// is not a limitation to work around — it is the shape of the problem.  A
+/// resolution *is* one operation over one store; the read and the write are two
+/// moments of it.
+///
+/// So a store that keeps what it learns owns its own mutability: a `Cell`, a
+/// lock, or an atomic.  That is the same demand [`PathStore`] makes of a store
+/// whose hits update a policy, and for the same reason — the caller reads
+/// through a shared reference, so anything that changes has to be the store's own
+/// business.  A store that would rather not pay it keeps nothing and implements
+/// only [`PathStore`].
+///
+/// # Why it takes a closure and not a path
+///
+/// The path to record is the one just resolved, and handing it over as
+/// `&Path` means the store copies it if it keeps one.  That is one copy per
+/// handle learned — once per syscall the resolution spent — and never on the
+/// read path, where a hit is still the borrowed
+/// [`PathStore::with_path`].
+pub trait PathMemo: PathStore {
     /// Record a path for this handle.
     ///
     /// Called with what the filesystem reported, including any `" (deleted)"`
@@ -187,10 +242,8 @@ pub trait PathStore {
     ///
     /// Borrowed rather than owned so that a store which cannot take ownership —
     /// a persisted log, a shared structure, anything that has to copy anyway —
-    /// is not forced to allocate first.  A store that can keep the path must copy
-    /// it, because the caller keeps its own copy: the answer goes on the event as
-    /// well as into the store.
-    fn insert(&mut self, fsid: Fsid, handle: &[u8], path: &Path);
+    /// is not forced to allocate first.  A store that can keep the path copies it.
+    fn remember(&self, fsid: Fsid, handle: &[u8], path: &Path);
 
     /// Drop what is known about this handle, so the next lookup asks the
     /// filesystem again.
@@ -200,7 +253,7 @@ pub trait PathStore {
     /// was learned.  Forgetting before the next resolution makes the resolver
     /// spend the syscall, which is what a caller that has just seen a rename
     /// event wants.
-    fn forget(&mut self, fsid: Fsid, handle: &[u8]);
+    fn forget(&self, fsid: Fsid, handle: &[u8]);
 }
 
 /// The store this crate uses when the caller has no reason to choose one.
@@ -220,15 +273,40 @@ pub trait PathStore {
 /// Unbounded is a real property and not an oversight: this crate cannot know how
 /// many handles a long-running process will see, so a bound would be a guess
 /// that silently discards knowledge.  A caller that needs one implements
-/// [`PathStore`] over an LRU or a TTL map and passes that instead — which the
-/// trait's `&mut self` lookup is shaped to allow, since a hit in such a store
-/// updates the policy that makes it bounded.
-#[derive(Debug, Clone, Default)]
+/// [`PathStore`] over an LRU or a TTL map and passes that instead.
+///
+/// # It carries its own mutability
+///
+/// [`PathMemo::remember`] takes `&self`, so the map is behind a [`RwLock`]: the
+/// reads a resolution makes are shared, the writes it learns are exclusive, and
+/// both go through one reference because that is the only shape a resolver can
+/// hold.  The lock is uncontended in the ordinary case — one task resolving its
+/// own batches — and an uncontended `RwLock` read is an atomic compare, which is
+/// nothing next to the `open_by_handle_at` a hit just avoided.
+///
+/// [`RwLock`]: std::sync::RwLock
+#[derive(Debug, Default)]
 pub struct HandleCache {
     /// Handles are only meaningful within their filesystem, so the split by
     /// fsid is the same fact the key was expressing — as a level instead of as a
     /// tuple.
-    by_filesystem: std::collections::HashMap<Fsid, std::collections::HashMap<FileHandle, PathBuf>>,
+    by_filesystem: std::sync::RwLock<
+        std::collections::HashMap<Fsid, std::collections::HashMap<FileHandle, PathBuf>>,
+    >,
+}
+
+impl Clone for HandleCache {
+    /// A clone shares the map rather than copying it.
+    ///
+    /// Two handles onto one store is what `Arc` says and what a caller wanting a
+    /// second clone of a whole handle table does not: a cache is knowledge
+    /// gathered over time, and a copy of it diverges the moment either side
+    /// learns anything.
+    fn clone(&self) -> Self {
+        Self {
+            by_filesystem: std::sync::RwLock::new(self.snapshot()),
+        }
+    }
 }
 
 impl HandleCache {
@@ -237,9 +315,22 @@ impl HandleCache {
         Self::default()
     }
 
+    /// A copy of every entry, for a caller that really wants one.
+    ///
+    /// [`Clone`] is this plus a fresh lock; it exists separately so that the
+    /// expensive thing has a name.
+    fn snapshot(
+        &self,
+    ) -> std::collections::HashMap<Fsid, std::collections::HashMap<FileHandle, PathBuf>> {
+        self.by_filesystem
+            .read()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .clone()
+    }
+
     /// How many handles are known, across every filesystem.
     pub fn len(&self) -> usize {
-        self.by_filesystem
+        self.read()
             .values()
             .map(std::collections::HashMap::len)
             .sum()
@@ -248,85 +339,124 @@ impl HandleCache {
     /// Whether nothing is known.
     pub fn is_empty(&self) -> bool {
         // Cheaper than `len() == 0`: the first non-empty level decides.
-        self.by_filesystem
+        self.read()
             .values()
             .all(std::collections::HashMap::is_empty)
     }
 
     /// How many filesystems have at least one handle recorded.
     pub fn filesystems(&self) -> usize {
-        self.by_filesystem.len()
+        self.read().len()
+    }
+
+    /// The map, read-locked.  A poisoned lock is not an error here: the store is
+    /// a cache, and a panic elsewhere left it consistent enough to read.
+    fn read(
+        &self,
+    ) -> std::sync::RwLockReadGuard<
+        '_,
+        std::collections::HashMap<Fsid, std::collections::HashMap<FileHandle, PathBuf>>,
+    > {
+        self.by_filesystem
+            .read()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
     }
 
     /// Forget every handle of one filesystem, the way
-    /// [`forget`](PathStore::forget) forgets one.
+    /// [`forget`](PathMemo::forget) forgets one.
     ///
     /// What a caller does after unmounting: the level goes away whole, which
     /// takes its handles' allocations with it.
-    pub fn forget_filesystem(&mut self, fsid: Fsid) {
-        self.by_filesystem.remove(&fsid);
+    pub fn forget_filesystem(&self, fsid: Fsid) {
+        self.write().remove(&fsid);
     }
 
     /// Drop everything, keeping the outer level's allocation for reuse.
-    pub fn clear(&mut self) {
-        self.by_filesystem.clear();
+    pub fn clear(&self) {
+        self.write().clear();
     }
 
-    /// Every entry, for inspection or persistence.
-    pub fn iter(&self) -> impl Iterator<Item = (Fsid, &[u8], &Path)> {
-        self.by_filesystem.iter().flat_map(|(fsid, handles)| {
-            handles
-                .iter()
-                .map(move |(h, p)| (*fsid, h.as_slice(), p.as_path()))
-        })
+    /// Every entry, **copied out**, for inspection or persistence.
+    ///
+    /// Owned rather than borrowed because the map is behind a lock: a borrow
+    /// would have to travel with the guard, and a caller iterating a store while
+    /// a reader resolves into it should not hold that guard.  A snapshot is the
+    /// honest shape for "tell me everything", and it is not the hot path —
+    /// [`path_of`](Self::path_of) is.
+    pub fn entries(&self) -> Vec<(Fsid, FileHandle, PathBuf)> {
+        self.read()
+            .iter()
+            .flat_map(|(fsid, handles)| {
+                handles
+                    .iter()
+                    .map(move |(h, p)| (*fsid, h.clone(), p.clone()))
+            })
+            .collect()
     }
 
-    /// The path known for this handle, **borrowed**: a hit allocates nothing.
+    /// The path known for this handle, handed to `f` **borrowed**: a hit copies
+    /// nothing.
     ///
-    /// This store has nothing to update on a hit — no recency, no expiry, no
-    /// counter — and its values are owned in place inside the map, so it is one
-    /// of the stores that really can hand out a reference.  It says so with an
-    /// inherent method because [`PathStore::get`] cannot: the trait's shape has
-    /// to cover stores that answer from behind a lock or with a policy to update
-    /// (see its docs), and those can only answer by copying.
+    /// The same operation as [`PathStore::with_path`], in its inherent form, so
+    /// that a caller holding a `HandleCache` names the map lookup directly
+    /// instead of going through the trait.
+    pub fn with_path<R>(&self, fsid: Fsid, handle: &[u8], f: impl FnOnce(&Path) -> R) -> Option<R> {
+        <Self as PathStore>::with_path(self, fsid, handle, f)
+    }
+
+    /// The path known for this handle, **owned**.
     ///
-    /// Reach for this when the caller wants to *look* rather than to resolve:
-    /// something that formats a path, compares it, or hands the borrow to
-    /// another call.  Anything that has to keep the path needs an owned one
-    /// anyway, and [`PathStore::get`] is that form.
-    pub fn path_of(&self, fsid: Fsid, handle: &[u8]) -> Option<&Path> {
+    /// For a caller that has to keep it.  Resolution does not use this — it goes
+    /// through [`with_path`](Self::with_path), which appends a name without
+    /// copying the directory half first — so the copy here is paid only when a
+    /// path really is being kept.
+    pub fn path_of(&self, fsid: Fsid, handle: &[u8]) -> Option<PathBuf> {
+        self.with_path(fsid, handle, Path::to_path_buf)
+    }
+
+    fn write(
+        &self,
+    ) -> std::sync::RwLockWriteGuard<
+        '_,
+        std::collections::HashMap<Fsid, std::collections::HashMap<FileHandle, PathBuf>>,
+    > {
         self.by_filesystem
-            .get(&fsid)?
-            .get(handle)
-            .map(PathBuf::as_path)
+            .write()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
     }
 }
 
 impl PathStore for HandleCache {
-    fn get(&mut self, fsid: Fsid, handle: &[u8]) -> Option<PathBuf> {
-        // The one copy a hit costs, and the reason `path_of` exists alongside it:
-        // a caller that can work from a borrow does not have to pay this.
-        self.path_of(fsid, handle).map(Path::to_path_buf)
+    fn with_path<R>(&self, fsid: Fsid, handle: &[u8], f: impl FnOnce(&Path) -> R) -> Option<R> {
+        // The guard lives for the call, and the borrow `f` receives lives inside
+        // it.  Nothing is copied and nothing is leaked: this is the whole reason
+        // the trait takes a closure.
+        let guard = self.read();
+        let path = guard.get(&fsid)?.get(handle)?;
+        Some(f(path))
     }
+}
 
-    fn insert(&mut self, fsid: Fsid, handle: &[u8], path: &Path) {
+impl PathMemo for HandleCache {
+    fn remember(&self, fsid: Fsid, handle: &[u8], path: &Path) {
         // The store owns its path, so this is where the copy happens: one
-        // allocation per miss, which is the miss's whole cost on top of the
-        // syscall it just spent.
-        self.by_filesystem
+        // allocation per handle learned, which is the miss's whole cost on top of
+        // the syscall it just spent.
+        self.write()
             .entry(fsid)
             .or_default()
             .insert(handle.to_vec(), path.to_path_buf());
     }
 
-    fn forget(&mut self, fsid: Fsid, handle: &[u8]) {
-        if let Some(handles) = self.by_filesystem.get_mut(&fsid) {
+    fn forget(&self, fsid: Fsid, handle: &[u8]) {
+        let mut map = self.write();
+        if let Some(handles) = map.get_mut(&fsid) {
             handles.remove(handle);
             // A filesystem with no handles left is a level with nothing in it;
             // dropping it here keeps a long run's outer level proportional to
             // the filesystems still in use rather than to every one ever seen.
             if handles.is_empty() {
-                self.by_filesystem.remove(&fsid);
+                map.remove(&fsid);
             }
         }
     }
@@ -338,25 +468,17 @@ impl PathStore for HandleCache {
 /// about that handle: what a caller watching for renames wants, and what a
 /// caller that needs no consistency across events pays for with one
 /// [`open_by_handle_at`] per handle.  [`HandleCache`] is the opposite choice,
-/// and [`PathStore::forget`] is the middle one — keep the cache, drop what a
+/// and [`PathMemo::forget`] is the middle one — keep the cache, drop what a
 /// rename invalidated.
 #[derive(Debug, Clone, Copy, Default)]
 pub struct NoCache;
 
 impl PathStore for NoCache {
-    /// The borrowed form of a known path is [`HandleCache::path_of`], which is
-    /// inherent rather than part of this trait: a `&self` method here could not
-    /// serve the stores that need `&mut self` or a lock guard, which is why
-    /// [`get`](Self::get) copies.  Nothing is ever known.
-    fn get(&mut self, _fsid: Fsid, _handle: &[u8]) -> Option<PathBuf> {
+    /// Nothing is ever known, so this is the one store whose lookup cannot
+    /// answer, and `f` never runs.
+    fn with_path<R>(&self, _fsid: Fsid, _handle: &[u8], _f: impl FnOnce(&Path) -> R) -> Option<R> {
         None
     }
-
-    /// Nothing is recorded: keeping it is the one thing this store does not do.
-    fn insert(&mut self, _fsid: Fsid, _handle: &[u8], _path: &Path) {}
-
-    /// Nothing to forget.
-    fn forget(&mut self, _fsid: Fsid, _handle: &[u8]) {}
 }
 
 /// Look up the file handle of an **open descriptor**.

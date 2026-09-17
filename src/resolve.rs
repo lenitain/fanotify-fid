@@ -37,7 +37,7 @@
 //!
 //! ```rust,no_run
 //! use fanotify_fid::consts::*;
-//! use fanotify_fid::handle::Mounts;
+//! use fanotify_fid::handle::{HandleCache, Mounts};
 //! use fanotify_fid::resolve::PathResolver;
 //! use fanotify_fid::{Fanotify, FanotifyError};
 //!
@@ -51,7 +51,8 @@
 //! // CAP_DAC_READ_SEARCH; without it every call answers EPERM, and the handles
 //! // and names the events carry still need no privilege at all.
 //! let mounts = Mounts::new().with_fd(std::fs::File::open("/srv/data")?)?;
-//! let mut resolver = PathResolver::new(mounts);
+//! let store = HandleCache::new();
+//! let resolver = PathResolver::new(&store, &mounts);
 //!
 //! let mut buf = Vec::new();
 //! loop {
@@ -64,8 +65,10 @@
 //!         }
 //!         Err(e) => return Err(e.into()),
 //!     };
-//!     // Resolves what it can, and says how many it managed.
-//!     let resolved = resolver.resolve_events(&mut events);
+//!     // Resolves what it can, and says how many it managed.  The learning form
+//!     // keeps what it decoded, so the next batch about these directories is
+//!     // answered from the store.
+//!     let resolved = resolver.resolve_events_memo(&store, &mut events);
 //!     for ev in &events {
 //!         if ev.has_path() {
 //!             println!("{:?}{}", ev.path(), if ev.is_deleted() { " (gone)" } else { "" });
@@ -84,47 +87,36 @@
 use std::ffi::OsStr;
 use std::io;
 use std::os::unix::ffi::OsStrExt;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 
 use crate::fid::FidEvent;
-use crate::handle::{Fsid, HandleCache, Mounts, PathStore, resolve_file_handle_in};
+use crate::handle::{Fsid, HandleCache, Mounts, PathMemo, PathStore, resolve_file_handle_in};
 
-/// Resolves the handles of FID events, remembering what it learns.
+/// Resolves the handles of FID events against a store the caller owns.
 ///
-/// Generic over the store so the caller chooses where knowledge lives: the
-/// default is [`HandleCache`], an unbounded map, and any [`PathStore`] — an LRU,
-/// a TTL map, a handle behind a lock — drops in without touching this type.
+/// The resolver holds **borrows** — of the store to read, of the mounts to try —
+/// and no state of its own beyond the syscall switch.  That is not a style
+/// choice: the store is shared, so a caller keeps it in one place and resolves
+/// from anywhere, and every read of it is a `&self` lookup handing the borrowed
+/// path to a closure ([`PathStore::with_path`]) rather than a copy.
 ///
-/// See the [module docs](self) for why the state belongs here rather than in a
-/// free function.
+/// Recording is a different call on that same reference: the methods that learn
+/// take `&M where M: PathMemo`, so a reader that only reads never asks for the
+/// right to write.
+///
+/// See the [module docs](self) for why the knowledge belongs to the store rather
+/// than to this type.
 #[derive(Debug)]
-pub struct PathResolver<C = HandleCache> {
-    store: C,
-    mounts: Mounts,
+pub struct PathResolver<'a, C: ?Sized = HandleCache> {
+    store: &'a C,
+    mounts: &'a Mounts,
     syscall_fallback: bool,
 }
 
-impl PathResolver<HandleCache> {
-    /// A resolver that keeps what it learns in a [`HandleCache`], and that may
-    /// spend the `open_by_handle_at` syscall to learn more.
-    pub fn new(mounts: Mounts) -> Self {
-        Self::with_store(mounts, HandleCache::new())
-    }
-}
-
-impl Default for PathResolver<HandleCache> {
-    fn default() -> Self {
-        Self::new(Mounts::new())
-    }
-}
-
-impl<C: PathStore> PathResolver<C> {
-    /// A resolver over a store of your choosing.
-    ///
-    /// Use this to bound the cache, to share it with another component, or to
-    /// start from knowledge gathered elsewhere: anything already in `store` is
-    /// used before any syscall is spent.
-    pub fn with_store(mounts: Mounts, store: C) -> Self {
+impl<'a, C: PathStore + ?Sized> PathResolver<'a, C> {
+    /// A resolver that reads from `store` and may spend `open_by_handle_at` to
+    /// learn more.
+    pub fn new(store: &'a C, mounts: &'a Mounts) -> Self {
         Self {
             store,
             mounts,
@@ -153,32 +145,14 @@ impl<C: PathStore> PathResolver<C> {
         self
     }
 
-    /// The knowledge gathered so far.
+    /// The store this resolver reads.
     pub fn store(&self) -> &C {
-        &self.store
-    }
-
-    /// The knowledge gathered so far, for inspection or pre-seeding.
-    ///
-    /// Pre-seeding is the point: a caller that has just resolved a directory by
-    /// opening it and asking [`handle_from_fd`](crate::handle::handle_from_fd)
-    /// can put the answer here with one
-    /// [`PathStore::insert`], and every later event about a child of that
-    /// directory resolves without a syscall.  [`PathStore::forget`] is the other
-    /// direction: dropping what a rename invalidated so the next call asks the
-    /// filesystem.
-    pub fn store_mut(&mut self) -> &mut C {
-        &mut self.store
+        self.store
     }
 
     /// The mount descriptors this resolver may use.
     pub fn mounts(&self) -> &Mounts {
-        &self.mounts
-    }
-
-    /// Add mount descriptors without giving up what has been learned.
-    pub fn mounts_mut(&mut self) -> &mut Mounts {
-        &mut self.mounts
+        self.mounts
     }
 
     /// Resolve one handle, using the store first and the syscall only if needed.
@@ -190,18 +164,17 @@ impl<C: PathStore> PathResolver<C> {
     /// could not be learned is tried rather than skipped, since not knowing is
     /// not evidence of a mismatch.
     ///
-    /// A hit in the store is returned as stored, and no syscall is spent; drop
-    /// the entry with [`PathStore::forget`] to ask the filesystem again.
+    /// **A hit is borrowed and no syscall is spent**: the store answers from what
+    /// it holds, which is the whole point of [`PathStore::with_path`] taking
+    /// `&self` and handing the borrow to your closure.  Drop the entry with
+    /// [`PathMemo::forget`] to ask the filesystem again.
     ///
-    /// Owned, because the store may be one that cannot hand out a borrow — a
-    /// handle behind a lock, an LRU whose hit updates its recency.  See
-    /// [`PathStore`]: a *hit* still allocates once here, while the syscall it
-    /// saves is the expensive half.  For the zero-allocation look, and when the
-    /// store is the default [`HandleCache`], use
-    /// [`known`](Self::known) or [`HandleCache::path_of`] — neither resolves
-    /// anything, so neither can spend a syscall.
-    pub fn resolve_handle(&mut self, fsid: Fsid, handle: &[u8]) -> io::Result<std::path::PathBuf> {
-        if let Some(path) = self.store.get(fsid, handle) {
+    /// A hit still costs the returned `PathBuf` — the answer has to be owned to
+    /// leave the store — while a miss builds one from a `readlink`.  Neither is a
+    /// copy of what the store already held on top of that, which is what an owned
+    /// store lookup made it.
+    pub fn resolve_handle(&self, fsid: Fsid, handle: &[u8]) -> io::Result<PathBuf> {
+        if let Some(path) = self.store.with_path(fsid, handle, Path::to_path_buf) {
             return Ok(path);
         }
         if !self.syscall_fallback {
@@ -211,11 +184,24 @@ impl<C: PathStore> PathResolver<C> {
         // The candidates are walked in place: no `Vec` per miss, which is what
         // `resolve_file_handle_in` taking an iterator buys — and the fsids were
         // learned when the mounts were added, so this spends no `fstatfs`.
-        let path = resolve_file_handle_in(self.mounts.candidates(), Some(fsid), handle)?;
-        // Recorded by reference, because the caller leaves with the path: the
-        // store copies it if it keeps one, instead of being handed a copy that
-        // the caller then has to keep as well.
-        self.store.insert(fsid, handle, &path);
+        resolve_file_handle_in(self.mounts.candidates(), Some(fsid), handle)
+    }
+
+    /// Resolve one handle and record the answer, for a caller that is willing to
+    /// spend the write.
+    ///
+    /// [`resolve_handle`](Self::resolve_handle) plus [`PathMemo::remember`], and
+    /// the reason the two are separate: a caller that only reads never asks a
+    /// store to record anything, so it can resolve from a store it only has a
+    /// shared reference to.
+    pub fn resolve_handle_memo<M: PathMemo + ?Sized>(
+        &self,
+        memo: &M,
+        fsid: Fsid,
+        handle: &[u8],
+    ) -> io::Result<PathBuf> {
+        let path = self.resolve_handle(fsid, handle)?;
+        memo.remember(fsid, handle, &path);
         Ok(path)
     }
 
@@ -248,35 +234,51 @@ impl<C: PathStore> PathResolver<C> {
     /// same path to `==`, but not the same string to `display`, to a `HashMap`
     /// key, or to anything else that compares bytes.
     ///
-    /// The answer is owned, so a hit that is not already the directory costs the
-    /// store's one copy plus whatever the join needs — a second allocation when
-    /// [`PathBuf::push`] has to grow the first.  That is the whole cost the
-    /// [`PathStore`] contract trades for covering stores that cannot hand out a
-    /// borrow (see its docs); a caller that only needs to *read* a known path,
-    /// with no name to append, pays none of it through
-    /// [`HandleCache::path_of`], reached as [`PathResolver::known`] documents.
+    /// The answer is owned, and the join is why: a hit with no name to append is
+    /// the store's own bytes copied once, while a name to append needs a buffer to
+    /// be joined into.  Appending is the one allocation this resolution cannot
+    /// avoid — a path *is* the join of its parts — and it is one, not the store's
+    /// copy plus the join, which is what an owned store lookup would have made it.
     ///
-    /// The directory half is resolved before the name is validated, so a rejected
-    /// name can still have taught the store one thing: where that handle lives.
-    pub fn resolve_dir(
-        &mut self,
-        fsid: Fsid,
-        handle: &[u8],
-        name: &[u8],
-    ) -> io::Result<std::path::PathBuf> {
-        let mut path = self.resolve_handle(fsid, handle)?;
-        if name.is_empty() || name == b"." {
+    /// The name is validated before the directory half is resolved, so a rejected
+    /// name never causes a syscall.
+    pub fn resolve_dir(&self, fsid: Fsid, handle: &[u8], name: &[u8]) -> io::Result<PathBuf> {
+        // Validate before anything is resolved, so a name that cannot be a name
+        // never causes a syscall.
+        if !name.is_empty() && name != b"." {
+            if name.contains(&b'/') || name.contains(&0) || name == b".." {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidInput,
+                    "entry name must be one path component",
+                ));
+            }
+            // A Linux filename is bytes, not text; `PathBuf::push` is what keeps
+            // a name that is not UTF-8 intact while joining the way a path joins
+            // — including at `/`, where a separator written by hand gives
+            // `//name`.  The directory half is joined *inside* the store's
+            // closure, so a hit costs this one allocation and no copy of the
+            // directory on top of it.
+            if let Some(path) = self.store.with_path(fsid, handle, |dir| {
+                let mut path = dir.to_path_buf();
+                path.push(OsStr::from_bytes(name));
+                path
+            }) {
+                return Ok(path);
+            }
+        } else if let Some(path) = self.store.with_path(fsid, handle, Path::to_path_buf) {
+            // The path *is* the directory: no join, and the only cost is the copy
+            // the answer has to be made of.
             return Ok(path);
         }
-        if name.contains(&b'/') || name.contains(&0) || name == b".." {
-            return Err(io::Error::new(
-                io::ErrorKind::InvalidInput,
-                "entry name must be one path component",
-            ));
+
+        if !self.syscall_fallback {
+            return Err(io::Error::from_raw_os_error(libc::EXDEV));
         }
-        // A Linux filename is bytes, not text; `PathBuf::push` is what keeps a
-        // name that is not UTF-8 intact while joining the way a path joins —
-        // including at `/`, where a separator written by hand gives `//name`.
+        let dir = resolve_file_handle_in(self.mounts.candidates(), Some(fsid), handle)?;
+        if name.is_empty() || name == b"." {
+            return Ok(dir);
+        }
+        let mut path = dir;
         path.push(OsStr::from_bytes(name));
         Ok(path)
     }
@@ -303,7 +305,16 @@ impl<C: PathStore> PathResolver<C> {
     /// "nothing to resolve" and "the answer was unavailable" stay apart.  Ask
     /// [`resolve_handle`](Self::resolve_handle) or
     /// [`resolve_dir`](Self::resolve_dir) directly when the errno matters.
-    pub fn resolve_event(&mut self, event: &mut FidEvent<'_>) -> EventResolution {
+    ///
+    /// # This call does not write
+    ///
+    /// It takes `&self`: nothing it does modifies the store, because a reader
+    /// resolving a batch has no business asking for the right to write.  A
+    /// resolution that succeeds does spend a syscall and does learn something
+    /// worth keeping — use [`resolve_event_memo`](Self::resolve_event_memo), or
+    /// [`resolve_events_memo`](Self::resolve_events_memo), to hand that knowledge
+    /// to a [`PathMemo`].
+    pub fn resolve_event(&self, event: &mut FidEvent<'_>) -> EventResolution {
         if event.has_path() {
             return EventResolution::AlreadyResolved;
         }
@@ -313,18 +324,13 @@ impl<C: PathStore> PathResolver<C> {
 
         // The handles and names are borrowed from the event, so nothing here
         // copies them: the parse that produced them was allocation-free and the
-        // resolution does not undo that.
+        // resolution does not undo that.  The path a record yields is put on the
+        // event, which does own it — that is the one copy resolution makes, and
+        // a caller that would rather not make it reads the handle and name and
+        // resolves lazily.
         if let Some(handle) = event.dfid_name_handle()
             && let Ok(path) = self.resolve_dir(fsid, handle, event.dfid_name_raw())
         {
-            // The parent is now in the store.  So is the entry itself when
-            // the record named one: an event about that same object arriving
-            // later carries `FID`/`DFID` — no name — and the path just
-            // derived is byte-identical to what resolving that handle alone
-            // would produce, so storing it cannot contradict the parent.
-            if let Some(self_handle) = event.self_handle() {
-                self.store.insert(fsid, self_handle, &path);
-            }
             event.set_path(path);
             return EventResolution::Resolved;
         }
@@ -348,60 +354,106 @@ impl<C: PathStore> PathResolver<C> {
         EventResolution::Unresolvable
     }
 
+    /// [`resolve_event`](Self::resolve_event), recording what it learns.
+    ///
+    /// The same resolution with the one thing the read-only form cannot do:
+    /// teach the store the handles it decoded, so an event about the same
+    /// directory — arriving later, or later in the same batch — resolves from
+    /// the store instead of spending `open_by_handle_at` again.
+    pub fn resolve_event_memo<M: PathMemo + ?Sized>(
+        &self,
+        memo: &M,
+        event: &mut FidEvent<'_>,
+    ) -> EventResolution {
+        if event.has_path() {
+            return EventResolution::AlreadyResolved;
+        }
+        let Some(fsid) = event.fsid() else {
+            return EventResolution::NothingToResolve;
+        };
+
+        if let Some(handle) = event.dfid_name_handle()
+            && let Ok(path) = self.resolve_dir(fsid, handle, event.dfid_name_raw())
+        {
+            // The parent is now in the store.  So is the entry itself when the
+            // record named one: an event about that same object arriving later
+            // carries `FID`/`DFID` — no name — and the path just derived is
+            // byte-identical to what resolving that handle alone would produce,
+            // so storing it cannot contradict the parent.
+            if let Some(self_handle) = event.self_handle() {
+                memo.remember(fsid, self_handle, &path);
+            }
+            event.set_path(path);
+            return EventResolution::Resolved;
+        }
+
+        if let Some(side) = event.rename_source()
+            && let Ok(path) = self.resolve_dir(fsid, side.handle(), side.name().as_bytes())
+        {
+            event.set_path(path);
+            return EventResolution::Resolved;
+        }
+
+        if let Some(handle) = event.self_handle()
+            && let Ok(path) = self.resolve_handle(fsid, handle)
+        {
+            memo.remember(fsid, handle, &path);
+            event.set_path(path);
+            return EventResolution::Resolved;
+        }
+
+        EventResolution::Unresolvable
+    }
+
     /// Resolve the target side of a rename event, which
     /// [`resolve_event`](Self::resolve_event) leaves alone — it names a
     /// different parent, and this is the call that decides to spend a syscall on
-    /// it.  Resolving it also learns the new parent into the store, which is
-    /// what makes a later event about a child of that directory resolve without
-    /// one.
-    pub fn resolve_rename_target(
-        &mut self,
-        event: &FidEvent<'_>,
-    ) -> Option<io::Result<std::path::PathBuf>> {
+    /// it.
+    ///
+    /// The answer is owned, and it is worth taking: a rename target whose parent
+    /// the store already knows costs no syscall and no store copy.
+    pub fn resolve_rename_target(&self, event: &FidEvent<'_>) -> Option<io::Result<PathBuf>> {
         let (Some(fsid), Some(side)) = (event.fsid(), event.rename_target()) else {
             return None;
         };
         Some(self.resolve_dir(fsid, side.handle(), side.name().as_bytes()))
     }
 
-    /// The path this resolver already knows for a handle, owned.
+    /// The path this resolver already knows for a handle, borrowed.
     ///
-    /// No syscall: the answer is read straight out of the [`PathStore`], so this
-    /// answers `None` rather than spending anything.  It is
-    /// [`resolve_handle`](Self::resolve_handle) without the fallback — the way to
-    /// ask "do I already know?" without asking the filesystem.
-    ///
-    /// Owned, and taking `&mut self`, because the store may need both: see
-    /// [`PathStore`] for why a hit cannot be handed over as a borrow in general.
-    /// For the zero-allocation look, when the store is the default
-    /// [`HandleCache`], use [`store`](Self::store) and
-    /// [`HandleCache::path_of`] — no copy, no syscall, no `&mut self`:
+    /// No syscall and no copy: the answer is read straight out of the
+    /// [`PathStore`].  It is [`resolve_handle`](Self::resolve_handle) without the
+    /// fallback — the way to ask "do I already know?" without asking the
+    /// filesystem and without paying for an answer.
     ///
     /// ```
-    /// use fanotify_fid::handle::{Fsid, HandleCache, Mounts, PathStore};
+    /// use fanotify_fid::handle::{Fsid, HandleCache, Mounts, PathMemo};
     /// use fanotify_fid::resolve::PathResolver;
     ///
     /// let fsid: Fsid = (0x5eed, 1);
-    /// let mut store = HandleCache::new();
-    /// PathStore::insert(&mut store, fsid, &[7; 12], std::path::Path::new("/srv/data"));
-    /// let mut resolver = PathResolver::with_store(Mounts::new(), store);
+    /// let store = HandleCache::new();
+    /// PathMemo::remember(&store, fsid, &[7; 12], std::path::Path::new("/srv/data"));
+    /// let mounts = Mounts::new();
+    /// let resolver = PathResolver::new(&store, &mounts);
     ///
-    /// // One copy, because the answer is owned.
-    /// let known = resolver.known(fsid, &[7; 12]);
-    /// assert_eq!(known.as_deref(), Some(std::path::Path::new("/srv/data")));
-    /// // No copy at all, because this one is borrowed.
-    /// let borrowed: &std::path::Path = resolver.store().path_of(fsid, &[7; 12]).unwrap();
-    /// assert_eq!(borrowed, std::path::Path::new("/srv/data"));
+    /// // Owned: the caller asked to be told the path, so it keeps the copy.
+    /// let known: std::path::PathBuf = resolver.known(fsid, &[7; 12]).unwrap();
+    /// assert_eq!(known, std::path::Path::new("/srv/data"));
+    /// assert!(resolver.known(fsid, &[0; 8]).is_none());
+    ///
+    /// // And the form resolution reads through copies nothing at all.
+    /// let same = resolver
+    ///     .store()
+    ///     .with_path(fsid, &[7; 12], |p| p == std::path::Path::new("/srv/data"));
+    /// assert_eq!(same, Some(true));
     /// ```
     ///
     /// A batch of events about children of one directory names that directory's
     /// handle repeatedly: resolve the parent once, then look it up here for the
-    /// rest of the batch.  Each of those looks is a copy, which is what the
-    /// borrowed form above is for when the caller only needs to read one.  An
-    /// entry a caller wants to *invalidate* is [`PathStore::forget`], reached
-    /// through [`store_mut`](Self::store_mut).
-    pub fn known(&mut self, fsid: Fsid, handle: &[u8]) -> Option<PathBuf> {
-        self.store.get(fsid, handle)
+    /// rest of the batch.  An entry a caller wants to *invalidate* is
+    /// [`PathMemo::forget`].
+    pub fn known(&self, fsid: Fsid, handle: &[u8]) -> Option<PathBuf> {
+        self.store.with_path(fsid, handle, Path::to_path_buf)
     }
 
     /// Resolve a batch, repeating until no further event can be resolved.
@@ -416,28 +468,56 @@ impl<C: PathStore> PathResolver<C> {
     /// knowing `D`, and A is what taught it.  A later pass, with A's knowledge in
     /// the store, reaches B.
     ///
-    /// The same applies to a rename: [`resolve_event`](Self::resolve_event)
-    /// lands the source side, and the target's parent is learned only when
-    /// [`resolve_rename_target`](Self::resolve_rename_target) is called for it.
+    /// That recovery only exists when the batch *recorded* what it learned, so
+    /// it is [`resolve_events_memo`](Self::resolve_events_memo) that repeats
+    /// passes.  The read-only form makes exactly one pass, because without a
+    /// memo a second pass would ask the filesystem the same questions again and
+    /// get the same answers.
     ///
     /// # Returns
     ///
     /// A [`Resolution`] saying how much work that took and what is still
-    /// outstanding.  The loop stops as soon as a pass resolves nothing **new**,
-    /// so a batch whose handles cannot be resolved costs one pass and no
-    /// spinning; a chain of nested recoveries costs one pass per level.
+    /// outstanding.  A batch whose handles cannot be resolved costs one pass and
+    /// no spinning; a chain of nested recoveries costs one pass per level.
     ///
     /// The distinction the count keeps is between resolving and re-seeing: an
     /// event that already carried a path is not counted as resolved, so a second
     /// call on a settled batch reports [`resolved == 0`](Resolution::resolved)
     /// rather than reporting the batch again.  See [`Resolution`].
-    pub fn resolve_events(&mut self, events: &mut [FidEvent<'_>]) -> Resolution {
-        // The loop is bounded by the chain depth rather than by a constant: each
-        // pass that makes progress resolves at least one handle that was not
-        // known before, so it cannot run more times than there are events.
-        // Termination compares this pass's newly-resolved count with the
-        // previous one, which is why `AlreadyResolved` must not be counted
-        // towards it — a settled batch would otherwise "make progress" forever.
+    pub fn resolve_events(&self, events: &mut [FidEvent<'_>]) -> Resolution {
+        let mut newly = 0;
+        let mut already = 0;
+        let mut unresolved = 0;
+        for event in events.iter_mut() {
+            match self.resolve_event(event) {
+                EventResolution::Resolved => newly += 1,
+                EventResolution::AlreadyResolved => already += 1,
+                EventResolution::NothingToResolve | EventResolution::Unresolvable => {
+                    unresolved += 1;
+                }
+            }
+        }
+        Resolution {
+            resolved: newly,
+            already_resolved: already,
+            unresolved,
+            passes: 1,
+        }
+    }
+
+    /// [`resolve_events`](Self::resolve_events), recording what it learns and
+    /// repeating until a pass resolves nothing new.
+    ///
+    /// The fixed-point loop is what makes a nested recovery work: a pass that
+    /// resolves a parent teaches the memo, and the next pass reaches children
+    /// whose own parents are gone.  Each pass that makes progress resolves at
+    /// least one handle that was not known before, so the loop cannot run more
+    /// times than there are events.
+    pub fn resolve_events_memo<M: PathMemo + ?Sized>(
+        &self,
+        memo: &M,
+        events: &mut [FidEvent<'_>],
+    ) -> Resolution {
         let mut passes = 0;
         let mut best = Resolution::default();
         loop {
@@ -445,7 +525,7 @@ impl<C: PathStore> PathResolver<C> {
             let mut already = 0;
             let mut unresolved = 0;
             for event in events.iter_mut() {
-                match self.resolve_event(event) {
+                match self.resolve_event_memo(memo, event) {
                     EventResolution::Resolved => newly += 1,
                     EventResolution::AlreadyResolved => already += 1,
                     EventResolution::NothingToResolve | EventResolution::Unresolvable => {
@@ -464,12 +544,10 @@ impl<C: PathStore> PathResolver<C> {
             // fixed point was reached, and it is not work: it re-sees what is
             // already there, so its `resolved` is zero by definition.  Reporting
             // it would say "this call resolved nothing" about a call that just
-            // resolved a batch — the same confusion the old sum caused, from the
-            // other direction.  So the last pass that *did* work is the one kept.
+            // resolved a batch.  So the last pass that *did* work is the one
+            // kept, and a batch that never resolved anything reports its first
+            // pass.
             if newly == 0 {
-                // Nothing was ever resolved — an empty batch, or one whose
-                // handles are all unresolvable — so the first pass is the only
-                // account of it there is.
                 if passes == 1 {
                     return this;
                 }

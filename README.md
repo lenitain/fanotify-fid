@@ -26,9 +26,14 @@ fixed-stride reader parses garbage. This crate reads all three, byte for byte.
 - `FidEvent<'buf>` borrows the buffer it was parsed from, so a parse copies no
   record's bytes. `EventReader` owns the buffer and the event storage: one
   allocation for the first batch, none after it.
-- `PathResolver` turns handles into paths and remembers what it learned, so a
-  batch of events about one directory costs one `open_by_handle_at` instead of one
-  per event. Plug in your own cache, or none.
+- `PathResolver` turns handles into paths, reading the store through a borrow and
+  teaching it through a separate `PathMemo` — so a hit copies nothing, a store
+  behind a lock can answer, and a batch of events about one directory costs one
+  `open_by_handle_at` instead of one per event. Plug in your own cache, or none.
+- Reading, resolving and learning are three calls with three signatures, and each
+  one says what it costs: `EventReader::read` borrows, `resolve_events` only reads,
+  `resolve_events_memo` learns, and `Fanotify::read_events` is the owned form for a
+  batch that has to move to another thread.
 - Permission answers in all their forms, including the audit record and any record
   type a newer kernel adds — built without a heap buffer.
 - Every errno is the kernel's. Nothing is pre-validated, so a refusal is the

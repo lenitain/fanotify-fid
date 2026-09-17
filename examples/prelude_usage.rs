@@ -24,11 +24,13 @@ fn main() -> std::result::Result<(), Box<dyn std::error::Error>> {
         Fanotify::init(FAN_CLASS_NOTIF | FAN_REPORT_FID, O_NOATIME | O_CLOEXEC)?;
     let _allowed: u32 = EVENT_F_FLAGS_ALLOWED;
 
-    // Resolving: the mount descriptor carries its own fsid, the resolver keeps
-    // what it learns.
+    // Resolving: the mount descriptor carries its own fsid, the store keeps what
+    // is learned, and the resolver only borrows both.
     let mounts = Mounts::new().with_fd(std::fs::File::open("/tmp")?)?;
-    let mut resolver = PathResolver::new(mounts);
-    let _ = resolver.store_mut();
+    let store = HandleCache::new();
+    PathMemo::remember(&store, (0, 1), &[1, 2, 3], std::path::Path::new("/tmp"));
+    let resolver = PathResolver::new(&store, &mounts);
+    let _ = resolver.known((0, 1), &[1, 2, 3]);
     let _ = EventResolution::Resolved;
 
     // And the free functions are in scope too.

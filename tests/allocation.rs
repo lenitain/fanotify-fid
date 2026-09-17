@@ -16,7 +16,7 @@ use std::hint::black_box;
 use std::os::fd::AsFd;
 
 use fanotify_fid::consts::*;
-use fanotify_fid::handle::{Fsid, HandleCache, Mounts, PathStore};
+use fanotify_fid::handle::{Fsid, HandleCache, Mounts, PathMemo};
 use fanotify_fid::resolve::PathResolver;
 use fanotify_fid::response::FanotifyResponse;
 use fanotify_fid::{EventReader, Fanotify, FanotifyError, FdEventReader};
@@ -229,16 +229,21 @@ fn the_fd_reader_allocates_nothing_per_read_either() {
 
 #[test]
 fn a_store_hit_costs_the_answer_it_returns_and_nothing_else() {
-    // What the resolver's store contract is worth in allocations: a hit answers
-    // from the store and never reaches the syscall, so the only allocation on the
-    // path is the owned path the caller asked for.  Asserted with the syscall
-    // refused, which is what makes "no syscall was spent" a fact rather than an
-    // assumption about the filesystem.
+    // What the resolver's store contract is worth in allocations.  Asserted with
+    // the syscall refused, which is what makes "no syscall was spent" a fact rather
+    // than an assumption about the filesystem.
+    //
+    // Three forms, three costs, and the point is which one resolution uses:
+    // `resolve_handle` and `path_of` return an owned path because the caller asked
+    // to be told one, while `with_path` — the form `resolve_dir` reads through — is
+    // the borrow, and appending a name to it costs the joined path and nothing
+    // else.
     let fsid: Fsid = (0x5eed, 1);
     let handle: Vec<u8> = vec![7; 12];
-    let mut store = HandleCache::new();
-    PathStore::insert(&mut store, fsid, &handle, std::path::Path::new("/known"));
-    let mut resolver = PathResolver::with_store(Mounts::new(), store);
+    let store = HandleCache::new();
+    PathMemo::remember(&store, fsid, &handle, std::path::Path::new("/known"));
+    let mounts = Mounts::new();
+    let mut resolver = PathResolver::new(&store, &mounts);
     resolver.set_syscall_fallback(false);
 
     let (path, allocations) = allocations_during(|| resolver.resolve_handle(fsid, &handle));
@@ -252,18 +257,22 @@ fn a_store_hit_costs_the_answer_it_returns_and_nothing_else() {
     // the lookup itself costs nothing, and a caller that copies the answer pays
     // for the copy and not for the lookup.
     let (found, allocations) = allocations_during(|| resolver.store().path_of(fsid, &handle));
-    assert!(found.is_some());
-    assert_eq!(allocations, 0, "a borrowed hit must allocate nothing");
-
-    let (copied, allocations) = allocations_during(|| {
-        resolver
-            .store()
-            .path_of(fsid, &handle)
-            .map(std::path::Path::to_path_buf)
-    });
-    assert_eq!(copied.unwrap(), std::path::PathBuf::from("/known"));
+    assert_eq!(found.unwrap(), std::path::PathBuf::from("/known"));
     assert_eq!(
         allocations, 1,
-        "and copying it is the caller's one allocation"
+        "an owned hit is exactly the returned `PathBuf`: no key copy, no guard"
+    );
+
+    // The form resolution actually uses: the path is handed to a closure while
+    // the store's guard is alive, so nothing is copied and nothing is leaked.
+    let (seen, allocations) = allocations_during(|| {
+        resolver
+            .store()
+            .with_path(fsid, &handle, |p| p == std::path::Path::new("/known"))
+    });
+    assert_eq!(seen, Some(true));
+    assert_eq!(
+        allocations, 0,
+        "the borrowed form the resolver reads through must allocate nothing"
     );
 }

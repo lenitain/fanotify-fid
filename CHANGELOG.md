@@ -5,12 +5,15 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
-## [Unreleased]
+## [0.8.0] - 2026-09-17
 
 0.8.0 is a rewrite rather than a series of additions: the parser became
 borrowing, reading and resolving became separate steps, and the items that only
-existed to work around the old shape are gone. The version moves for that reason,
-and the **Breaking** notes below are the migration path.
+existed to work around the old shape are gone. One shape drove it throughout —
+**a resolution is one operation over one store**, and it is expressed that way:
+one read of the store, through a closure, with no exclusive access asked for and
+no path copied to answer a lookup. The version moves for that reason, and the
+**Breaking** notes below are the migration path.
 
 ### Added
 
@@ -19,15 +22,18 @@ and the **Breaking** notes below are the migration path.
 - `EventReader`: a reader that owns its read buffer and its event storage, so a
   loop allocates nothing after the storage has grown and nothing has to be leaked
   to arrange it. `read()` hands out `&mut [FidEvent<'_>]`, so a resolver can
-  write a path onto each event in place, and `raw_bytes()` returns the batch
-  exactly as the kernel wrote it — the entry point for an architecture that
-  cannot keep events across the next read, such as one that copies the batch once
-  and parses it on a worker thread (`examples/batch_to_worker.rs`).
+  write a path onto each event in place. Its events borrow its buffer, so a whole
+  batch that has to outlive the read is copied **as bytes** — once, by the caller,
+  through the stateless `Fanotify::read_events*` forms, where the buffer is the
+  caller's own `Vec` and the borrow checker sees the whole picture.
+  `examples/batch_to_worker.rs` is that architecture end to end.
 - `FdEventReader`: the same reader for descriptor groups. It needs no lifetime
   erasure, because an `FdEvent` owns everything it reports, and its event storage
   is sized for the whole buffer up front (`capacity.div_ceil(24)` slots) so a
   read never grows it. A batch's descriptors stay open until the next read
-  replaces the slot or `FdEvent::into_fd` takes one.
+  replaces the slot or `FdEvent::into_fd` takes one. `raw_bytes()` reports the
+  bytes of the last successful read exactly as the kernel wrote them, for
+  recording or for replay through the public pure parsers.
 - `Fanotify::from_fd()` (`unsafe`): adopt a descriptor that is already a group —
   inherited, received over `SCM_RIGHTS`, or set up before privileges were
   dropped. The caller vouches that it is a fanotify group, the same contract
@@ -46,9 +52,6 @@ and the **Breaking** notes below are the migration path.
   `passes` instead of one number that conflated two of them.
 - `PathResolver::known()`: the store lookup with no syscall fallback — "do I
   already know this handle?", answered without spending `open_by_handle_at`.
-- `PathResolver::store` / `store_mut` / `mounts` / `mounts_mut`: the learning and
-  the descriptors are reachable, so a caller can pre-seed, inspect or invalidate
-  them.
 - `resolve_file_handle_in()`: the other half of `resolve_file_handle`, taking the
   `Candidate` values `Mounts::candidates()` produces instead of a bare
   `&[OwnedFd]`. A bare slice carries no fsid, so `resolve_file_handle` probes
@@ -57,9 +60,19 @@ and the **Breaking** notes below are the migration path.
 - `Candidate` and `Mounts::candidates()` are public. `Candidate` pairs a
   descriptor with the fsid known for it, which is what makes the filter sound and
   what a caller needs to drive a resolution itself.
-- `HandleCache::path_of()`: a borrowed lookup that allocates nothing. `HandleCache`
-  also gained `len`, `is_empty`, `filesystems`, `iter`, `clear` and
-  `forget_filesystem`.
+- `PathMemo`: the store's write side, as its own trait and its own reference —
+  `remember(&self, ..)` and `forget(&self, ..)` — so a resolver generic over one
+  store reference can read a store that keeps what it learns and a store that
+  keeps nothing alike, through the `&T: PathStore` blanket impl.
+- `HandleCache::with_path()`, the borrowing lookup resolution reads through: the
+  path is handed to a closure while the store's guard is alive, so a hit copies
+  nothing. `HandleCache` also gained `path_of` (the owning form, for a caller
+  that wants to be *told* a path), `len`, `is_empty`, `filesystems`, `entries`,
+  `clear` and `forget_filesystem`.
+- `examples/batch_to_worker.rs` rewritten around the stateless read and the
+  learning resolver: copy the batch **once as bytes** and parse and resolve it on
+  the worker, which is what a caller that cannot keep events across a read actually
+  wants.
 
 **Events**
 
@@ -90,6 +103,55 @@ and the **Breaking** notes below are the migration path.
 
 ### Changed
 
+- **The store contract is one operation, not a read and a write over two
+  references.** A `PathStore` read hands the path to a closure and takes `&self`:
+  `with_path(&self, fsid, handle, f: impl FnOnce(&Path) -> R) -> Option<R>`. Three
+  things fall out of that:
+  - **A hit copies nothing.** A signature returning an owned path made a batch of a
+    thousand events about one directory copy a thousand paths out of a map that
+    already held them, one allocation and one `memcpy` each, only for the resolver
+    to read them and drop them.
+  - **A store behind a lock can answer.** `Mutex<HashMap<..>>` cannot return a
+    borrow from a `&self` method, because the guard cannot travel with the answer;
+    it can only copy. Handing the borrow to a closure is something both a lock-free
+    store and a locked one can do, so neither has to copy and neither has to leak a
+    guard to fake a lifetime.
+  - **A resolver no longer needs exclusive access to the store.** `&mut self` for a
+    lookup meant a caller keeping its store in the same struct as its reader —
+    which is the ordinary shape — could not resolve at all.
+- **Recording takes `&self` too, and has its own trait.** Writing is a mutation of
+  a store the resolver holds one reference to, so a store that keeps what it learns
+  owns its mutability: `HandleCache` is a two-level map behind an `RwLock`
+  (uncontended reads, exclusive writes, one `&HandleCache` for both), and a store
+  that would rather not pay that keeps nothing and implements `PathStore` alone.
+- **`PathResolver` borrows instead of owning.** `PathResolver<'a, C>` holds
+  `&'a C` and `&'a Mounts`, so `with_store(mounts, store)` is gone in favour of
+  `new(&store, &mounts)`, and nothing has to be moved in and out to resolve.
+- **Every resolution call takes `&self` and writes nothing.** `resolve_handle`,
+  `resolve_dir`, `resolve_event`, `resolve_rename_target`, `resolve_events` and
+  `known` are read-only; the `*_memo` forms (`resolve_handle_memo`,
+  `resolve_event_memo`, `resolve_events_memo`) take a `&M where M: PathMemo` and are
+  the ones that teach the store.
+- **`resolve_events` makes one pass; `resolve_events_memo` repeats to a fixed
+  point.** The repeat exists to recover a chain — an event's parent learned only
+  after another event resolved it — and that only happens when the batch records
+  what it learned. Repeating without a memo would ask the filesystem the same
+  questions again. `Resolution::passes` is the productive pass's own number, so a
+  batch settled on the first pass reports `1` either way.
+- **`EventReader` has no `raw_bytes`.** Its events borrow its buffer, so handing out
+  `&[u8]` as well is not a missing accessor but an unsound one: the two borrows
+  cannot both be live, and a method that returned the bytes without reborrowing the
+  events would be handing out a slice the next read may overwrite. A caller that
+  needs the bytes uses the stateless `Fanotify::read_events*`, where the buffer is
+  the caller's own `Vec` and the borrow checker sees the whole picture — which is
+  what `examples/batch_to_worker.rs` does. `FdEventReader::raw_bytes` stays: an
+  `FdEvent` owns everything it reports, so the bytes are an independent fact there.
+- **`HandleCache` is `RwLock`ed, and its accessors reflect that.** `path_of` returns
+  a `PathBuf` (a caller that wants to be *told* the path keeps the copy), `with_path`
+  is the borrowing form resolution reads through, `iter` is `entries()` returning
+  owned tuples because a borrow would have to travel with the guard, and `Clone`
+  copies the entries rather than sharing the map. `NoCache` implements `PathStore`
+  only — it has nothing to remember.
 - **Building a group.** `Fanotify::new()` now takes the flags and answers a
   `Result`, and `Fanotify::init()` takes the flags and the `event_f_flags`.
   0.7.1's `Default` added `FAN_CLOEXEC` for you; nothing is added now, so a group
@@ -134,10 +196,11 @@ and the **Breaking** notes below are the migration path.
 - **Errors.** `FanotifyError` has five variants (`Init`, `Mark`, `Read`,
   `Write`, `UnknownEventVersion`), is `#[non_exhaustive]`, and its messages say
   what the errno means *for that syscall*. Every errno is still the kernel's.
-- **A store hit costs one allocation, not two**: the key is no longer copied
-  into an owned `Vec` before the lookup. A handle whose filesystem reports
-  `f_fsid` zero is still indistinguishable from another such filesystem; the
-  docs now say what that costs a store keyed on the pair.
+- **A store hit no longer copies the key**: the lookup takes the `Fsid` and the
+  handle bytes as they are, instead of copying them into an owned pair first. A
+  handle whose filesystem reports `f_fsid` zero is still indistinguishable from
+  another such filesystem; the docs now say what that costs a store keyed on the
+  pair.
 - **`open_by_handle_at` takes any `AsFd`** and opens with `O_PATH | O_CLOEXEC`,
   so it no longer leaks a descriptor across `exec`;
   `name_to_handle_at`/`handle_from_fd` ask for a FID handle and retry without
@@ -160,10 +223,11 @@ and the **Breaking** notes below are the migration path.
 - `HandleKey`: it is `FileHandle`.
 - `FanotifyError::{Handle, Io}` and `impl From<io::Error>`, so `?` on a
   `handle::*` call no longer converts — those functions return `io::Error`.
-- `PathStore::lookup` and `Mounts::as_owned_fds`, both added during this release
-  and never used by it: the first was a `&self` accessor that no store needing
-  `&mut self` or a lock guard can implement, and the second returned a shape
-  `iter`/`on_filesystem`/`candidates` already cover.
+- `PathStore::get`, `PathStore::insert`, `PathStore::lookup` and
+  `Mounts::as_owned_fds`, all added during this release and none of them in it:
+  reading is `with_path` and writing is `PathMemo::{remember, forget}`, and
+  `as_owned_fds` returned a shape `iter`/`on_filesystem`/`candidates` already
+  cover.
 
 ### Breaking
 
@@ -184,12 +248,12 @@ Read these first; the rest of the entry describes what to migrate *to*.
   a decoder that read the payload must slice `&raw[4..]`; the length is
   `u16::from_ne_bytes([raw[2], raw[3]])` in the host's byte order.
   `push_unknown_info_record` takes that same header-included record.
-- `PathStore::get` takes `&mut self` and `PathStore::insert` takes `path: &Path`.
-  An implementor changes both receivers. A caller that reached a store through
-  `PathResolver::store()` can no longer call `get` on it — use `store_mut()`,
-  `known()`, or `HandleCache::path_of`. A raw
-  `HashMap<(Fsid, FileHandle), PathBuf>` is no longer a store: `HandleCache` is
-  one.
+- `PathStore` has one method, `with_path`, and reading takes `&self`. An
+  implementor writes that method instead of a `get`/`insert` pair; a store that
+  keeps what it learns implements `PathMemo` as well, and a resolver is generic
+  over one borrow of either. A `HashMap<(Fsid, FileHandle), PathBuf>` wrapped in
+  a `Mutex` is now a store — it could not be one while a read had to hand back an
+  owned path from behind the guard.
 - `PathResolver::resolve_events` returns `Resolution` rather than `usize`. The
   old number counted already-resolved events as resolved, so it reported the
   same count for a settled batch as for the call that had just resolved it; a
@@ -211,13 +275,11 @@ Read these first; the rest of the entry describes what to migrate *to*.
   counted `AlreadyResolved` towards its result, so a second call on a batch that
   had not changed reported the same number as the call that resolved it, and a
   progress check could not detect the absence of progress.
-- A read that fails leaves nothing of the previous batch behind. Both readers
+- A read that fails leaves nothing of the previous batch behind. The readers
   cleared `bytes_read` and their event storage *after* the read succeeded, so an
-  error — `EAGAIN` on an empty queue above all — left `raw_bytes()` answering
-  with the previous batch, the fd reader still holding that batch's descriptors,
-  and the FID reader still holding its pidfds. A caller that copies `raw_bytes`
-  on the error path, which is what `examples/batch_to_worker.rs` demonstrates,
-  would process the previous batch twice. `Fanotify::read_events` clears its
+  error — `EAGAIN` on an empty queue above all — left the previous batch's
+  descriptors and pidfds alive inside them, and `FdEventReader::raw_bytes`
+  answering with the previous batch. `Fanotify::read_events` now clears its
   caller's buffer on failure for the same reason: a length left over from a
   successful read must not make an empty queue look like a batch.
 - `Mounts::add` no longer leaves a stray fsid behind when duplicating the
@@ -242,16 +304,18 @@ Read these first; the rest of the entry describes what to migrate *to*.
   sees `EINVAL`.
 - `tests/allocation.rs`: the costs the API promises, asserted with a counting
   global allocator — a permission response built and written without allocating,
-  1000 empty-queue reads without allocating, a warm reader without allocating, a
-  store hit costing exactly the path it returns, and `path_of` costing nothing.
-  An absent cost is not something a behavioural test can observe.
+  1000 empty-queue reads without allocating, a warm reader without allocating, and
+  the three store forms at their three costs: a hit through `with_path` copies
+  nothing, and the owning forms (`resolve_handle`, `HandleCache::path_of`) cost
+  exactly the path they return, with no key copy and no guard. An absent cost is
+  not something a behavioural test can observe.
 - `tests/properties.rs`: convergence, parser totality and the deleted-marker
   rules as properties rather than examples.
 - `fuzz/`: three cargo-fuzz targets (`parse_fid_events`, `parse_fd_events`,
   `resolve_dir`).
 - `examples/batch_to_worker.rs`: read a batch, copy its bytes once, parse them on
   a worker thread — the architecture the borrowing model cannot serve directly,
-  and the one that shows why `raw_bytes` exists.
+  and the one that shows why the stateless read exists.
 
 
 ## [0.7.1] - 2026-09-16
