@@ -38,9 +38,14 @@
 //!   `EINVAL`: the word is a closed set, which is why [`raw`](FanotifyResponse::raw)
 //!   exists for sending a word *you* chose and reading the answer.
 //! * Including both [`FAN_ALLOW`] and [`FAN_DENY`], or neither, is `EINVAL`.
-//! * A packed errno is read only for a [`FAN_CLASS_PRE_CONTENT`] group, and only
-//!   from the kernel's short list (`EPERM`, `EIO`, `EBUSY`, `ETXTBSY`, `EAGAIN`,
-//!   `ENOSPC`, `EDQUOT`); every other class and value is `EINVAL`.
+//! * A packed errno is read only for a [`FAN_CLASS_PRE_CONTENT`] group.  Every
+//!   other class converts `FAN_DENY` to `EPERM` and never looks at the errno
+//!   bits, so a deny from a `FAN_CLASS_CONTENT` group reaches the blocked caller
+//!   as `EPERM` whatever was encoded — which class wants
+//!   [`deny_errno`](FanotifyResponse::deny_errno) rather than
+//!   [`deny`](FanotifyResponse::deny) is a property of the group.
+//! * The errno field is [`FAN_ERRNO_BITS`] wide, so a larger value is truncated
+//!   to those bits rather than refused.
 //! * [`FAN_AUDIT`] without [`FAN_ENABLE_AUDIT`] on the group is `EINVAL` —
 //!   that flag needs `CAP_AUDIT_WRITE`, **not** `CAP_SYS_ADMIN`.
 //! * [`FAN_INFO`] demands a well-formed record: `pad == 0`, `len` equal to the
@@ -83,12 +88,101 @@ use crate::sys::errno;
 /// `sizeof(struct fanotify_response_info_header)`: `type`, `pad`, `len`.
 const INFO_HEADER_SIZE: usize = 4;
 
+/// The record an audit-rule response carries: `rule(4) + subj_trust(4) +
+/// obj_trust(4)`.
+const AUDIT_RULE_PAYLOAD_SIZE: usize = 12;
+
+/// Write an audit-rule payload into `out`, which must have room for
+/// [`AUDIT_RULE_PAYLOAD_SIZE`] bytes.
+fn audit_rule_payload(rule: u32, out: &mut [u8; AUDIT_RULE_PAYLOAD_SIZE]) {
+    out[..4].copy_from_slice(&rule.to_ne_bytes());
+    // subj_trust and obj_trust stay at the kernel's default, which is 0.
+    out[4..].fill(0);
+}
+
+/// A record body this crate holds rather than borrows.
+///
+/// The point is the **field order**: the storage comes first, so
+/// [`audit_rule`](ResponsePayload::audit_rule) can fill the array, move the
+/// whole struct into place, and then borrow the array — the borrow points at the
+/// array's final home, not at a temporary.  That is what lets
+/// [`FanotifyResponse::audit_rule`] build its 12-byte record with no
+/// allocation while [`info_payload`](FanotifyResponse::info_payload) still
+/// answers with a borrow of it.
+///
+/// A `Cow` cannot do this: an inline buffer has to live somewhere, and a
+/// `Cow::Owned` of it is a `Vec`.  A response is written once per intercepted
+/// operation while that operation is blocked, so the allocation is latency on
+/// somebody else's syscall — worth the twenty lines it takes to avoid.
+#[derive(Debug)]
+struct InlinePayload {
+    bytes: [u8; AUDIT_RULE_PAYLOAD_SIZE],
+    len: usize,
+}
+
+impl InlinePayload {
+    /// The audit-rule record for `rule`, inline and by construction
+    /// [`AUDIT_RULE_PAYLOAD_SIZE`] bytes long.
+    fn audit_rule(rule: u32) -> Self {
+        let mut bytes = [0u8; AUDIT_RULE_PAYLOAD_SIZE];
+        audit_rule_payload(rule, &mut bytes);
+        Self {
+            bytes,
+            len: AUDIT_RULE_PAYLOAD_SIZE,
+        }
+    }
+}
+
+impl AsRef<[u8]> for InlinePayload {
+    fn as_ref(&self) -> &[u8] {
+        &self.bytes[..self.len]
+    }
+}
+
+/// The body of one response record: a type the kernel interprets and the bytes
+/// that follow its 4-byte header.
+///
+/// Two storage shapes because there are two kinds of record: one the caller
+/// supplies ([`FanotifyResponse::info`] — any type, any length, borrowed or
+/// owned) and one this crate generates ([`FanotifyResponse::audit_rule`] — the
+/// single type the kernel defines today, a fixed 12 bytes).
+#[derive(Debug)]
+enum ResponsePayload<'a> {
+    /// An audit-rule record, held inside the response.
+    AuditRule(InlinePayload),
+    /// Any other record body: borrowed from the caller, or owned by it.
+    Record(Cow<'a, [u8]>),
+}
+
+impl ResponsePayload<'_> {
+    /// How many bytes this payload contributes after the record header.
+    fn len(&self) -> usize {
+        match self {
+            Self::AuditRule(inline) => inline.as_ref().len(),
+            Self::Record(payload) => payload.len(),
+        }
+    }
+
+    /// The payload bytes as they go on the wire.
+    fn as_bytes(&self) -> &[u8] {
+        match self {
+            Self::AuditRule(inline) => inline.as_ref(),
+            Self::Record(payload) => payload,
+        }
+    }
+
+    /// Append this payload's bytes to `out`.
+    fn write_to(&self, out: &mut WireBuffer) {
+        out.extend_from_slice(self.as_bytes());
+    }
+}
+
 /// The body of one response record: a type the kernel interprets and the bytes
 /// that follow its 4-byte header.
 #[derive(Debug)]
 struct ResponseInfo<'a> {
     info_type: u8,
-    payload: Cow<'a, [u8]>,
+    payload: ResponsePayload<'a>,
 }
 
 /// A decision about one pending permission event.
@@ -125,8 +219,8 @@ impl<'a> FanotifyResponse<'a> {
     /// [`FAN_ERRNO_BITS`] bits, so a larger value is truncated to those bits
     /// rather than refused.  **Only a `FAN_CLASS_PRE_CONTENT` group gets this
     /// through**: for any other class the kernel ignores the errno and the
-    /// caller still sees `EPERM`.  The errno values the kernel accepts are
-    /// limited — see the module docs, and `fanotify(7)` for the list.
+    /// caller still sees `EPERM`, whatever was encoded here — see the module
+    /// docs for which classes that makes this form worth using on.
     ///
     /// ```
     /// use fanotify_fid::response::FanotifyResponse;
@@ -217,7 +311,7 @@ impl<'a> FanotifyResponse<'a> {
             response: decision | FAN_INFO,
             info: Some(ResponseInfo {
                 info_type,
-                payload: payload.into(),
+                payload: ResponsePayload::Record(payload.into()),
             }),
         }
     }
@@ -249,10 +343,18 @@ impl<'a> FanotifyResponse<'a> {
     /// assert_eq!(resp.info_payload().map(<[u8]>::len), Some(12));
     /// ```
     pub fn audit_rule(decision: u32, audit_rule: u32) -> Self {
-        let mut payload = vec![0u8; 12];
-        payload[..4].copy_from_slice(&audit_rule.to_ne_bytes());
-        // subj_trust and obj_trust stay at the kernel's default, which is 0.
-        Self::info(decision | FAN_AUDIT, FAN_RESPONSE_INFO_AUDIT_RULE, payload)
+        // The record is built inside the response, never on the heap: this runs
+        // once per intercepted operation, while that operation is blocked.
+        // `InlinePayload` carries the bytes as fields of the response, so
+        // `info_payload` still answers with a borrow of them.
+        Self {
+            fd: None,
+            response: decision | FAN_AUDIT | FAN_INFO,
+            info: Some(ResponseInfo {
+                info_type: FAN_RESPONSE_INFO_AUDIT_RULE,
+                payload: ResponsePayload::AuditRule(InlinePayload::audit_rule(audit_rule)),
+            }),
+        }
     }
 
     /// The decision word as it goes on the wire: [`FAN_ALLOW`] or [`FAN_DENY`],
@@ -296,7 +398,75 @@ impl<'a> FanotifyResponse<'a> {
 
     /// The record body *after* its 4-byte header, if this form writes one.
     pub fn info_payload(&self) -> Option<&[u8]> {
-        self.info.as_ref().map(|info| info.payload.as_ref())
+        self.info.as_ref().map(|info| info.payload.as_bytes())
+    }
+}
+
+/// A `Vec` that starts on the stack.
+///
+/// Every response this crate writes is 8 bytes, or 24 with the audit record, so
+/// a heap buffer for one is pure overhead on a path where the operation being
+/// answered is blocked.  The inline array covers every form that exists today;
+/// a caller handing over a large payload through [`FanotifyResponse::info`] is
+/// the only thing that spills, and spilling costs exactly what the old code
+/// always paid.
+///
+/// Deliberately not `smallvec`: this is twenty lines, it is the only place that
+/// needs it, and it does not put a second dependency in a crate whose manifest
+/// has one.
+struct WireBuffer {
+    inline: [u8; Self::INLINE],
+    len: usize,
+    spilled: Option<Vec<u8>>,
+}
+
+impl WireBuffer {
+    /// Enough for the 8-byte response plus the largest record this crate builds
+    /// (a 4-byte header and the 12-byte audit rule), with room to spare.
+    const INLINE: usize = 32;
+
+    fn new() -> Self {
+        Self {
+            inline: [0; Self::INLINE],
+            len: 0,
+            spilled: None,
+        }
+    }
+
+    fn as_slice(&self) -> &[u8] {
+        match &self.spilled {
+            Some(vec) => vec.as_slice(),
+            None => &self.inline[..self.len],
+        }
+    }
+
+    fn extend_from_slice(&mut self, bytes: &[u8]) {
+        if let Some(vec) = &mut self.spilled {
+            vec.extend_from_slice(bytes);
+            return;
+        }
+        let end = self.len + bytes.len();
+        if end <= Self::INLINE {
+            self.inline[self.len..end].copy_from_slice(bytes);
+            self.len = end;
+            return;
+        }
+        // The only allocating branch, and it is unreachable for every form this
+        // crate constructs itself.
+        let mut vec = Vec::with_capacity(end);
+        vec.extend_from_slice(&self.inline[..self.len]);
+        vec.extend_from_slice(bytes);
+        self.spilled = Some(vec);
+    }
+}
+
+/// Indexing and slicing, so the layout assertions in the tests read the same as
+/// they did against a `Vec`.
+impl std::ops::Deref for WireBuffer {
+    type Target = [u8];
+
+    fn deref(&self) -> &[u8] {
+        self.as_slice()
     }
 }
 
@@ -311,14 +481,13 @@ fn deny_errno_word(errno: i32) -> u32 {
 /// `struct fanotify_response`, followed by the record when the form carries
 /// one.  A payload whose record cannot be expressed in `len` is refused here,
 /// before any syscall.
-fn encode_response(response: &FanotifyResponse<'_>) -> Result<Vec<u8>, FanotifyError> {
+///
+/// The returned buffer is stack-resident for every form this crate builds; see
+/// [`WireBuffer`].
+fn encode_response(response: &FanotifyResponse<'_>) -> Result<WireBuffer, FanotifyError> {
     let fd_field = response.fd.map_or(FAN_NOFD, |fd| fd.as_raw_fd());
-    let record_len = response
-        .info
-        .as_ref()
-        .map_or(0, |info| INFO_HEADER_SIZE + info.payload.len());
 
-    let mut body = Vec::with_capacity(8 + record_len);
+    let mut body = WireBuffer::new();
     body.extend_from_slice(&fd_field.to_ne_bytes());
     body.extend_from_slice(&response.response.to_ne_bytes());
 
@@ -329,10 +498,9 @@ fn encode_response(response: &FanotifyResponse<'_>) -> Result<Vec<u8>, FanotifyE
             // the kernel's refusal of a malformed record.
             FanotifyError::Write(libc::EINVAL)
         })?;
-        body.push(info.info_type);
-        body.push(0); // pad, must be zero
+        body.extend_from_slice(&[info.info_type, 0]); // type, then pad (zero)
         body.extend_from_slice(&len.to_ne_bytes());
-        body.extend_from_slice(&info.payload);
+        info.payload.write_to(&mut body);
     }
 
     Ok(body)
@@ -357,21 +525,22 @@ pub(crate) fn write_response(
     response: &FanotifyResponse<'_>,
 ) -> Result<(), FanotifyError> {
     let body = encode_response(response)?;
+    let bytes = body.as_slice();
 
-    // SAFETY: `body` is an initialized byte buffer and the syscall reads only
-    // `body.len()` bytes from it; `fanotify_fd` is borrowed for the call.
+    // SAFETY: `bytes` is an initialized byte buffer and the syscall reads only
+    // `bytes.len()` bytes from it; `fanotify_fd` is borrowed for the call.
     let written = unsafe {
         libc::write(
             fanotify_fd.as_fd().as_raw_fd(),
-            body.as_ptr().cast::<libc::c_void>(),
-            body.len(),
+            bytes.as_ptr().cast::<libc::c_void>(),
+            bytes.len(),
         )
     };
     if written < 0 {
         return Err(FanotifyError::Write(errno()));
     }
     // The kernel returns the number of bytes it consumed.
-    if (written as usize) < body.len() {
+    if (written as usize) < bytes.len() {
         return Err(FanotifyError::Write(libc::EINVAL));
     }
     Ok(())

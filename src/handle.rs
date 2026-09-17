@@ -62,6 +62,16 @@ use crate::sys::errno;
 
 /// A filesystem id, as a FID info record reports it: the two `int`s of
 /// `statfs(2)`'s `f_fsid`.
+///
+/// It is the crate's answer to "which filesystem is this handle's", and it is
+/// what [`PathStore`] keys on and what [`Mounts`] filters by.  **No value is
+/// reserved**: `(0, 0)` is a filesystem that reports zero, not a missing one.
+/// Some filesystems do report zero — `fanotify(7)` names `fuse(4)` — and for
+/// those the kernel itself offers no way to tell two instances apart, so a store
+/// keyed on this pair cannot either.  The rule that decides whether a descriptor
+/// may be tried for a handle is the one [`resolve_file_handle_in`] documents; its
+/// cost is one descriptor too many tried, never a wrong path.  See
+/// [`PathStore`] for the consequence to a cache.
 pub type Fsid = (i32, i32);
 
 /// A raw file handle: the bytes of `struct file_handle`, header included.
@@ -97,11 +107,12 @@ pub const MAX_FILE_HANDLE_SIZE: usize = FILE_HANDLE_HEADER_SIZE + MAX_HANDLE_SZ;
 ///
 /// # Implementing it
 ///
-/// Only three operations are required, and two are already what a map does.
-/// Implement it to bound the cache (an LRU that drops the oldest entries), to
-/// share it (a handle behind a lock), to persist it, to forget on demand, or to
-/// keep nothing at all ([`NoCache`]) — none of which this crate can choose for
-/// you, because each is a policy about memory, staleness or concurrency.
+/// Three operations are required: record ([`insert`](Self::insert)), answer
+/// ([`get`](Self::get)) and drop ([`forget`](Self::forget)).  Implement them to
+/// bound the cache (an LRU that drops the oldest entries), to share it (a handle
+/// behind a lock), to persist it, to forget on demand, or to keep nothing at all
+/// ([`NoCache`]) — none of which this crate can choose for you, because each is a
+/// policy about memory, staleness or concurrency.
 ///
 /// A hit is used as the answer and no syscall is spent; a miss means "ask the
 /// filesystem".  So a store that expires, forgets or declines to answer costs a
@@ -109,14 +120,63 @@ pub const MAX_FILE_HANDLE_SIZE: usize = FILE_HANDLE_HEADER_SIZE + MAX_HANDLE_SZ;
 /// answer is what keeps two events about one handle from contradicting each
 /// other.
 ///
+/// # Why a hit hands over an owned path
+///
+/// [`get`](Self::get) returns `Option<PathBuf>` rather than a borrow, and that
+/// is the shape the policies above actually need.  A borrow would rule out the
+/// two stores most worth having:
+///
+/// * **a handle behind a lock.**  A reference into a `Mutex<HashMap>` cannot
+///   outlive the guard that produced it, and no signature taking `&self` and
+///   returning `Option<&Path>` can express "the guard travels with the
+///   answer".  A store in that shape can only answer by copying.
+/// * **an LRU, or any store with a recency or expiry policy.**  A hit is what
+///   *updates* the policy, so a lookup is a write — `lru::LruCache::get` takes
+///   `&mut self` — and a `&self` method cannot call it.
+///
+/// So the trait asks for the copy, and the copy is cheap next to what it buys:
+/// a hit still skips `open_by_handle_at` and a `readlink`, which is the whole
+/// reason the store exists.  A store that *can* hand out a reference — one whose
+/// values are already owned in place, with no policy to update — should say so
+/// with an **inherent** method, and only that way: [`HandleCache::path_of`] is
+/// this crate's own example, and it is what
+/// [`PathResolver::known`](crate::resolve::PathResolver::known) sends a caller to
+/// for the zero-allocation look.  A `&self` method on this trait could not serve
+/// that purpose, because the stores that need the copy are exactly the ones that
+/// need `&mut self` or a guard — so a trait-level borrow would either exclude
+/// them or be silently useless for them.  What a store must not do is pretend a
+/// `&self` borrow covers a store that needs `&mut self` or a guard.
+///
 /// The key is the **pair** of fsid and handle, not the handle alone: handle
 /// bytes are only meaningful together with their filesystem.  Two filesystems
 /// that both fall back to the kernel's synthetic `FILEID_INO64_GEN` encoding
 /// (procfs, sysfs, tracefs, …) hand out identical bytes for their roots, so a
 /// store keyed on bytes alone answers with another filesystem's path.
+///
+/// # The pair is only as good as the fsid
+///
+/// The split above is what makes one handle resolve to one answer **across
+/// filesystems**, and it holds except where the kernel's fsid stops
+/// distinguishing them: a filesystem that reports `f_fsid` zero — `fuse(4)` is
+/// the documented case — is one `(0, 0)` to this key no matter how many instances
+/// are mounted.  Two such filesystems watched through one group then share a
+/// slot, so a stored path can be handed back for the other one's handle.  The
+/// kernel reports no field that separates them, so a store cannot either; a
+/// caller in that position keeps one store per filesystem, the same way it keeps
+/// one [`Mounts`] per filesystem.
 pub trait PathStore {
     /// The path already known for this handle, if any.
-    fn get(&self, fsid: Fsid, handle: &[u8]) -> Option<PathBuf>;
+    ///
+    /// Owned, because the stores this trait exists for cannot hand out a
+    /// reference: see the type-level docs on why.  A store that can — an
+    /// in-place map — is free to add an inherent borrowing accessor alongside
+    /// this method, and should, because that accessor is the only zero-allocation
+    /// way to ask.
+    ///
+    /// Takes `&mut self`: a hit is what updates a recency, an expiry or a
+    /// counter, so a lookup may legitimately write.  A store with no policy to
+    /// update ignores the mutability.
+    fn get(&mut self, fsid: Fsid, handle: &[u8]) -> Option<PathBuf>;
 
     /// Record a path for this handle.
     ///
@@ -124,7 +184,13 @@ pub trait PathStore {
     /// marker.  While the entry is there, later lookups of the same handle
     /// return what was recorded, so that every reader of one handle sees one
     /// answer; [`forget`](Self::forget) is how a caller replaces it.
-    fn insert(&mut self, fsid: Fsid, handle: &[u8], path: PathBuf);
+    ///
+    /// Borrowed rather than owned so that a store which cannot take ownership —
+    /// a persisted log, a shared structure, anything that has to copy anyway —
+    /// is not forced to allocate first.  A store that can keep the path must copy
+    /// it, because the caller keeps its own copy: the answer goes on the event as
+    /// well as into the store.
+    fn insert(&mut self, fsid: Fsid, handle: &[u8], path: &Path);
 
     /// Drop what is known about this handle, so the next lookup asks the
     /// filesystem again.
@@ -139,27 +205,130 @@ pub trait PathStore {
 
 /// The store this crate uses when the caller has no reason to choose one.
 ///
-/// An unbounded [`HashMap`](std::collections::HashMap) — the simplest thing that
-/// makes repeated handles cheap.  Unbounded is a real property and not an oversight: this crate cannot
-/// know how many handles a long-running process will see, so a bound would be a
-/// guess that silently discards knowledge.  A caller that needs one implements
-/// [`PathStore`] over an LRU or a TTL map and passes that instead.
-pub type HandleCache = std::collections::HashMap<(Fsid, FileHandle), PathBuf>;
+/// Two levels of [`HashMap`](std::collections::HashMap) — the outer keyed by
+/// fsid, the inner by handle bytes — which is what makes a lookup take the
+/// caller's `&[u8]` **without copying it**.  A single map over an
+/// `(Fsid, FileHandle)` key cannot do that: `HashMap::get` needs one borrowed
+/// form of the key, and no tuple of `(Fsid, &[u8])` hashes like
+/// `(Fsid, Vec<u8>)` does, so the lookup would have to build the owned key first
+/// — an allocation and a `memcpy` per hit.  Splitting the levels is what lets the
+/// inner map borrow: `Vec<u8>: Borrow<[u8]>` is exactly the relation
+/// `HashMap::get` is written for.  That is also why this store can offer
+/// [`path_of`](Self::path_of), the zero-allocation hit, which the [`PathStore`]
+/// trait cannot ask of every store.
+///
+/// Unbounded is a real property and not an oversight: this crate cannot know how
+/// many handles a long-running process will see, so a bound would be a guess
+/// that silently discards knowledge.  A caller that needs one implements
+/// [`PathStore`] over an LRU or a TTL map and passes that instead — which the
+/// trait's `&mut self` lookup is shaped to allow, since a hit in such a store
+/// updates the policy that makes it bounded.
+#[derive(Debug, Clone, Default)]
+pub struct HandleCache {
+    /// Handles are only meaningful within their filesystem, so the split by
+    /// fsid is the same fact the key was expressing — as a level instead of as a
+    /// tuple.
+    by_filesystem: std::collections::HashMap<Fsid, std::collections::HashMap<FileHandle, PathBuf>>,
+}
 
-impl PathStore for HandleCache {
-    fn get(&self, fsid: Fsid, handle: &[u8]) -> Option<PathBuf> {
-        // Fully qualified: `self.get(..)` here would be this trait method, not
-        // the map's, and would recurse until the stack ran out.
-        std::collections::HashMap::get(self, &(fsid, handle.to_vec())).cloned()
+impl HandleCache {
+    /// A cache that knows nothing.
+    pub fn new() -> Self {
+        Self::default()
     }
 
-    fn insert(&mut self, fsid: Fsid, handle: &[u8], path: PathBuf) {
-        std::collections::HashMap::insert(self, (fsid, handle.to_vec()), path);
+    /// How many handles are known, across every filesystem.
+    pub fn len(&self) -> usize {
+        self.by_filesystem
+            .values()
+            .map(std::collections::HashMap::len)
+            .sum()
+    }
+
+    /// Whether nothing is known.
+    pub fn is_empty(&self) -> bool {
+        // Cheaper than `len() == 0`: the first non-empty level decides.
+        self.by_filesystem
+            .values()
+            .all(std::collections::HashMap::is_empty)
+    }
+
+    /// How many filesystems have at least one handle recorded.
+    pub fn filesystems(&self) -> usize {
+        self.by_filesystem.len()
+    }
+
+    /// Forget every handle of one filesystem, the way
+    /// [`forget`](PathStore::forget) forgets one.
+    ///
+    /// What a caller does after unmounting: the level goes away whole, which
+    /// takes its handles' allocations with it.
+    pub fn forget_filesystem(&mut self, fsid: Fsid) {
+        self.by_filesystem.remove(&fsid);
+    }
+
+    /// Drop everything, keeping the outer level's allocation for reuse.
+    pub fn clear(&mut self) {
+        self.by_filesystem.clear();
+    }
+
+    /// Every entry, for inspection or persistence.
+    pub fn iter(&self) -> impl Iterator<Item = (Fsid, &[u8], &Path)> {
+        self.by_filesystem.iter().flat_map(|(fsid, handles)| {
+            handles
+                .iter()
+                .map(move |(h, p)| (*fsid, h.as_slice(), p.as_path()))
+        })
+    }
+
+    /// The path known for this handle, **borrowed**: a hit allocates nothing.
+    ///
+    /// This store has nothing to update on a hit — no recency, no expiry, no
+    /// counter — and its values are owned in place inside the map, so it is one
+    /// of the stores that really can hand out a reference.  It says so with an
+    /// inherent method because [`PathStore::get`] cannot: the trait's shape has
+    /// to cover stores that answer from behind a lock or with a policy to update
+    /// (see its docs), and those can only answer by copying.
+    ///
+    /// Reach for this when the caller wants to *look* rather than to resolve:
+    /// something that formats a path, compares it, or hands the borrow to
+    /// another call.  Anything that has to keep the path needs an owned one
+    /// anyway, and [`PathStore::get`] is that form.
+    pub fn path_of(&self, fsid: Fsid, handle: &[u8]) -> Option<&Path> {
+        self.by_filesystem
+            .get(&fsid)?
+            .get(handle)
+            .map(PathBuf::as_path)
+    }
+}
+
+impl PathStore for HandleCache {
+    fn get(&mut self, fsid: Fsid, handle: &[u8]) -> Option<PathBuf> {
+        // The one copy a hit costs, and the reason `path_of` exists alongside it:
+        // a caller that can work from a borrow does not have to pay this.
+        self.path_of(fsid, handle).map(Path::to_path_buf)
+    }
+
+    fn insert(&mut self, fsid: Fsid, handle: &[u8], path: &Path) {
+        // The store owns its path, so this is where the copy happens: one
+        // allocation per miss, which is the miss's whole cost on top of the
+        // syscall it just spent.
+        self.by_filesystem
+            .entry(fsid)
+            .or_default()
+            .insert(handle.to_vec(), path.to_path_buf());
     }
 
     fn forget(&mut self, fsid: Fsid, handle: &[u8]) {
-        // Fully qualified for the same reason as `get` above.
-        std::collections::HashMap::remove(self, &(fsid, handle.to_vec()));
+        if let Some(handles) = self.by_filesystem.get_mut(&fsid) {
+            handles.remove(handle);
+            // A filesystem with no handles left is a level with nothing in it;
+            // dropping it here keeps a long run's outer level proportional to
+            // the filesystems still in use rather than to every one ever seen.
+            if handles.is_empty() {
+                self.by_filesystem.remove(&fsid);
+            }
+        }
     }
 }
 
@@ -175,13 +344,16 @@ impl PathStore for HandleCache {
 pub struct NoCache;
 
 impl PathStore for NoCache {
-    /// Nothing is ever known.
-    fn get(&self, _fsid: Fsid, _handle: &[u8]) -> Option<PathBuf> {
+    /// The borrowed form of a known path is [`HandleCache::path_of`], which is
+    /// inherent rather than part of this trait: a `&self` method here could not
+    /// serve the stores that need `&mut self` or a lock guard, which is why
+    /// [`get`](Self::get) copies.  Nothing is ever known.
+    fn get(&mut self, _fsid: Fsid, _handle: &[u8]) -> Option<PathBuf> {
         None
     }
 
     /// Nothing is recorded: keeping it is the one thing this store does not do.
-    fn insert(&mut self, _fsid: Fsid, _handle: &[u8], _path: PathBuf) {}
+    fn insert(&mut self, _fsid: Fsid, _handle: &[u8], _path: &Path) {}
 
     /// Nothing to forget.
     fn forget(&mut self, _fsid: Fsid, _handle: &[u8]) {}
@@ -413,8 +585,12 @@ fn fsid_of_statfs(st: &libc::statfs) -> Fsid {
 /// Which filesystem each descriptor is on has to be **asked of the kernel**
 /// ([`fsid_of_fd`]) — a descriptor the caller supplies carries no such fact — and
 /// a descriptor whose fsid cannot be read is tried anyway: not knowing is not
-/// evidence of a mismatch.  [`Mounts`] exists to learn each fsid once instead of
-/// once per call.
+/// evidence of a mismatch.  That probe runs **once per descriptor per call**,
+/// because a bare `&[OwnedFd]` carries no fsid to remember.  [`Mounts`] exists to
+/// learn each fsid once instead, and [`Mounts::candidates`] hands the pair to
+/// [`resolve_file_handle_in`], which is this function without the repeated
+/// `fstatfs`.  Use this one when the descriptors are a local slice built for one
+/// call; use that one for anything that resolves more than one handle.
 ///
 /// # Errors
 ///
@@ -436,26 +612,43 @@ pub fn resolve_file_handle(
     if mount_fds.is_empty() {
         return Err(io::Error::from_raw_os_error(libc::EINVAL));
     }
-    let candidates: Vec<Candidate<'_>> = mount_fds
-        .iter()
-        .map(|fd| Candidate {
+    // Probed here because a bare `&[OwnedFd]` carries no fsid — the kernel has
+    // to be asked, once per descriptor per call.  No collection: the candidates
+    // are taken as an iterator, so the probe is consumed as it is walked.
+    resolve_file_handle_in(
+        mount_fds.iter().map(|fd| Candidate {
             fd: fd.as_fd(),
             fsid: fsid_of_fd(fd).ok(),
-        })
-        .collect();
-    resolve_in(&candidates, fsid, handle)
+        }),
+        fsid,
+        handle,
+    )
 }
 
 /// One descriptor a handle may be opened against, with what is known about the
 /// filesystem it is on.
 ///
+/// What [`resolve_file_handle_in`] walks, and what [`Mounts::candidates`]
+/// produces: a descriptor paired with the fsid learned for it once, which is what
+/// keeps a resolution from spending an `fstatfs` per call.
+///
 /// The fsid is what makes the filter sound: `open_by_handle_at` on a descriptor
 /// from another filesystem can open the same bytes as a *different, existing*
 /// file, and nothing in the answer says so.  `None` is "not known", which is not
-/// the same as "does not match" — see [`wanted_filesystem`].
-pub(crate) struct Candidate<'a> {
-    pub(crate) fd: BorrowedFd<'a>,
-    pub(crate) fsid: Option<Fsid>,
+/// the same as "does not match" — an unknown fsid on either side matches, and
+/// [`resolve_file_handle_in`] states the rule.
+///
+/// The fields are public so a caller can assemble candidates a [`Mounts`] did not
+/// produce — a descriptor whose fsid it read itself with [`fsid_of_fd`], or a
+/// synthetic one.  A wrong `fsid` is the one way to get the silent mismatch
+/// [`Mounts::add`] exists to prevent, so prefer [`Mounts::add_with_fsid`] unless
+/// the value came from this crate.
+#[derive(Clone, Copy)]
+pub struct Candidate<'a> {
+    /// The mount descriptor that may answer.
+    pub fd: BorrowedFd<'a>,
+    /// The filesystem that descriptor is on, when the kernel would say.
+    pub fsid: Option<Fsid>,
 }
 
 /// Whether a descriptor on `known` may be tried for a handle reported on
@@ -466,6 +659,20 @@ pub(crate) struct Candidate<'a> {
 /// queried into a resolution that never happened.  This is the rule
 /// [`Mounts`] pre-filters by, so the selection it hands over is exactly the
 /// selection this tries.
+///
+/// # Zero is not an unimplemented fsid
+///
+/// No value of [`Fsid`] is reserved, so `(0, 0)` is matched like any other: it
+/// means "the filesystem that reports zero", not "no filesystem".  That matters
+/// because filesystems do report zero — `fanotify(7)` says so of `fuse(4)`
+/// explicitly, and adds that when two of them report zero under one group,
+/// **the kernel gives no way to tell them apart**.  Two such mounts therefore
+/// select each other here, which is the one case where the fsid filter cannot do
+/// what it exists for.  It is not a gap in this rule but a limit of the
+/// interface: nothing in the event distinguishes the two, so no rule over the
+/// event's own fields could either.  A caller watching two zero-fsid filesystems
+/// through one group has to keep one [`Mounts`] per filesystem and pass the
+/// right one to the right events.
 fn wanted_filesystem(known: Option<Fsid>, wanted: Option<Fsid>) -> bool {
     match (wanted, known) {
         (Some(want), Some(on)) => want == on,
@@ -476,19 +683,61 @@ fn wanted_filesystem(known: Option<Fsid>, wanted: Option<Fsid>) -> bool {
 /// [`resolve_file_handle`]'s implementation, over descriptors whose filesystems
 /// are already known.
 ///
-/// Split out so [`Mounts`] and [`PathResolver`](crate::resolve::PathResolver)
-/// hand over a selection they have **already** probed: probing here would spend
-/// an `fstatfs` per candidate to learn what the caller just looked up.
+/// `resolve_file_handle` accepts a bare `&[OwnedFd]`, which carries no fsid, so
+/// it has to ask the kernel ([`fsid_of_fd`]) for each one **on every call** — one
+/// `fstatfs` per descriptor per resolution.  That probe is a property of the
+/// descriptor, not of any one call, which is exactly the fact [`Mounts`] exists
+/// to learn once.  This is that function's other half: call it with
+/// [`Mounts::candidates`] and the filter costs nothing, because the fsids were
+/// read when the descriptors were added.
 ///
-/// A malformed handle is `EINVAL` — a property of the argument.  An empty
-/// selection, or one whose descriptors are all on other filesystems, is `EXDEV`:
-/// nothing was on that filesystem, which is a registration gap and not a
-/// property of the handle.
-pub(crate) fn resolve_in(
-    candidates: &[Candidate<'_>],
+/// Prefer it over [`resolve_file_handle`] whenever the descriptors outlive the
+/// call — an event loop, a worker thread, anything resolving more than one
+/// handle.  Reach for `resolve_file_handle` when the descriptors really are a
+/// local `&[OwnedFd]` built for one call.
+///
+/// # Errors
+///
+/// As [`resolve_file_handle`]: the errno of the last attempt on a matching
+/// filesystem (`EPERM` without `CAP_DAC_READ_SEARCH`, `ESTALE` if the object is
+/// gone), `EINVAL` for a malformed handle, and `EXDEV` when nothing was tried —
+/// an empty selection, or one whose descriptors are all on other filesystems.
+/// `EXDEV` is about the selection rather than the handle: it says the caller
+/// registered no descriptor that could answer, which is why it is not folded
+/// into the last attempt's errno.
+///
+/// # The path is best-effort
+///
+/// As [`resolve_file_handle`]: it comes from `/proc/self/fd` after the open, so
+/// it is the path *at that moment*, and an unlinked object keeps its
+/// `" (deleted)"` marker rather than being guessed at.
+///
+/// ```
+/// use fanotify_fid::handle::{Mounts, resolve_file_handle_in};
+///
+/// let dir = std::fs::File::open("/tmp")?;
+/// let mounts = Mounts::new().with_fd(&dir)?;
+///
+/// // A byte string that is not a handle: the shape is checked before any
+/// // descriptor is used, so this answers without touching the filesystem.
+/// let err = resolve_file_handle_in(mounts.candidates(), None, b"short").unwrap_err();
+/// assert_eq!(err.kind(), std::io::ErrorKind::InvalidInput);
+///
+/// // No descriptor was added for the fsid the caller names, so nothing is
+/// // tried — which is a registration gap, not a property of the handle.
+/// let err = resolve_file_handle_in(mounts.candidates(), Some((0xdead, 1)), &[0u8; 12])
+///     .unwrap_err();
+/// assert_eq!(err.raw_os_error(), Some(libc::EXDEV));
+/// # Ok::<(), std::io::Error>(())
+/// ```
+pub fn resolve_file_handle_in<'a, I>(
+    candidates: I,
     fsid: Option<Fsid>,
     handle: &[u8],
-) -> io::Result<PathBuf> {
+) -> io::Result<PathBuf>
+where
+    I: IntoIterator<Item = Candidate<'a>>,
+{
     if handle.len() < FILE_HANDLE_HEADER_SIZE || handle.len() > MAX_FILE_HANDLE_SIZE {
         return Err(io::Error::new(
             io::ErrorKind::InvalidInput,
@@ -560,11 +809,13 @@ fn c_path(path: &Path) -> io::Result<CString> {
 /// ```
 #[derive(Debug, Default)]
 pub struct Mounts {
-    fds: Vec<OwnedFd>,
-    /// The fsid of each descriptor, when the kernel would answer.  Empty means
-    /// "not known", which is not the same as "does not match" — see
-    /// [`on_filesystem`](Self::on_filesystem).
-    fsids: Vec<Option<Fsid>>,
+    /// Each descriptor with the fsid learned for it, in one vector.
+    ///
+    /// Paired rather than zipped from two vectors because resolution asks
+    /// "which of these may answer for this fsid" once per cache miss, and one
+    /// contiguous run of `(descriptor, fsid)` is both a single pass and the
+    /// iterator [`candidates`](Self::candidates) yields with no collection step.
+    entries: Vec<(OwnedFd, Option<Fsid>)>,
 }
 
 impl Mounts {
@@ -583,8 +834,10 @@ impl Mounts {
     /// The descriptor is duplicated (`F_DUPFD_CLOEXEC`), so this fails with
     /// `EMFILE`/`ENFILE` when the process is out of descriptors.
     pub fn add<Fd: AsFd>(&mut self, fd: Fd) -> io::Result<&mut Self> {
-        self.fsids.push(fsid_of_fd(&fd).ok());
-        self.fds.push(fd.as_fd().try_clone_to_owned()?);
+        // The fsid probe runs first so that a `try_clone` failure does not leave
+        // an entry with a descriptor and no fsid.
+        let known = fsid_of_fd(&fd).ok();
+        self.entries.push((fd.as_fd().try_clone_to_owned()?, known));
         Ok(self)
     }
 
@@ -606,8 +859,8 @@ impl Mounts {
     ///
     /// As [`add`](Self::add): the descriptor is duplicated.
     pub fn add_with_fsid<Fd: AsFd>(&mut self, fd: Fd, fsid: Fsid) -> io::Result<&mut Self> {
-        self.fsids.push(Some(fsid));
-        self.fds.push(fd.as_fd().try_clone_to_owned()?);
+        self.entries
+            .push((fd.as_fd().try_clone_to_owned()?, Some(fsid)));
         Ok(self)
     }
 
@@ -621,10 +874,9 @@ impl Mounts {
     pub fn on_filesystem(&self, fsid: Fsid) -> Vec<BorrowedFd<'_>> {
         // Filtered here rather than through `matching`: that returns borrowed
         // descriptors tied to a temporary `Vec`, which cannot be handed out.
-        self.fds
+        self.entries
             .iter()
-            .zip(&self.fsids)
-            .filter(|(_, known)| wanted_filesystem(**known, Some(fsid)))
+            .filter(|(_, known)| wanted_filesystem(*known, Some(fsid)))
             .map(|(fd, _)| fd.as_fd())
             .collect()
     }
@@ -636,59 +888,47 @@ impl Mounts {
     /// `Vec`, which is what asking the filesystem wants.  Both select the same
     /// descriptors.
     pub fn matching(&self, fsid: Fsid) -> Vec<&OwnedFd> {
-        self.fds
+        self.entries
             .iter()
-            .zip(&self.fsids)
-            .filter(|(_, known)| wanted_filesystem(**known, Some(fsid)))
+            .filter(|(_, known)| wanted_filesystem(*known, Some(fsid)))
             .map(|(fd, _)| fd)
             .collect()
     }
 
-    /// The descriptors with what is known about each one's filesystem, for a
-    /// resolution call.
+    /// Every descriptor with what is known about each one's filesystem.
     ///
-    /// Crate-internal because the fsid it carries is what stops [`resolve_in`]
-    /// from spending a second `fstatfs` per candidate: a descriptor whose fsid
-    /// was learned by [`add`](Self::add) is already known to be on it or not.  A
-    /// caller that wants the descriptors themselves has
+    /// The fsid carried alongside each descriptor is what stops
+    /// [`resolve_file_handle_in`] from spending an `fstatfs` per candidate: a
+    /// descriptor whose fsid was learned by [`add`](Self::add) is already known
+    /// to be on the filesystem or not.  An iterator rather than a slice or a
+    /// `Vec`, so resolution walks the descriptors in place instead of copying
+    /// them somewhere first.  A caller that wants the descriptors alone has
     /// [`on_filesystem`](Self::on_filesystem) and [`iter`](Self::iter).
-    pub(crate) fn candidates(&self) -> impl Iterator<Item = Candidate<'_>> {
-        self.fds
-            .iter()
-            .zip(&self.fsids)
-            .map(|(fd, known)| Candidate {
-                fd: fd.as_fd(),
-                fsid: *known,
-            })
+    pub fn candidates(&self) -> impl Iterator<Item = Candidate<'_>> + use<'_> {
+        self.entries.iter().map(|(fd, known)| Candidate {
+            fd: fd.as_fd(),
+            fsid: *known,
+        })
     }
 
     /// Every descriptor, for iteration when the fsid is not in question.
     pub fn iter(&self) -> impl Iterator<Item = BorrowedFd<'_>> {
-        self.fds.iter().map(AsFd::as_fd)
-    }
-
-    /// The descriptors themselves, for passing to [`resolve_file_handle`].
-    ///
-    /// That function takes `&[OwnedFd]` because it may need to try several; this
-    /// exposes the collection in that shape without the caller having to keep a
-    /// second copy of what it already put here.
-    pub fn as_owned_fds(&self) -> &[OwnedFd] {
-        &self.fds
+        self.entries.iter().map(|(fd, _)| fd.as_fd())
     }
 
     /// How many descriptors were added.
     pub fn len(&self) -> usize {
-        self.fds.len()
+        self.entries.len()
     }
 
     /// Whether none were added.
     pub fn is_empty(&self) -> bool {
-        self.fds.is_empty()
+        self.entries.is_empty()
     }
 
     /// The fsid learned for the descriptor at `index`, if it was learned.
     pub fn fsid_at(&self, index: usize) -> Option<Fsid> {
-        self.fsids.get(index).copied().flatten()
+        self.entries.get(index).and_then(|(_, known)| *known)
     }
 }
 
@@ -696,6 +936,6 @@ impl std::ops::Index<usize> for Mounts {
     type Output = OwnedFd;
 
     fn index(&self, index: usize) -> &OwnedFd {
-        &self.fds[index]
+        &self.entries[index].0
     }
 }

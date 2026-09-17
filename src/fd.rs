@@ -41,6 +41,19 @@
 //! A caller that really means to take the numbers over does so explicitly, with
 //! `unsafe` of its own, or by reading through the group.
 //!
+//! # Reading a live group, and what a batch's storage means
+//!
+//! [`Fanotify::read_fd_events`](crate::Fanotify::read_fd_events) is the
+//! stateless read: one `Vec` of events per call, dropped when the caller is done.
+//! [`FdEventReader`](crate::FdEventReader) is the reader for a loop, and it owns
+//! its buffer and its event storage so that every read after setup allocates
+//! nothing.  Because it reuses that storage, its batches have a lifetime worth
+//! stating: **an event's descriptor is open until the next read on that reader
+//! replaces it**, or until [`FdEvent::into_fd`] takes it out.  The stateless call
+//! has the same rule by construction — the events it returns are dropped together
+//! — so nothing about it changes; what changes is that a reused slot gives up the
+//! descriptor it held rather than freeing it.
+//!
 //! # `fd` is not always a descriptor
 //!
 //! | Value | Meaning |
@@ -418,7 +431,8 @@ pub(crate) fn read_fd_events_reported(
     // answer to this call, so a non-negative number in it is a descriptor the
     // kernel installed for this process.  `adopt_reported` makes each number a
     // single owner even if the buffer names it twice.
-    let (mut events, report) = parse_fd_events(buf);
+    let mut events = Vec::new();
+    let report = parse_fd_events_into(&mut events, buf);
     let mut adopted = Vec::new();
     for event in &mut events {
         event.adopt_reported(&mut adopted);
@@ -643,5 +657,58 @@ mod tests {
         assert_eq!(event.fd_field(), number);
         assert!(event.fd().is_some());
         assert_eq!(event.no_fd_reason(), None);
+    }
+
+    #[test]
+    fn reusing_a_slot_closes_the_descriptor_the_previous_parse_adopted() {
+        // The rule `FdEventReader` rests on: it keeps one `Vec` of events and
+        // rewrites the slots in place, so a slot that held a descriptor must give
+        // it up when the next batch takes it.  That is the difference between
+        // reusing storage and leaking a descriptor per batch, and it is a
+        // property of the parse rather than of the reader, so it is asserted
+        // here, where no group is needed.
+        //
+        // `ManuallyDrop`, as in the duplicate test above: the descriptor in a
+        // read buffer belongs to the *event*, and a `File` that also claimed it
+        // would be a second owner rather than the situation under test.
+        use std::mem::ManuallyDrop;
+        use std::os::fd::AsRawFd;
+
+        let kernel_owned = ManuallyDrop::new(std::fs::File::open("/dev/null").unwrap());
+        let raw = kernel_owned.as_raw_fd();
+
+        let first = metadata(METADATA_SIZE as u32, FAN_OPEN, raw, 1);
+        let mut events = Vec::new();
+        assert!(parse_fd_events_into(&mut events, &first).is_complete());
+        let mut adopted = Vec::new();
+        events[0].adopt_reported(&mut adopted);
+        assert!(events[0].fd().is_some());
+        assert!(
+            fcntl_getfd(raw) >= 0,
+            "the descriptor is open while it is held"
+        );
+
+        // A second buffer with no descriptor in the slot the first one used.
+        let second = metadata(METADATA_SIZE as u32, FAN_DELETE, FAN_NOFD, 2);
+        assert!(parse_fd_events_into(&mut events, &second).is_complete());
+        assert_eq!(events[0].mask(), FAN_DELETE, "the slot was rewritten");
+        assert!(
+            fcntl_getfd(raw) < 0,
+            "the replaced slot must have closed the descriptor it held"
+        );
+
+        // The slot itself is free again, and the storage is reusable: a later
+        // batch fills it and adopts whatever *that* buffer reported.  What must
+        // not happen is adopting this number again — the descriptor is closed,
+        // and a second `OwnedFd` for a closed number is the double close the
+        // adoption guard exists to prevent — so the number is dropped here and
+        // the reader's next batch brings fresh ones.
+        //
+        // Nothing closes the descriptor a second time on the way out of this test:
+        // the `ManuallyDrop` wrapping the `File` is exactly what keeps its `Drop`
+        // from running, which is the whole reason it is used instead of a `File`
+        // that owns the descriptor for real. (`fstat`, not `fstat`-and-close, is
+        // what `fcntl_getfd` does, so the checks above never took ownership
+        // either.)
     }
 }

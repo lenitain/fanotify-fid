@@ -9,7 +9,7 @@ mod common;
 
 use common::{Capabilities, tmpdir};
 use fanotify_fid::consts::*;
-use fanotify_fid::{Fanotify, FanotifyError};
+use fanotify_fid::{EventReader, Fanotify, FanotifyError, FdEventReader};
 
 /// Whether a descriptor number is currently open, without touching it as a fd.
 ///
@@ -424,7 +424,7 @@ mod the_prelude_covers_the_ordinary_path {
             &mut store,
             (1, 2),
             &[0u8; 12],
-            std::path::PathBuf::from("/via/store"),
+            &std::path::PathBuf::from("/via/store"),
         );
 
         let mut resolver = PathResolver::with_store(Mounts::new(), store);
@@ -507,4 +507,396 @@ fn an_opath_descriptor_is_not_usable_for_a_descriptor_mark() {
         .mark_at(&opath, FAN_MARK_ADD | AT_EMPTY_PATH as u32, FAN_OPEN, "")
         .expect_err("AT_EMPTY_PATH is not a fanotify_mark flag");
     assert_eq!(err.errno(), Some(libc::EINVAL));
+}
+
+#[test]
+fn a_reader_owns_its_buffer_and_resolves_in_place() {
+    // The shape `EventReader` exists for: one buffer and one event `Vec` for the
+    // whole loop, events reached through `&mut` so a path can be written onto
+    // them without copying.  A kernel event is what makes this a test rather
+    // than a type-check.
+    let dir = tmpdir();
+    let fan = common::fid_group();
+    fan.mark(FAN_MARK_ADD, FAN_CREATE, dir.path().to_str().unwrap())
+        .unwrap();
+
+    let mut reader = EventReader::new(&fan, 256 * 1024);
+    assert_eq!(reader.capacity(), 256 * 1024);
+
+    std::fs::write(dir.path().join("made"), b"x").unwrap();
+
+    let mut seen = 0;
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+    while seen == 0 && std::time::Instant::now() < deadline {
+        match reader.read() {
+            Ok(events) => {
+                for ev in events.iter_mut() {
+                    // `&mut`, so this is the same call a resolver makes.
+                    ev.set_path(std::path::PathBuf::from("/resolved/in/place"));
+                }
+                seen = events.len();
+            }
+            Err(FanotifyError::Read(libc::EAGAIN)) => {
+                fan.wait_readable(Some(std::time::Duration::from_millis(50)))
+                    .unwrap();
+            }
+            Err(e) => panic!("unexpected: {e}"),
+        }
+    }
+    assert!(seen >= 1, "the create event must arrive");
+    // The raw bytes the last read produced are the buffer's, kept for a caller
+    // that records them.
+    assert!(!reader.raw_bytes().is_empty());
+}
+
+#[test]
+fn a_reader_reuses_the_same_storage_for_every_read() {
+    // The allocation this type removes is per read, so the property to assert is
+    // that two reads in a row — the second after events from the first were
+    // alive — do not rebuild anything.  `event_capacity` is the observable half:
+    // it is zero until a read produces events, and unchanged afterwards.
+    let fan = common::fid_group();
+    let mut reader = EventReader::new(&fan, 4096);
+
+    // An empty queue: no events, so the event storage is untouched.  Reading
+    // twice in a row is the loop shape that the borrowed-buffer API could not
+    // express at all.
+    for _ in 0..3 {
+        match reader.read() {
+            Err(FanotifyError::Read(libc::EAGAIN)) => {}
+            Ok(events) => assert!(events.is_empty()),
+            Err(e) => panic!("unexpected: {e}"),
+        }
+    }
+    assert_eq!(
+        reader.event_capacity(),
+        0,
+        "an empty read must not have grown the event storage"
+    );
+
+    // And a read that is handed the raw bytes of an event parses them without a
+    // second reader: the buffer is the reader's own, so nothing is copied out.
+    let dir = tmpdir();
+    fan.mark(FAN_MARK_ADD, FAN_CREATE, dir.path().to_str().unwrap())
+        .unwrap();
+    std::fs::write(dir.path().join("child"), b"x").unwrap();
+
+    let mut read_something = false;
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+    while !read_something && std::time::Instant::now() < deadline {
+        match reader.read() {
+            Ok(events) if !events.is_empty() => {
+                read_something = true;
+                let capacity = reader.event_capacity();
+                assert!(capacity > 0, "the event storage grew once");
+                // A second read must reuse it rather than start over.
+                match reader.read() {
+                    Ok(events) => assert!(events.len() <= capacity),
+                    Err(FanotifyError::Read(libc::EAGAIN)) => {}
+                    Err(e) => panic!("unexpected: {e}"),
+                }
+                assert_eq!(reader.event_capacity(), capacity, "no re-allocation");
+            }
+            Ok(_) => {
+                fan.wait_readable(Some(std::time::Duration::from_millis(50)))
+                    .unwrap();
+            }
+            Err(FanotifyError::Read(libc::EAGAIN)) => {
+                fan.wait_readable(Some(std::time::Duration::from_millis(50)))
+                    .unwrap();
+            }
+            Err(e) => panic!("unexpected: {e}"),
+        }
+    }
+    assert!(read_something, "the create event must arrive");
+}
+
+#[test]
+fn a_reader_fixes_its_capacity_because_its_events_point_into_it() {
+    // The invariant the lifetime erasure rests on: the buffer is never
+    // reallocated, so an event's handle and name cannot be moved out from under
+    // it.  `capacity` is part of the reader's contract, not a hint — including
+    // for a buffer too small for the next event, which the kernel refuses with
+    // `EINVAL` rather than splitting.
+    let fan = common::fid_group();
+    let reader = EventReader::new(&fan, 24);
+    // At least: an allocator may hand back more than was asked for, and what
+    // matters is that nothing shrinks it afterwards.
+    assert!(reader.capacity() >= 24);
+    // A zero capacity is the crate's default rather than a zero-byte read.
+    let default = EventReader::new(&fan, 0);
+    assert!(default.capacity() >= 24);
+}
+
+// ── The fd-format reader: the same storage discipline, for the identity that
+//    hands over descriptors instead of handles ──
+
+/// A descriptor-identity group, which is the only kind that reports `FdEvent`s.
+///
+/// `FAN_CLASS_NOTIF` without a FID flag needs `CAP_SYS_ADMIN` — omitting the
+/// report flag is not the unprivileged choice — so every test that reads real fd
+/// events is `#[ignore]`d behind it.
+fn fd_group() -> Option<Fanotify> {
+    if !Capabilities::probe().is_admin() {
+        return None;
+    }
+    Some(
+        Fanotify::new(FAN_CLASS_NOTIF | FAN_CLOEXEC | FAN_NONBLOCK)
+            .expect("an admin may create a bare NOTIF group"),
+    )
+}
+
+#[test]
+fn an_fd_reader_fixes_its_storage_before_the_first_read() {
+    // `FdEvent` owns everything it reports, so there is no lifetime erasure here
+    // and no invariant to protect by refusing to grow — but the storage is still
+    // allocated once, by `new`, because the point of the reader is that a read
+    // loop allocates nothing.  What that means observably: the event storage is
+    // already at its maximum before any read, and no read moves it.
+    let fan = common::fid_group();
+    let mut reader = FdEventReader::new(&fan, 4096);
+
+    // 4096 bytes of 24-byte events: the upper bound on one read's events.
+    assert_eq!(reader.capacity(), 4096);
+    // Ceiling division: 4096 bytes holds 170 whole events plus 16 spare bytes,
+    // and a slot per whole event is the bound, not a slot per full 24 bytes.
+    assert_eq!(reader.event_capacity(), 4096usize.div_ceil(24));
+    assert_eq!(reader.raw_bytes(), b"", "no read has produced bytes yet");
+
+    for _ in 0..3 {
+        match reader.read() {
+            // An empty queue on a non-blocking group.  `read()` reports the
+            // kernel's errno rather than an empty slice, which is the same
+            // contract `Fanotify::read_fd_events` has.
+            Err(FanotifyError::Read(libc::EAGAIN)) => {}
+            Ok(events) => assert!(events.is_empty()),
+            Err(e) => panic!("unexpected: {e}"),
+        }
+    }
+    assert_eq!(
+        reader.event_capacity(),
+        4096usize.div_ceil(24),
+        "an empty read must not have touched the storage"
+    );
+    assert_eq!(reader.raw_bytes(), b"");
+}
+
+#[test]
+fn an_fd_reader_keeps_the_bytes_of_its_last_read() {
+    // The raw form exists for a caller that records what the kernel wrote, so it
+    // must be the bytes of the *last* read and not of the first: an empty read
+    // after a full one is the case that would show a stale length.
+    let fan = common::fid_group();
+    let mut reader = FdEventReader::new(&fan, 4096);
+    // Nothing is marked, so there is nothing to read and the length stays zero.
+    for _ in 0..2 {
+        let _ = reader.read();
+        assert_eq!(reader.raw_bytes().len(), 0);
+    }
+}
+
+#[test]
+#[allow(
+    clippy::redundant_guards,
+    reason = "the guard mirrors the panic arm below it"
+)]
+fn a_failed_read_does_not_leave_the_previous_batch_behind() {
+    // What a read that returned an error produced is nothing, so nothing of the
+    // read before it may still be reachable: `raw_bytes` answers with the batch
+    // the `Ok` just matched, never an older one.  The bug this pins down is the
+    // one that matters to `examples/batch_to_worker.rs`, a loop that copies
+    // `raw_bytes` — with the state cleared after the read instead of before it, a
+    // caller that copies on the error path dispatches the previous batch twice.
+    let dir = tmpdir();
+    let fan = common::fid_group();
+    fan.mark(FAN_MARK_ADD, FAN_CREATE, dir.path().to_str().unwrap())
+        .unwrap();
+    let mut reader = EventReader::new(&fan, 4096);
+
+    // A real batch first: the stale state has to be something, or the test
+    // proves nothing about it.
+    std::fs::write(dir.path().join("first"), b"x").unwrap();
+    let mut ready = false;
+    let mut saw_batch = false;
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+    while !ready && std::time::Instant::now() < deadline {
+        match reader.read() {
+            Ok(events) if !events.is_empty() => {
+                saw_batch = true;
+                ready = true;
+            }
+            Ok(_) => {}
+            Err(FanotifyError::Read(libc::EAGAIN)) => {
+                fan.wait_readable(Some(std::time::Duration::from_millis(50)))
+                    .unwrap();
+            }
+            Err(e) => panic!("unexpected: {e}"),
+        }
+    }
+    assert!(saw_batch, "the create event must arrive");
+    assert!(!reader.raw_bytes().is_empty());
+
+    // Then reads that fail.  Each one must answer with the empty batch, and each
+    // one is checked while the previous read's bytes are still what `raw_bytes`
+    // held a moment ago.
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+    let mut failures = 0usize;
+    while failures < 3 && std::time::Instant::now() < deadline {
+        match reader.read() {
+            Ok(events) if events.is_empty() => failures += 1,
+            Ok(events) => panic!(
+                "an event arrived with nothing left to report: {}",
+                events.len()
+            ),
+            Err(FanotifyError::Read(libc::EAGAIN)) => failures += 1,
+            Err(e) => panic!("unexpected: {e}"),
+        }
+        assert!(
+            reader.raw_bytes().is_empty(),
+            "a failed read must not leave the previous batch behind",
+        );
+    }
+    assert!(
+        failures >= 3,
+        "the queue must empty out so the error path is actually exercised",
+    );
+    // And no event of the previous batch is still reachable either.
+    assert_eq!(reader.read().map(|events| events.len()).unwrap_or(0), 0);
+}
+
+#[test]
+#[ignore = "needs CAP_SYS_ADMIN: a non-FID NOTIF group is admin-only"]
+#[allow(
+    clippy::redundant_guards,
+    reason = "the guard mirrors the panic arm below it"
+)]
+fn an_fd_reader_gives_up_its_batch_when_a_read_fails() {
+    let Some(fan) = fd_group() else {
+        skip_without_cap_sys_admin!("a failed fd-format read");
+    };
+    let dir = tmpdir();
+    fan.mark(FAN_MARK_ADD, FAN_CREATE, dir.path().to_str().unwrap())
+        .unwrap();
+
+    let mut reader = FdEventReader::new(&fan, 64 * 1024);
+    let Some(object) = next_fd_event_object(&fan, &mut reader, dir.path(), "first") else {
+        panic!("the first create event must arrive");
+    };
+    assert!(!reader.raw_bytes().is_empty());
+    assert!(descriptor_is_still_the_same_object(object));
+
+    // A read that finds nothing is a read that produced nothing, so the batch
+    // and the descriptor it carried go with it.  (The next successful read would
+    // replace them anyway; what a failure must not do is leave them reachable
+    // through `raw_bytes` and the event slice until then.)
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+    let mut failed = false;
+    while !failed && std::time::Instant::now() < deadline {
+        match reader.read() {
+            Ok(events) if events.is_empty() => failed = true,
+            Ok(events) => panic!("an event arrived with nothing to report: {}", events.len()),
+            Err(FanotifyError::Read(libc::EAGAIN)) => failed = true,
+            Err(e) => panic!("unexpected: {e}"),
+        }
+    }
+    assert!(failed, "the queue must empty out");
+    assert!(reader.raw_bytes().is_empty());
+    assert!(
+        !descriptor_is_still_the_same_object(object),
+        "a failed read must not keep holding the previous batch's descriptor",
+    );
+}
+
+#[test]
+#[ignore = "needs CAP_SYS_ADMIN: a non-FID NOTIF group is admin-only"]
+fn an_fd_reader_reuses_its_storage_across_batches() {
+    let Some(fan) = fd_group() else {
+        skip_without_cap_sys_admin!("reading fd-format events");
+    };
+    let dir = tmpdir();
+    fan.mark(FAN_MARK_ADD, FAN_CREATE, dir.path().to_str().unwrap())
+        .unwrap();
+
+    let mut reader = FdEventReader::new(&fan, 64 * 1024);
+    let slots = reader.event_capacity();
+    // Sized for a whole buffer of events before the first read, which is what
+    // makes every read afterwards allocation-free.
+    assert_eq!(slots, (64 * 1024usize).div_ceil(24));
+
+    let object = next_fd_event_object(&fan, &mut reader, dir.path(), "first")
+        .expect("the first create event must arrive");
+    assert!(object >= 0);
+    // The batch reports bytes, and only as many as the kernel wrote.
+    assert!(!reader.raw_bytes().is_empty());
+    assert_eq!(reader.event_capacity(), slots, "no re-allocation");
+
+    // A second batch reuses those slots, so the same storage holds it.
+    let again = next_fd_event_object(&fan, &mut reader, dir.path(), "second")
+        .expect("the second create event must arrive");
+    assert!(again >= 0);
+    assert_eq!(reader.event_capacity(), slots, "no re-allocation");
+}
+
+#[test]
+#[ignore = "needs CAP_SYS_ADMIN: a non-FID NOTIF group is admin-only"]
+fn an_fd_reader_closes_the_batch_it_replaces() {
+    let Some(fan) = fd_group() else {
+        skip_without_cap_sys_admin!("replacing an fd-format batch");
+    };
+    let dir = tmpdir();
+    fan.mark(FAN_MARK_ADD, FAN_CREATE, dir.path().to_str().unwrap())
+        .unwrap();
+
+    let mut reader = FdEventReader::new(&fan, 64 * 1024);
+    let buffer_before = reader.raw_bytes().as_ptr();
+
+    let Some(object) = next_fd_event_object(&fan, &mut reader, dir.path(), "first") else {
+        panic!("the first create event must arrive");
+    };
+    assert!(
+        descriptor_is_still_the_same_object(object),
+        "the descriptor belongs to the batch while the batch is current"
+    );
+
+    // The next event replaces the batch, and a replaced slot drops its
+    // descriptor: that is the rule the reader documents, and it is what makes
+    // one `Vec` reusable instead of a leak.
+    let _ = next_fd_event_object(&fan, &mut reader, dir.path(), "second")
+        .expect("the second create event must arrive");
+    assert!(
+        !descriptor_is_still_the_same_object(object),
+        "the replaced batch must have given its descriptor up"
+    );
+    assert_eq!(
+        reader.raw_bytes().as_ptr(),
+        buffer_before,
+        "the read buffer is the reader's own and never moves"
+    );
+}
+
+/// Read until an fd event appears for a file created as `entry`, and return its
+/// raw descriptor number — a number rather than a borrow, so a caller can check
+/// it after the batch that owned it has been replaced.
+fn next_fd_event_object(
+    fan: &Fanotify,
+    reader: &mut FdEventReader<'_>,
+    dir: &std::path::Path,
+    entry: &str,
+) -> Option<i32> {
+    use std::os::fd::AsRawFd;
+
+    std::fs::write(dir.join(entry), b"x").unwrap();
+    common::retry(
+        || match reader.read() {
+            Ok(events) => events
+                .iter()
+                .find_map(|ev| ev.fd().map(|fd| fd.as_raw_fd())),
+            Err(FanotifyError::Read(libc::EAGAIN)) => {
+                let _ = fan.wait_readable(Some(std::time::Duration::from_millis(20)));
+                None
+            }
+            Err(e) => panic!("unexpected: {e}"),
+        },
+        std::time::Duration::from_secs(5),
+    )
 }

@@ -21,9 +21,10 @@ fuzz_target!(|data: &[u8]| {
     let handle: FileHandle = vec![0u8; 12];
 
     // A store hit answers the directory half without a syscall, so the only
-    // input that matters is `data`.
+    // input that matters is `data`.  The store copies what it keeps, so the base
+    // is recorded by reference and stays this closure's to compare against.
     let mut store = HandleCache::new();
-    PathStore::insert(&mut store, FSID, &handle, base.clone());
+    PathStore::insert(&mut store, FSID, &handle, base.as_path());
     let mut resolver = PathResolver::with_store(Mounts::new(), store);
 
     match resolver.resolve_dir(FSID, &handle, data) {

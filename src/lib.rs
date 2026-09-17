@@ -69,14 +69,17 @@
 //! * **the three identities and their wire formats** — parsing a FID event
 //!   ([`parse_fid_events`], and
 //!   [`Fanotify::read_events`]), an fd-based event
-//!   ([`Fanotify::read_fd_events`]), and a mount event (the same FID reader: a
+//!   ([`Fanotify::read_fd_events`] and its reader [`FdEventReader`]), and a mount
+//!   event (the same FID reader: a
 //!   mount event is a FID-format event whose identity record is
 //!   [`FidEvent::mnt_id`]).  A FID event **borrows the buffer it was parsed
 //!   from**, so a stream of handles and names costs no per-record allocation;
 //!   [`FidEvent::into_owned`] is the explicit conversion for an event that has
-//!   to outlive the read.  Both formats have a `*_reported` entry point whose
-//!   [`ParseReport`] says whether the buffer was walked to the end, because a
-//!   truncated buffer and an empty queue must not look alike;
+//!   to outlive the read, and
+//!   [`EventReader::raw_bytes`] is the cheaper one for a whole batch that has to
+//!   (see `examples/batch_to_worker.rs`).  Both formats have a `*_reported`
+//!   entry point whose [`ParseReport`] says whether the buffer was walked to the
+//!   end, because a truncated buffer and an empty queue must not look alike;
 //! * **the two ways to answer a permission event** — matched by descriptor, or
 //!   without one ([`response`]);
 //! * **the kernel's primitives, as themselves** — every anchor, mask and action
@@ -137,7 +140,7 @@
 //! | [`FAN_MARK_MOUNT`](consts::FAN_MARK_MOUNT) / [`FAN_MARK_FILESYSTEM`](consts::FAN_MARK_FILESYSTEM) / [`FAN_MARK_MNTNS`](consts::FAN_MARK_MNTNS) | an unprivileged group may place inode marks only — and that limit is about the **anchor**, not the file: marking a root-owned file succeeds |
 //! | [`FAN_REPORT_PIDFD`](consts::FAN_REPORT_PIDFD), [`FAN_REPORT_TID`](consts::FAN_REPORT_TID), [`FAN_REPORT_FD_ERROR`](consts::FAN_REPORT_FD_ERROR) | admin-only init flags |
 //! | [`FAN_UNLIMITED_QUEUE`](consts::FAN_UNLIMITED_QUEUE), [`FAN_UNLIMITED_MARKS`](consts::FAN_UNLIMITED_MARKS) | admin-only init flags |
-//! | [`FAN_REPORT_MNT`](consts::FAN_REPORT_MNT) | the whole mount-identity row |
+//! | [`FAN_REPORT_MNT`](consts::FAN_REPORT_MNT) **marks** | creating the group needs nothing — unlike every other row here, the capability is asked for at `fanotify_mark` |
 //! | [`FAN_FS_ERROR`](consts::FAN_FS_ERROR) events | inherited from the filesystem mark they need |
 //! | [`FAN_ENABLE_AUDIT`](consts::FAN_ENABLE_AUDIT) | needs `CAP_AUDIT_WRITE`, **not** `CAP_SYS_ADMIN` |
 //!
@@ -178,14 +181,13 @@
 //! # Requirements
 //!
 //! Linux only — the crate fails to compile elsewhere with that message.  Rust
-//! 1.85 or newer (edition 2024).  One dependency, `libc`, for the syscalls.
+//! 1.88 or newer (edition 2024).  One dependency, `libc`, for the syscalls.
 //!
 //! # Reading a FID group
 //!
 //! ```rust,no_run
 //! use fanotify_fid::{Fanotify, FanotifyError, consts::*};
-//! use fanotify_fid::handle::resolve_file_handle;
-//! use std::os::fd::OwnedFd;
+//! use fanotify_fid::handle::{Mounts, resolve_file_handle_in};
 //!
 //! # fn main() -> Result<(), Box<dyn std::error::Error>> {
 //!
@@ -201,8 +203,10 @@
 //!
 //! // 3. Resolving a handle to a path needs CAP_DAC_READ_SEARCH.  A mount
 //! //    descriptor says which filesystem a handle belongs to, which is what
-//! //    makes the resolution correct rather than merely possible.
-//! let mount_fds: Vec<OwnedFd> = vec![std::fs::File::open("/srv/data")?.into()];
+//! //    makes the resolution correct rather than merely possible — and `Mounts`
+//! //    learns each descriptor's filesystem once, so resolution does not repeat
+//! //    that `fstatfs` per event the way a bare `&[OwnedFd]` has to.
+//! let mounts = Mounts::new().with_fd(std::fs::File::open("/srv/data")?)?;
 //!
 //! // 4. Read.
 //! let mut buf = Vec::new();
@@ -223,11 +227,12 @@
 //!
 //!                 // A path, if you have the privilege and want one.
 //!                 if let (Some(fsid), Some(handle)) = (ev.fsid(), ev.dfid_name_handle()) {
-//!                     println!("parent: {:?}", resolve_file_handle(&mount_fds, Some(fsid), handle));
+//!                     println!("parent: {:?}", resolve_file_handle_in(mounts.candidates(), Some(fsid), handle));
 //!                 }
 //!             }
 //!         }
-//!         Err(FanotifyError::Read(libc::EAGAIN)) => {
+//!         // An empty queue is not a failure: wait for the next event.
+//!         Err(e) if e.is_would_block() => {
 //!             fan.wait_readable(None)?;
 //!         }
 //!         Err(e) => return Err(e.into()),
@@ -292,10 +297,13 @@ pub use fd::{FdEvent, parse_fd_events};
 pub use fid::{
     FidEvent, Pidfd, RenameSide, parse_fid_events, parse_fid_events_into, parse_fid_events_reported,
 };
-pub use group::Fanotify;
-pub use handle::{FileHandle, Fsid, HandleCache, Mounts, NoCache, PathStore, resolve_file_handle};
+pub use group::{EventReader, Fanotify, FdEventReader};
+pub use handle::{
+    Candidate, FileHandle, Fsid, HandleCache, Mounts, NoCache, PathStore, resolve_file_handle,
+    resolve_file_handle_in,
+};
 pub use parse::{EventStop, ParseReport};
-pub use resolve::{EventResolution, PathResolver};
+pub use resolve::{EventResolution, PathResolver, Resolution};
 pub use response::FanotifyResponse;
 
 /// The names most callers need, in one import.
@@ -326,14 +334,15 @@ pub use response::FanotifyResponse;
 pub mod prelude {
     pub use crate::consts::*;
     pub use crate::handle::{
-        FileHandle, Fsid, HandleCache, Mounts, NoCache, PathStore, fsid_of_fd, fsid_of_path,
-        handle_from_fd, name_to_handle_at, open_by_handle_at, resolve_file_handle,
+        Candidate, FileHandle, Fsid, HandleCache, Mounts, NoCache, PathStore, fsid_of_fd,
+        fsid_of_path, handle_from_fd, name_to_handle_at, open_by_handle_at, resolve_file_handle,
+        resolve_file_handle_in,
     };
-    pub use crate::resolve::{EventResolution, PathResolver};
+    pub use crate::resolve::{EventResolution, PathResolver, Resolution};
     pub use crate::sys::{fanotify_init, fanotify_mark};
     pub use crate::{
-        EventStop, Fanotify, FanotifyError, FanotifyResponse, FdEvent, FidEvent, ParseReport,
-        Pidfd, RenameSide, Result, parse_fd_events, parse_fid_events, parse_fid_events_into,
-        parse_fid_events_reported,
+        EventReader, EventStop, Fanotify, FanotifyError, FanotifyResponse, FdEvent, FdEventReader,
+        FidEvent, ParseReport, Pidfd, RenameSide, Result, parse_fd_events, parse_fid_events,
+        parse_fid_events_into, parse_fid_events_reported,
     };
 }

@@ -139,6 +139,52 @@ impl Fanotify {
         })
     }
 
+    /// Adopt a group descriptor this process already holds.
+    ///
+    /// The descriptor-in form of [`init`](Self::init), for a group that was
+    /// created elsewhere: inherited across `fork`/`exec`, received over a unix
+    /// socket with `SCM_RIGHTS`, or set up before privileges were dropped.  None
+    /// of those can be replaced by a call to `fanotify_init`, so without this the
+    /// whole API — reading events, placing marks, answering permission events —
+    /// is unreachable for a process that did not create its own group.
+    ///
+    /// Nothing is probed and nothing is stored but the descriptor: it is used as
+    /// given, and the kernel's errno is what any later call answers.  The flags
+    /// the group was created with are not known here and are not guessed at, so
+    /// this is not the place to validate that a group is FID-mode.  A group that
+    /// is not FID-mode still answers a read with bytes this crate parses — both
+    /// identities share one metadata layout and one version — so the mistake
+    /// shows up as events whose fsid and handles are absent rather than as an
+    /// error.  [`read_events`](Self::read_events) reports what it can of them.
+    ///
+    /// The descriptor is owned from here on: dropping the returned value closes
+    /// it, which releases the group's marks, so a caller that wants to keep the
+    /// descriptor must [`into_inner`](Self::into_inner) it back or duplicate it
+    /// first.
+    ///
+    /// # Safety
+    ///
+    /// The descriptor must be a fanotify group.  This is the same contract
+    /// [`std::os::fd::FromRawFd`] carries and for the same reason: a descriptor
+    /// is a bare number, and the kernel answers a `read(2)` on the wrong kind of
+    /// object in its own way rather than in a way that can be checked here.  A
+    /// duplicate of a group's own descriptor (`try_clone`) is the safe case and
+    /// the one this exists for.
+    ///
+    /// ```rust,no_run
+    /// use std::os::fd::OwnedFd;
+    /// use fanotify_fid::Fanotify;
+    ///
+    /// # fn inherited_group() -> OwnedFd { unimplemented!() }
+    /// // A group descriptor received over SCM_RIGHTS, say.
+    /// let raw: OwnedFd = inherited_group();
+    /// let fan = unsafe { Fanotify::from_fd(raw) };
+    /// # Ok::<(), fanotify_fid::FanotifyError>(())
+    /// ```
+    pub unsafe fn from_fd(fd: OwnedFd) -> Self {
+        Self { fd }
+    }
+
     /// Add or remove a mark, anchored at `dir_fd` + `path`.
     ///
     /// `flags` selects the anchor and the action: exactly one of
@@ -308,6 +354,48 @@ impl Fanotify {
     /// An event that must outlive the buffer is made owned with
     /// [`FidEvent::into_owned`](crate::FidEvent::into_owned).
     ///
+    /// # Reusing storage across reads
+    ///
+    /// The events `Vec` cannot be reused through *this* call, and that is a
+    /// property of the lifetime rather than a missing method:
+    /// `Vec<FidEvent<'buf>>` fixes `'buf`, so a `Vec` that outlives one iteration
+    /// pins the buffer's borrow for as long as it lives and the next read cannot
+    /// have the buffer at all.
+    ///
+    /// [`EventReader`] is the answer, and it needs nothing of the caller: it owns
+    /// the buffer and the event `Vec`, so both are allocated once for the life of
+    /// the reader and every read after setup allocates nothing.  Reach for this
+    /// call instead when the events are consumed inside one iteration anyway —
+    /// both are zero-copy, and only this one lets the buffer live on the stack.
+    ///
+    /// ```rust,no_run
+    /// use fanotify_fid::{EventReader, Fanotify, FanotifyError, consts::*};
+    ///
+    /// # let fan = Fanotify::new(FAN_CLASS_NOTIF | FAN_REPORT_FID)?;
+    /// let mut reader = EventReader::new(&fan, 256 * 1024);
+    /// loop {
+    ///     match reader.read() {
+    ///         Ok(events) => {
+    ///             for ev in events.iter() {
+    ///                 println!("{:?}", ev.fsid());
+    ///             }
+    ///         }
+    ///         // An empty queue is not a failure: wait for the next event.
+    ///         Err(e) if e.is_would_block() => {
+    ///             fan.wait_readable(None)?;
+    ///         }
+    ///         Err(e) => return Err(e),
+    ///     }
+    /// }
+    /// # Ok::<(), FanotifyError>(())
+    /// ```
+    ///
+    /// What that buys is real: without it every read that overflows a freshly
+    /// grown buffer pays a `realloc` and a copy of everything already read.  If a
+    /// caller would rather own its events outright, `FidEvent::into_owned` on
+    /// each one trades that back for a copy per record — which is the trade this
+    /// crate's borrowing model exists to refuse.
+    ///
     /// ```rust,no_run
     /// use fanotify_fid::{Fanotify, FanotifyError, consts::*};
     ///
@@ -326,7 +414,8 @@ impl Fanotify {
     ///             }
     ///         }
     ///         // A non-blocking group with an empty queue: not a failure.
-    ///         Err(FanotifyError::Read(libc::EAGAIN)) => {
+    ///         // An empty queue is not a failure: wait for the next event.
+    ///         Err(e) if e.is_would_block() => {
     ///             fan.wait_readable(None)?;
     ///         }
     ///         Err(e) => return Err(e),
@@ -385,11 +474,32 @@ impl Fanotify {
         buf: &'buf mut Vec<u8>,
     ) -> Result<(Vec<FidEvent<'buf>>, ParseReport)> {
         sys::read_events(&self.fd, buf)?;
+        // Nothing to parse: not one byte was written, which on a non-blocking
+        // group is the `EAGAIN` retry — the read that must stay free.  The early
+        // return is what keeps it free of the walk rather than of an allocation
+        // (`Vec::new()` does not allocate, and a parse of an empty buffer would
+        // reach the same report); the empty-queue path is also why `read_events`
+        // empties the buffer on failure, so a stale length cannot make this look
+        // like a batch.
+        if buf.is_empty() {
+            return Ok((
+                Vec::new(),
+                ParseReport {
+                    bytes_consumed: 0,
+                    bytes_left: 0,
+                    stop: EventStop::End,
+                },
+            ));
+        }
         // SAFETY-propagation, not a new unsafe block: `sys::read_events`
         // performed the `read(2)` that filled `buf`, so a non-negative pidfd
         // number in it is a descriptor the kernel installed for this process.
         // Each number is adopted at most once, which the adopt helper enforces.
-        let (mut events, report) = fid::parse_fid_events_reported(buf);
+        let mut events = Vec::new();
+        let report = fid::parse_fid_events_into(&mut events, buf);
+        // A vector of descriptor numbers is scratch space per call rather than
+        // per event: it is bounded by the events in one read, and a read that
+        // carries pidfds is the rare case.
         let mut adopted = Vec::new();
         for event in &mut events {
             let Some(raw) = fid::reported_pidfd_number(event.pidfd()) else {
@@ -499,6 +609,16 @@ impl Fanotify {
         self.fd.as_fd()
     }
 
+    /// The group's descriptor, for the crate's own syscall wrappers.
+    ///
+    /// Private on purpose: [`as_fd`](Self::as_fd) is the public form, and the
+    /// readers and the response writer take the borrowed descriptor they need
+    /// from it.  This exists so a reader can name the descriptor without naming
+    /// the field.
+    pub(crate) fn fd(&self) -> &OwnedFd {
+        &self.fd
+    }
+
     /// Give up the group and hand back its descriptor.
     ///
     /// The descriptor stays open; whoever receives it now closes it, and until
@@ -511,5 +631,506 @@ impl Fanotify {
 impl AsFd for Fanotify {
     fn as_fd(&self) -> BorrowedFd<'_> {
         self.fd.as_fd()
+    }
+}
+
+/// A reader that owns its buffer, so reading allocates nothing after setup.
+///
+/// [`Fanotify::read_events`] takes the read buffer from the caller, and the
+/// events it returns borrow that buffer.  That is what makes parsing free of
+/// per-record allocation, but it has a consequence the plain call cannot avoid:
+/// `Vec<FidEvent<'buf>>` fixes `'buf`, so a `Vec` that outlives one read pins the
+/// buffer's borrow for as long as the `Vec` lives, and the next read cannot have
+/// the buffer at all.  The documented workaround was a `'static` buffer obtained
+/// with `Box::leak` — trading a permanent leak for a per-read allocation, which
+/// is a bad trade to hand a caller.
+///
+/// This type is the trade done properly.  It owns the buffer and the event
+/// `Vec`, so both are allocated once, and hands out a borrow of the events for
+/// as long as it is mutably borrowed:
+///
+/// ```rust,no_run
+/// use fanotify_fid::fid::FidEvent;
+/// use fanotify_fid::resolve::PathResolver;
+/// use fanotify_fid::handle::Mounts;
+/// use fanotify_fid::{EventReader, Fanotify, FanotifyError, consts::*};
+///
+/// # let fan = Fanotify::new(FAN_CLASS_NOTIF | FAN_REPORT_FID)?;
+/// # let mut resolver = PathResolver::new(Mounts::new());
+/// let mut reader = EventReader::new(&fan, 256 * 1024);
+/// loop {
+///     match reader.read() {
+///         Ok(events) => {
+///             // `&mut`, so a path can be resolved in place: no copy per event.
+///             resolver.resolve_events(events);
+///             for ev in events.iter() {
+///                 println!("{:?}", ev.path());
+///             }
+///         }
+///         // An empty queue is not a failure: wait for the next event.
+///         Err(e) if e.is_would_block() => {
+///             fan.wait_readable(None)?;
+///         }
+///         Err(e) => return Err(e),
+///     }
+/// }
+/// # Ok::<(), FanotifyError>(())
+/// ```
+///
+/// # Why this is sound
+///
+/// The events name bytes inside the reader's own buffer, so storing them as
+/// `FidEvent<'static>` is a lifetime erasure — two `unsafe` blocks in
+/// `read_reported`, and no others in this type — and these properties make it
+/// hold:
+///
+/// * **The buffer cannot be moved or grown.**  It is a `Box<[u8]>` and its
+///   length is a separate field, so there is no capacity to reserve into and no
+///   `push` to reallocate: the allocation is made once by [`new`](Self::new) and
+///   [`read`](Self::read) only ever changes how many of its bytes are live.  That
+///   is a property of the type rather than of a comment — growth is not offered,
+///   and a caller that needs a different size makes a different reader — so the
+///   safety argument does not depend on the crate's `read_into` continuing to
+///   behave.
+/// * **`read` takes `&mut self`.**  While the slice it returned is alive the
+///   caller cannot call `read` again — or any other `&mut self` method — so the
+///   kernel cannot write into the buffer while events borrowing it are in use.
+///   The lifetime the caller sees is the borrow of `self`, which is what makes
+///   the compiler enforce the order a consumer must have anyway.
+/// * **Nothing borrows the buffer once the reader is dropping.**  `Drop` runs
+///   the fields in declaration order, so `group`, `buf`, `bytes_read` and
+///   `events` are released in that order: the allocation is freed *before* the
+///   events that name bytes inside it.  That order is safe only because a
+///   `Cow::Borrowed` is a pointer and a length with nothing to run — `Cow` has no
+///   `Drop` of its own, and neither does the `&[u8]` inside it, so no destructor
+///   reads through the slice.  The invariant a change here has to keep is
+///   therefore **not** "`events` outlives `buf`" — declaration order deliberately
+///   does not provide that — but "no field of [`FidEvent`] dereferences the
+///   buffer when dropped".  A field with a destructor that touched the bytes
+///   (`Cow` replaced by a type that reports what it read, say) would make the
+///   current order unsound, and moving `events` above `buf` is what that change
+///   would have to come with.
+/// * **A batch is overwritten, never read back.**  The slice handed out is `&mut`,
+///   so a caller may *write* to the events — including storing an event whose
+///   `Cow` borrows something shorter-lived than the reader.  That is sound for the
+///   same reason the drop order is: the next parse assigns over every live slot
+///   (`FidEvent::reset` plus the parsed value), so no stale event is ever read,
+///   and dropping the replaced value reaches no buffer because nothing in
+///   `FidEvent` reads through a `Cow` on drop.  This is the half of the argument a
+///   caller can defeat by keeping one of those `&mut` events alive across a read —
+///   which the borrow of `self` already forbids.
+///
+/// A pidfd record is adopted here exactly as in `read_events`, and on the same
+/// grounds: the buffer is the direct result of this call's `read(2)`.
+#[derive(Debug)]
+pub struct EventReader<'fan> {
+    /// Borrowed, not owned: the group outlives every read, and a reader that
+    /// owned the descriptor would close the group when it dropped.
+    group: &'fan Fanotify,
+    /// The read buffer, boxed and fixed: `bytes_read` is how much of it the last
+    /// `read(2)` filled.  A `Box<[u8]>` cannot grow, which is the type-level half
+    /// of the safety argument above — there is no capacity for a reserve to
+    /// consume and no pointer for a growth to invalidate.
+    ///
+    /// Declared before `events` on purpose, and it does not matter which way
+    /// round they are: see the drop-order bullet above for the invariant that
+    /// actually has to hold.
+    buf: Box<[u8]>,
+    /// How many bytes of `buf` the last read produced.
+    bytes_read: usize,
+    /// The erased form of the events in `buf`.  Never handed out as `'static` —
+    /// `read` narrows it to the borrow of `self` before returning.
+    events: Vec<FidEvent<'static>>,
+}
+
+impl<'fan> EventReader<'fan> {
+    /// A reader over `group` with a `capacity`-byte read buffer.
+    ///
+    /// The capacity is the read size and is fixed for the reader's life: one
+    /// `read(2)` returns as many whole events as fit, so a larger buffer means
+    /// fewer syscalls on a deep queue, never a partial event.  A buffer too small
+    /// for the next event earns `EINVAL` from the kernel rather than a split —
+    /// see [`Fanotify::read_events`] — and the only remedy is a larger reader.
+    ///
+    /// A zero `capacity` is the 64 KiB default below rather than a zero-byte
+    /// read, which the kernel would answer `EINVAL` to forever; a caller that
+    /// wants a different read size passes one — 256 KiB is a reasonable size for
+    /// a filesystem mark.
+    pub fn new(group: &'fan Fanotify, capacity: usize) -> Self {
+        /// What a `capacity` of zero becomes: the same floor
+        /// [`sys::read_events`] applies to a buffer the caller did not size.
+        const DEFAULT_BUF_BYTES: usize = 64 * 1024;
+
+        let bytes = if capacity == 0 {
+            DEFAULT_BUF_BYTES
+        } else {
+            capacity
+        };
+        Self {
+            group,
+            // Zeroed rather than uninitialized: this is the one allocation the
+            // reader makes, and paying one `calloc` for it is what lets every
+            // later read be a plain `&mut [u8]` with no `MaybeUninit` anywhere in
+            // the API or the safety argument.
+            buf: vec![0u8; bytes].into_boxed_slice(),
+            bytes_read: 0,
+            events: Vec::new(),
+        }
+    }
+
+    /// Read the next batch and return the events, mutably.
+    ///
+    /// Mutably because resolving a path writes it onto the event
+    /// ([`PathResolver::resolve_events`](crate::resolve::PathResolver::resolve_events)),
+    /// and a shared slice would force the caller to copy each event to do that.
+    ///
+    /// The slice is valid until the next `&mut self` call on this reader; it is
+    /// the reader's own storage, so nothing is allocated for it.
+    ///
+    /// # Errors
+    ///
+    /// As [`Fanotify::read_events`]: the kernel's errno, with `EAGAIN` for an
+    /// empty queue on a non-blocking group — which is not a failure, and costs
+    /// nothing here.  An unknown `vers` is [`FanotifyError::UnknownEventVersion`].
+    pub fn read(&mut self) -> Result<&mut [FidEvent<'_>]> {
+        let (events, report) = self.read_reported()?;
+        if let EventStop::UnknownVersion(vers) = report.stop {
+            return Err(FanotifyError::UnknownEventVersion(vers));
+        }
+        Ok(events)
+    }
+
+    /// [`read`](Self::read), also reporting how far the parse got.
+    ///
+    /// The [`ParseReport`] is the same one [`Fanotify::read_events_reported`]
+    /// returns, including its treatment of an unknown `vers`: reported rather
+    /// than raised, so the events before it are still there.
+    ///
+    /// # Errors
+    ///
+    /// The syscall's errno, and nothing else: an error here means no bytes were
+    /// read, so [`raw_bytes`](Self::raw_bytes) and the events are both empty and
+    /// nothing of the previous read is still reachable.  An unknown `vers` in a
+    /// *successful* read is not an error here — it is the `EventStop` in the
+    /// returned [`ParseReport`], with the events parsed before it still in the
+    /// slice.  [`read`](Self::read) is the form that raises it instead, and that
+    /// error is the one case where the bytes and the events of the last read stay
+    /// reachable.
+    pub fn read_reported(&mut self) -> Result<(&mut [FidEvent<'_>], ParseReport)> {
+        // Both halves of "what the last read produced" are cleared *before* the
+        // read, not after it succeeds.  A failed read — the `EAGAIN` of an empty
+        // queue, an `EINVAL` for an oversized event — produced nothing, so
+        // `raw_bytes` must not go on answering with the previous batch and these
+        // events must not go on holding its pidfds.  Clearing after the `?` would
+        // leave exactly that stale state behind, and a caller that copies
+        // `raw_bytes` on the error path would process the previous batch twice.
+        self.bytes_read = 0;
+        self.events.clear();
+
+        // `&mut [u8]` out of the box, so the type itself rules out a
+        // reallocation: `read_into` has nowhere to grow into.
+        let n = sys::read_into(self.group.fd(), &mut self.buf)?;
+        self.bytes_read = n;
+
+        // Nothing was written: an empty queue, or the `EAGAIN` this crate's
+        // non-blocking examples retry on.  Returning early is what keeps that
+        // wake-up free — no parse, no allocation, no syscall beyond the one just
+        // made.  The length is zero here, so the erasure below has nothing to
+        // get wrong; it is skipped rather than reasoned about.
+        let report = if n == 0 {
+            ParseReport {
+                bytes_consumed: 0,
+                bytes_left: 0,
+                stop: EventStop::End,
+            }
+        } else {
+            // SAFETY: the erasure's two preconditions are this type's invariants.
+            //
+            // 1. The bytes live in `self.buf`, a `Box<[u8]>` whose allocation was
+            //    made once in `new`: it cannot be reallocated, because there is no
+            //    capacity to grow into and no owned `Vec` behind it.  So the bytes
+            //    the events name stay where they are for as long as `self` lives —
+            //    which is at least as long as the `'static` this claims.
+            // 2. No `FidEvent<'static>` is ever exposed as `'static`: the
+            //    narrowing below returns the borrow of `&mut self`, so the
+            //    compiler will not let a caller hold the events across another
+            //    `&mut self` call, and the kernel therefore cannot write into
+            //    `self.buf` while an event borrows it.
+            //
+            // The pidfd adoption is sound for the reason it is in
+            // `read_events_reported`: those bytes are the direct result of the
+            // `read` just above, so a non-negative number in them is a descriptor
+            // the kernel installed for this process.
+            let buf: &'static [u8] =
+                unsafe { std::slice::from_raw_parts(self.buf.as_ptr(), self.bytes_read) };
+            let report = fid::parse_fid_events_into(&mut self.events, buf);
+            let mut adopted = Vec::new();
+            for event in &mut self.events {
+                let Some(raw) = fid::reported_pidfd_number(event.pidfd()) else {
+                    continue;
+                };
+                *event.pidfd_mut() = fid::adopt_reported_pidfd(raw, &mut adopted);
+            }
+            report
+        };
+
+        // The one place the erased lifetime becomes the caller's borrow, and it
+        // narrows rather than widens: the events live in `self.events`, which
+        // cannot be touched again until this borrow ends.  A shared slice would
+        // not do — `FidEvent` is invariant in its lifetime, so `&mut
+        // [FidEvent<'static>]` cannot be returned as anything else without this.
+        let events = unsafe {
+            std::mem::transmute::<&mut [FidEvent<'static>], &mut [FidEvent<'_>]>(&mut self.events)
+        };
+        Ok((events, report))
+    }
+
+    /// The bytes the last read produced, marker for marker as the kernel wrote
+    /// them.
+    ///
+    /// For a caller that records raw input: what a parse could not interpret, or
+    /// what a version this crate does not know looks like, is still here.  This
+    /// is also the escape hatch for an architecture that cannot keep events alive
+    /// across the next read — copy this slice once and parse it on another
+    /// thread, rather than paying [`FidEvent::into_owned`] per event; see
+    /// `examples/batch_to_worker.rs`.
+    ///
+    /// # It belongs to the last read that succeeded
+    ///
+    /// A read that returned an error is not a read: `EAGAIN` on an empty queue,
+    /// `EINVAL` for an event larger than the buffer, or any other errno leaves
+    /// this **empty**, and the events of the previous batch are gone with it.  So
+    /// what a caller sees here is always the batch the `Ok` it just matched
+    /// described, never an older one — including on the error path of a loop that
+    /// copies these bytes, which is the mistake this rule exists to make
+    /// impossible.
+    pub fn raw_bytes(&self) -> &[u8] {
+        &self.buf[..self.bytes_read]
+    }
+
+    /// The capacity chosen for the read buffer, which is the read size.
+    pub fn capacity(&self) -> usize {
+        self.buf.len()
+    }
+
+    /// How much storage the event `Vec` has, which a read grows at most once.
+    ///
+    /// The per-read allocation this type exists to remove is the event `Vec`
+    /// growing; after the first read that produced events it is sized for the
+    /// batch it saw, and a later read of the same size reuses it.  Exposed for
+    /// tests and for a caller that wants to confirm the warm-up happened.
+    pub fn event_capacity(&self) -> usize {
+        self.events.capacity()
+    }
+}
+
+/// [`EventReader`] for a group that reports **descriptors** instead of handles.
+///
+/// The same idea as [`EventReader`], for the other identity: the reader owns the
+/// buffer and the event storage, so every read after setup allocates nothing and
+/// nothing is left to the caller to arrange.  [`Fanotify::read_fd_events`] is the
+/// stateless form, and it is fine when one batch is parsed and dropped; this is
+/// the form for a loop, where the event `Vec` is the allocation it removes.
+///
+/// ```rust,no_run
+/// use fanotify_fid::response::FanotifyResponse;
+/// use fanotify_fid::{Fanotify, FanotifyError, FdEventReader, consts::*};
+///
+/// # fn main() -> Result<(), FanotifyError> {
+/// // Descriptor identity: the events carry the object, not a handle.
+/// let fan = Fanotify::new(FAN_CLASS_CONTENT | FAN_CLOEXEC | FAN_NONBLOCK)?;
+/// fan.mark(FAN_MARK_ADD, FAN_OPEN_PERM, "/srv/data")?;
+///
+/// let mut reader = FdEventReader::new(&fan, 64 * 1024);
+/// loop {
+///     match reader.read() {
+///         Ok(events) => {
+///             for ev in events {
+///                 let Some(fd) = ev.fd() else { continue };
+///                 // The answer must be written before the next read: the next
+///                 // read replaces the events, and a replaced event closes its
+///                 // descriptor.
+///                 fan.send_response(&FanotifyResponse::allow(fd))?;
+///             }
+///         }
+///         // An empty queue is not a failure: wait for the next event.
+///         Err(e) if e.is_would_block() => {
+///             fan.wait_readable(None)?;
+///         }
+///         Err(e) => return Err(e),
+///     }
+/// }
+/// # }
+/// ```
+///
+/// # How it differs from the FID reader
+///
+/// `read` returns `&[FdEvent]` where [`EventReader::read`] returns
+/// `&mut [FidEvent<'_>]`, and the difference is a fact about the two formats
+/// rather than a choice: an fd-based event **owns** everything it reports, so
+/// there is nothing borrowed from the buffer to erase, no lifetime to narrow, and
+/// no `unsafe` anywhere in this type.  A caller who needs to change an event has
+/// `&mut` through the slice it owns; a caller who wants a path resolved in place
+/// has no equivalent here, because a `FdEvent`'s path comes from `/proc` and not
+/// from a resolver.
+///
+/// # The batch stays valid until the next read
+///
+/// A slot that is rewritten gives up the descriptor it held — dropping an
+/// [`OwnedFd`] closes it — so an event's `fd` is live from the read that reported
+/// it until the next `read` on the same reader, or until the event is taken out
+/// with [`FdEvent::into_fd`].  That is the same rule
+/// [`parse_fd_events_into`](crate::fd::parse_fd_events_into) documents, and the
+/// same one the stateless call has by construction: what changes here is only
+/// that the storage is reused rather than freed.
+#[derive(Debug)]
+pub struct FdEventReader<'fan> {
+    /// Borrowed, as in [`EventReader`]: the reader must not close the group.
+    group: &'fan Fanotify,
+    /// The read buffer, boxed and fixed: `bytes_read` says how much of it the
+    /// last `read(2)` filled.
+    buf: Box<[u8]>,
+    /// How many bytes of `buf` the last read produced.
+    bytes_read: usize,
+    /// The events of the last read.  Filled to the largest count the buffer can
+    /// hold, so a read reuses slots instead of growing the `Vec`; only the first
+    /// events after a read are live, because `read` truncates to the count the
+    /// parse produced.
+    events: Vec<FdEvent>,
+}
+
+impl<'fan> FdEventReader<'fan> {
+    /// A reader over `group` with a `capacity`-byte read buffer.
+    ///
+    /// As [`EventReader::new`]: the capacity is the read size, fixed for the
+    /// reader's life, and zero is the 64 KiB default rather than a zero-byte
+    /// read.  An fd-based event is [`METADATA_SIZE`](crate::fd::METADATA_SIZE)
+    /// bytes with nothing after it, so the buffer also decides how many events
+    /// one syscall may return.
+    pub fn new(group: &'fan Fanotify, capacity: usize) -> Self {
+        /// The same floor [`EventReader::new`] applies.
+        const DEFAULT_BUF_BYTES: usize = 64 * 1024;
+
+        let bytes = if capacity == 0 {
+            DEFAULT_BUF_BYTES
+        } else {
+            capacity
+        };
+        // The most events `bytes` could ever hold, so the event `Vec` is
+        // allocated once here and never grown by a read.  A short event is
+        // impossible — the kernel writes at least a header — so this is an upper
+        // bound rather than a guess that could be exceeded.
+        let most_events = bytes.div_ceil(crate::fd::METADATA_SIZE);
+        let mut events = Vec::new();
+        // Reserved exactly, so the upper bound is the storage's real capacity and
+        // cannot be exceeded by a read: `resize_with` alone would leave the `Vec`
+        // free to grow past it.
+        events.reserve_exact(most_events);
+        // `resize_with` rather than `vec![event; n]`: `FdEvent` is deliberately
+        // not `Clone` (cloning one would have to duplicate or share a descriptor),
+        // and empty slots need no cloning anyway.
+        events.resize_with(most_events, || FdEvent::new(0, None, 0));
+        Self {
+            group,
+            buf: vec![0u8; bytes].into_boxed_slice(),
+            bytes_read: 0,
+            events,
+        }
+    }
+
+    /// Read the next batch of fd-based events.
+    ///
+    /// The events are borrowed from the reader, and the borrow is what keeps the
+    /// rule above enforceable: the next `read` needs `&mut self`, so the
+    /// compiler will not let a caller keep an event's descriptor number or its
+    /// place in the batch across one.
+    ///
+    /// # Errors
+    ///
+    /// As [`Fanotify::read_fd_events`]: the kernel's errno, with `EAGAIN` for an
+    /// empty queue on a non-blocking group — not a failure, and it costs nothing
+    /// here.
+    pub fn read(&mut self) -> Result<&[FdEvent]> {
+        let (events, _) = self.read_reported()?;
+        Ok(events)
+    }
+
+    /// [`read`](Self::read), also reporting how far the parse got.
+    ///
+    /// The same [`ParseReport`] as
+    /// [`Fanotify::read_fd_events_reported`](crate::Fanotify::read_fd_events_reported):
+    /// a kernel `read(2)` returns whole events, so a non-complete report means
+    /// the stream, not the caller, and `bytes_left` is the tail that was not
+    /// interpreted.
+    ///
+    /// # Errors
+    ///
+    /// As [`read`](Self::read).  An error is not a batch: it empties both
+    /// [`raw_bytes`](Self::raw_bytes) and the event storage, so the descriptors
+    /// the previous batch carried are closed here rather than left held by a
+    /// reader whose last read failed.
+    pub fn read_reported(&mut self) -> Result<(&[FdEvent], ParseReport)> {
+        // Nothing the previous read produced survives into this one — see
+        // `EventReader::read_reported` for why this runs before the read rather
+        // than after it.  Here it is sharper than a stale `raw_bytes`: the slots
+        // still hold the descriptors the previous batch put there, and a read
+        // that fails must not leave them owned by a batch that is over.
+        self.bytes_read = 0;
+        self.events.clear();
+
+        let n = sys::read_into(self.group.fd(), &mut self.buf)?;
+        self.bytes_read = n;
+
+        // Every slot is live again: `parse_fd_events_into` writes each one before
+        // it is read, and rewrites the `fd` field of a slot it reuses — which is
+        // what closes the descriptor the previous read put there.  So a stale
+        // descriptor cannot outlive the read that replaced it, and the truncate
+        // below is what keeps the returned slice from including slots this read
+        // did not fill.
+        let report = fd::parse_fd_events_into(&mut self.events, &self.buf[..n]);
+        // `bytes_consumed` is the sum of the events' own `event_len` fields, each
+        // of which is checked against `METADATA_SIZE` before it is walked, so this
+        // division is exact and the result is the number of live slots.
+        self.events
+            .truncate(report.bytes_consumed / crate::fd::METADATA_SIZE);
+        // The same adoption as the stateless read, and on the same grounds: this
+        // buffer is what this call's `read(2)` just returned, so a non-negative
+        // number in it is a descriptor the kernel installed for this process.
+        // The scratch list is per read on purpose: it holds the numbers adopted
+        // *in this buffer*, and carrying it across reads would refuse a number
+        // the kernel had legitimately reused after the previous batch closed it.
+        let mut adopted = Vec::new();
+        for event in &mut self.events {
+            event.adopt_reported(&mut adopted);
+        }
+        Ok((&self.events, report))
+    }
+
+    /// The bytes the last read produced, marker for marker as the kernel wrote
+    /// them.
+    ///
+    /// For a caller that records raw input, and for the architecture that cannot
+    /// keep events across the next read: copy this once and hand the copy to
+    /// [`parse_fd_events`](crate::fd::parse_fd_events) wherever you like.
+    ///
+    /// Empty after a read that returned an error, exactly as in
+    /// [`EventReader::raw_bytes`]: a failed read produced nothing, so the
+    /// previous batch does not linger here for a caller to process twice.
+    pub fn raw_bytes(&self) -> &[u8] {
+        &self.buf[..self.bytes_read]
+    }
+
+    /// The read size this reader was built with.
+    pub fn capacity(&self) -> usize {
+        self.buf.len()
+    }
+
+    /// How many event slots the reader holds, which is its upper bound on events
+    /// per read.
+    ///
+    /// Allocated once, by [`new`](Self::new): this is the storage a read reuses,
+    /// exposed so a caller can confirm that no read grows it.
+    pub fn event_capacity(&self) -> usize {
+        self.events.capacity()
     }
 }

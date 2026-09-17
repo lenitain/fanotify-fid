@@ -70,7 +70,7 @@ pub const CAP_AUDIT_WRITE: u32 = 29;
 /// whole system's files, so it is not delegable to a nested namespace — and the
 /// only environment where these tests can run is a real privileged one.  A
 /// failure that looks like a bug in the crate on a `unshare -Ur` run is this,
-/// and `tests/README.md` says so where someone hitting it will look.
+/// which is why every privileged test names the capability it needs.
 #[derive(Debug, Clone, Copy)]
 pub struct Capabilities {
     effective: u64,

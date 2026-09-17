@@ -168,7 +168,7 @@ fn resolving_a_batch_converges_and_a_second_pass_changes_nothing() {
         // resolves is exactly what the store can answer — a deterministic
         // fixture for a property about the resolver's own bookkeeping.
         let mut store = HandleCache::new();
-        PathStore::insert(&mut store, fsid, &known, PathBuf::from("/known"));
+        PathStore::insert(&mut store, fsid, &known, &PathBuf::from("/known"));
         let mut resolver = PathResolver::with_store(Mounts::new(), store);
         resolver.set_syscall_fallback(false);
 
@@ -176,9 +176,19 @@ fn resolving_a_batch_converges_and_a_second_pass_changes_nothing() {
         let after_first = paths_of(&events);
         let second = resolver.resolve_events(&mut events);
 
+        // A settled batch has nothing left to resolve.  This is the assertion
+        // that used to pass for the wrong reason: while `AlreadyResolved` was
+        // counted as resolved, both calls reported the same number *because*
+        // both were counting "these already had paths" — the second call looked
+        // like it had done the first call's work.  What has to drop to zero is
+        // `resolved`, and the events have to show up under `already_resolved`.
         assert_eq!(
-            first, second,
+            second.resolved, 0,
             "case {case}: a settled batch must not resolve anything new"
+        );
+        assert_eq!(
+            second.already_resolved, first.resolved,
+            "case {case}: the second call re-sees exactly what the first resolved",
         );
         assert_eq!(
             paths_of(&events),
@@ -193,9 +203,9 @@ fn resolving_a_batch_converges_and_a_second_pass_changes_nothing() {
             .map(|event| event.dfid_name_handle() == Some(known.as_slice()))
             .collect();
         assert_eq!(
+            first.resolved,
             events.iter().filter(|event| event.has_path()).count(),
-            first,
-            "case {case}: the return value is the number of events with paths",
+            "case {case}: `resolved` counts the events the call newly resolved",
         );
         for (event, should_resolve) in events.iter().zip(resolved) {
             assert_eq!(event.has_path(), should_resolve, "case {case}");
@@ -225,7 +235,7 @@ fn resolve_event_says_exactly_whether_the_event_ended_with_a_path() {
         let mut event = event_naming(fsid, handle, "entry");
 
         let mut store = HandleCache::new();
-        PathStore::insert(&mut store, fsid, &known, PathBuf::from("/known"));
+        PathStore::insert(&mut store, fsid, &known, &PathBuf::from("/known"));
         let mut resolver = PathResolver::with_store(Mounts::new(), store);
         resolver.set_syscall_fallback(false);
 

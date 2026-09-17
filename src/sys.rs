@@ -165,12 +165,28 @@ pub(crate) fn fanotify_mark_by_fd(
 /// `Vec::with_capacity` is the knob.  On success the buffer's length is what the
 /// kernel wrote; on failure it is emptied.
 ///
+/// # The buffer is written, never moved
+///
+/// This is the only place in the crate that writes into a read buffer, and it
+/// **only ever moves the length**: it never calls `reserve`, `resize`, `push` or
+/// anything else that could reallocate, and the one `reserve` on the path runs
+/// only for a buffer with no capacity at all — before the `read`, never after
+/// one has succeeded.
+///
+/// That is not an optimisation, it is a precondition of someone else's safety
+/// argument: [`crate::EventReader`] hands out events that point into the buffer
+/// it passed here, so a reallocation after a successful read would leave every
+/// outstanding event dangling.  [`read_into`] is the same syscall over a plain
+/// slice, for a reader whose buffer type cannot grow at all.
+///
 /// # Errors
 ///
 /// [`FanotifyError::Read`] with the kernel's errno: `EAGAIN` for an empty queue
-/// on a non-blocking group (not a failure), `EINVAL` when the buffer is smaller
-/// than the next event — the kernel refuses a partial event rather than
-/// splitting one — `EBADF`, `ENOSYS`.
+/// on a non-blocking group (not a failure — see
+/// [`FanotifyError::is_would_block`]), `EINVAL` when the buffer is smaller than
+/// the next event — the kernel refuses a partial event rather than splitting one
+/// — `EBADF`, `ENOSYS`.  A read interrupted by a signal is **retried** rather
+/// than reported, so `EINTR` is not part of this function's vocabulary.
 pub(crate) fn read_events(fanotify_fd: &OwnedFd, buf: &mut Vec<u8>) -> Result<(), FanotifyError> {
     /// More than one event fits, whatever the format, so a deep queue costs few
     /// syscalls.  A `read` never returns a partial event regardless, so this is
@@ -183,24 +199,90 @@ pub(crate) fn read_events(fanotify_fd: &OwnedFd, buf: &mut Vec<u8>) -> Result<()
         buf.reserve(DEFAULT_BUF_BYTES);
     }
 
-    // SAFETY: `read` writes at most `capacity` bytes into the allocation — which
-    // is at least one byte, so no zero-byte read is issued — and the length is
-    // advanced only by the value it returns, so no uninitialized byte is ever
-    // exposed to safe code.
-    let n = unsafe {
-        libc::read(
-            fanotify_fd.as_raw_fd(),
-            buf.as_mut_ptr().cast::<libc::c_void>(),
-            buf.capacity(),
-        )
+    // SAFETY: the slice is this `Vec`'s own allocation — `as_mut_ptr` and
+    // `capacity` describe exactly it — so no aliasing is introduced and `&mut buf`
+    // is held for the call.  Its bytes past the length are uninitialized, which
+    // is why `read_into` only ever *writes* them and why the length is advanced
+    // below by no more than what it reported writing.
+    let n = match read_into(fanotify_fd, unsafe {
+        std::slice::from_raw_parts_mut(buf.as_mut_ptr(), buf.capacity())
+    }) {
+        Ok(n) => n,
+        Err(e) => {
+            // The documented contract, and the reason it is worth having: a
+            // failed read produced nothing, so the caller's buffer must not go on
+            // answering with the previous batch.  Callers act on `buf.is_empty()`
+            // — see `read_events_reported` — and a length left over from a
+            // successful read would make an `EAGAIN` look like a batch.
+            buf.clear();
+            return Err(e);
+        }
     };
-    if n < 0 {
-        buf.clear();
-        return Err(FanotifyError::Read(errno()));
-    }
-    // SAFETY: the successful `read` initialized exactly `n` bytes.
-    unsafe { buf.set_len(n as usize) };
+    // SAFETY: the successful `read` initialized exactly `n` bytes, and `n`
+    // cannot exceed the capacity the kernel was given.
+    unsafe { buf.set_len(n) };
     Ok(())
+}
+
+/// `read(2)` on a fanotify group into a slice that cannot grow.
+///
+/// The syscall behind both readers, and the whole of what it guarantees: at most
+/// `buf.len()` bytes are written, the count comes back, and nothing about the
+/// buffer's address changes — a slice has no capacity to grow into, so a caller
+/// who has handed out borrows of it has nothing to fear from the next read.
+///
+/// `buf` must be **initialized**, which is why the slice form is `&mut [u8]` and
+/// not `&mut [MaybeUninit<u8>]`: a zeroed buffer is a buffer the caller can also
+/// hand to [`crate::EventReader::raw_bytes`] without a second thought, and bytes
+/// the kernel is about to overwrite do not need to be *uninitialized* to be
+/// free.  A caller coming from an uninitialized allocation can reach this
+/// through [`read_events`], which is where that case is handled.
+///
+/// # Errors
+///
+/// As [`read_events`]; an empty slice is `EINVAL` from the kernel rather than a
+/// zero-byte read, which is what a caller that sized nothing deserves to see.
+///
+/// # A signal is retried, not reported
+///
+/// `EINTR` is the one errno this function does not return: a `read(2)` that was
+/// interrupted before transferring anything is retried in place, because "a
+/// signal arrived" is not an answer about the event queue and both callers here
+/// would otherwise have to invent that distinction themselves.  Everything else
+/// comes back exactly as the kernel gave it.
+pub(crate) fn read_into(fanotify_fd: &OwnedFd, buf: &mut [u8]) -> Result<usize, FanotifyError> {
+    loop {
+        // SAFETY: `read` writes at most `buf.len()` initialized bytes and returns
+        // how many; both descriptor and buffer are borrowed for the call.
+        let n = unsafe {
+            libc::read(
+                fanotify_fd.as_raw_fd(),
+                buf.as_mut_ptr().cast::<libc::c_void>(),
+                buf.len(),
+            )
+        };
+        if n < 0 {
+            let err = errno();
+            // A signal that arrived before the read transferred anything is not
+            // an answer about the queue, so it is not this function's to report:
+            // retrying keeps the interruption invisible to a caller whose loop
+            // would otherwise have to distinguish "a signal arrived" from "the
+            // read failed" — a distinction no read error carries for it.
+            //
+            // Retrying cannot lose an event.  `read` either transfers bytes or
+            // fails with `EINTR` having transferred none, so there is nothing to
+            // splice and no partial event to reason about; the event that was
+            // queued, if any, is still queued.  A signal with a handler installed
+            // without `SA_RESTART` is the case this exists for, and a blocking
+            // group simply goes back to waiting, which is what it would have done
+            // anyway.
+            if err == libc::EINTR {
+                continue;
+            }
+            return Err(FanotifyError::Read(err));
+        }
+        return Ok(n as usize);
+    }
 }
 
 /// The current `errno` as an `i32`.

@@ -56,6 +56,38 @@ impl FanotifyError {
             Self::UnknownEventVersion(_) => None,
         }
     }
+
+    /// Whether this is the `EAGAIN` of an **empty queue**, which is not a
+    /// failure.
+    ///
+    /// A non-blocking group — one created with `FAN_NONBLOCK`, which every
+    /// example here uses — answers a read with `EAGAIN` when nothing is queued,
+    /// so an event loop has to tell that apart from a read that really failed.
+    /// See [`Fanotify::wait_readable`](crate::Fanotify::wait_readable) for what
+    /// to do next.  The check exists as a method because writing it by hand means
+    /// matching on the raw errno of the right variant, and getting the variant
+    /// wrong is a silent mistake: the same `EAGAIN` from a *response write* means
+    /// something else entirely.
+    ///
+    /// `EINTR` is **not** this: a read interrupted by a signal is retried inside
+    /// this crate before a caller ever sees it, so no read error means "a signal
+    /// arrived".
+    ///
+    /// ```
+    /// use fanotify_fid::{Fanotify, FanotifyError, consts::*};
+    ///
+    /// let fan = Fanotify::new(FAN_CLASS_NOTIF | FAN_CLOEXEC | FAN_NONBLOCK | FAN_REPORT_FID)?;
+    /// let mut buf = Vec::new();
+    /// match fan.read_events(&mut buf) {
+    ///     Ok(events) => println!("{} events", events.len()),
+    ///     Err(e) if e.is_would_block() => println!("nothing queued yet"),
+    ///     Err(e) => return Err(e.into()),
+    /// }
+    /// # Ok::<(), Box<dyn std::error::Error>>(())
+    /// ```
+    pub fn is_would_block(&self) -> bool {
+        matches!(*self, Self::Read(libc::EAGAIN))
+    }
 }
 
 impl fmt::Display for FanotifyError {
@@ -165,7 +197,12 @@ fn describe_mark(code: i32) -> Cow<'static, str> {
 fn describe_read(code: i32) -> Cow<'static, str> {
     match code {
         libc::EAGAIN => Cow::Borrowed("No events are queued (non-blocking group)"),
-        libc::EINTR => Cow::Borrowed("Interrupted by a signal before any event arrived; retry"),
+        libc::EINTR => Cow::Borrowed(
+            "Interrupted by a signal before any event arrived.  This crate retries a read that \
+             is interrupted, so a caller does not see it; `wait_readable` reports it instead, \
+             where retrying would be a decision about the caller's loop rather than about a \
+             syscall",
+        ),
         libc::EINVAL => Cow::Borrowed(
             "The buffer is too small for the next event.  fanotify never delivers a partial \
              event, so the buffer must hold the largest one — a long entry name is what makes \

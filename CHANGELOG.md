@@ -7,54 +7,252 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
-### Changed
-
-- **Parsing borrows the read buffer.** `FidEvent` now carries a lifetime —
-  `FidEvent<'buf>` — and its handle, name, rename-side and unknown-record bytes
-  are `Cow<'buf, [u8]>`, so a parse copies no record's bytes and the only
-  allocation left is growing the event `Vec`. `Fanotify::read_events` returns
-  `Vec<FidEvent<'_>>` for the same reason: the events are consumed inside the
-  read loop, and `FidEvent::into_owned` is the explicit conversion for one that
-  has to outlive the buffer. `parse_fid_events_into` refills an existing `Vec`
-  in place, keeping each event's unknown-record allocation. The lifetime model
-  is in the `fid` module docs.
-- `FanotifyResponse::allow` / `deny` / `deny_errno` / `audit_rule` are now sugar
-  over two low-level constructors, `FanotifyResponse::raw` (an arbitrary
-  decision word) and `FanotifyResponse::info` (an arbitrary record type and
-  payload), so a record type a newer kernel adds needs no crate release.
-  `FanotifyResponse::with_fd` attaches the descriptor a record-carrying
-  response is matched against; without one the kernel validates the record and
-  answers nothing.  The response documentation now states what `fanotify_write`
-  actually validates; in particular it corrects the earlier claim that the
-  `FAN_INFO` form answers the oldest pending event — the kernel matches every
-  response by the event's descriptor, and `FAN_AUDIT` (not `FAN_INFO`) is what
-  needs `FAN_ENABLE_AUDIT`.
-- `FanotifyError`, `Pidfd`, `EventResolution` and `EventStop` are
-  `#[non_exhaustive]`: the kernel surface they describe grows by addition, and a
-  caller matching exhaustively today should not be broken by one.
-- `FidEvent::set_dfid_name` and `set_self_handle` take any `Cow` input, so a
-  borrowed handle or name is stored without a copy.
+0.8.0 is a rewrite rather than a series of additions: the parser became
+borrowing, reading and resolving became separate steps, and the items that only
+existed to work around the old shape are gone. The version moves for that reason,
+and the **Breaking** notes below are the migration path.
 
 ### Added
 
-- `ParseReport` and `EventStop`, plus the walk-reporting entry points
-  `parse_fid_events_reported`, `parse_fid_events_into`,
-  `Fanotify::read_events_reported`, and — for the fd format — `parse_fd_events`,
-  `parse_fd_events_into` and `Fanotify::read_fd_events_reported`.
-  `bytes_left > 0` now says that the tail was not interpreted, instead of a
-  truncated buffer merely yielding fewer events.
-- `FidEvent::set_fd_error`, and `FdEvent::new` / `FdEvent::set_fd_field` for
-  synthesising both event formats without a kernel. `FdEvent::new` accepts only
-  an `OwnedFd`; `set_fd_field` changes the reported number and claims nothing.
-- `Fanotify::mark_fd`: place a mark on the object a descriptor names, with no
-  path resolution at all. The kernel's descriptor form is a `NULL` pathname,
-  which also means an `O_PATH` descriptor is refused with `EBADF` — documented,
-  and asserted against the kernel in `tests/group.rs`.
-- `consts::AT_EMPTY_PATH` (`0x1000`), the flag `handle_from_fd` already used.
-- `fuzz/` with three cargo-fuzz targets (`parse_fid_events`, `parse_fd_events`,
-  `resolve_dir`) and `tests/properties.rs`, which checks the
-  `without_deleted_suffix`, resolver-convergence and parser-totality properties
-  in every `cargo test` run.
+**Reading**
+
+- `EventReader`: a reader that owns its read buffer and its event storage, so a
+  loop allocates nothing after the storage has grown and nothing has to be leaked
+  to arrange it. `read()` hands out `&mut [FidEvent<'_>]`, so a resolver can
+  write a path onto each event in place, and `raw_bytes()` returns the batch
+  exactly as the kernel wrote it — the entry point for an architecture that
+  cannot keep events across the next read, such as one that copies the batch once
+  and parses it on a worker thread (`examples/batch_to_worker.rs`).
+- `FdEventReader`: the same reader for descriptor groups. It needs no lifetime
+  erasure, because an `FdEvent` owns everything it reports, and its event storage
+  is sized for the whole buffer up front (`capacity.div_ceil(24)` slots) so a
+  read never grows it. A batch's descriptors stay open until the next read
+  replaces the slot or `FdEvent::into_fd` takes one.
+- `Fanotify::from_fd()` (`unsafe`): adopt a descriptor that is already a group —
+  inherited, received over `SCM_RIGHTS`, or set up before privileges were
+  dropped. The caller vouches that it is a fanotify group, the same contract
+  `FromRawFd` carries; the returned value owns it, so dropping it closes the
+  group and releases its marks. This is what makes the API reachable for a
+  process that did not create its own group.
+- `FanotifyError::is_would_block()`: whether the error is the `EAGAIN` of an
+  empty queue, so a loop does not have to match the raw errno of the right
+  variant to tell "nothing queued" from "the read failed".
+
+**Resolving**
+
+- `PathResolver`, `Resolution` and `EventResolution`: resolution is now an
+  explicit pass over a batch rather than something that happened inside the read.
+  `resolve_events` reports `resolved`, `already_resolved`, `unresolved` and
+  `passes` instead of one number that conflated two of them.
+- `PathResolver::known()`: the store lookup with no syscall fallback — "do I
+  already know this handle?", answered without spending `open_by_handle_at`.
+- `PathResolver::store` / `store_mut` / `mounts` / `mounts_mut`: the learning and
+  the descriptors are reachable, so a caller can pre-seed, inspect or invalidate
+  them.
+- `resolve_file_handle_in()`: the other half of `resolve_file_handle`, taking the
+  `Candidate` values `Mounts::candidates()` produces instead of a bare
+  `&[OwnedFd]`. A bare slice carries no fsid, so `resolve_file_handle` probes
+  every descriptor with `fstatfs` on every call; `Mounts` learns each fsid once,
+  so this form spends none. It is the call `PathResolver` uses internally.
+- `Candidate` and `Mounts::candidates()` are public. `Candidate` pairs a
+  descriptor with the fsid known for it, which is what makes the filter sound and
+  what a caller needs to drive a resolution itself.
+- `HandleCache::path_of()`: a borrowed lookup that allocates nothing. `HandleCache`
+  also gained `len`, `is_empty`, `filesystems`, `iter`, `clear` and
+  `forget_filesystem`.
+
+**Events**
+
+- `FidEvent::into_owned()`, and the whole borrowed value API built on it: the
+  handle, the name, both rename sides and the unknown records are `Cow<'buf,
+  [u8]>`, so a parse copies no record's bytes.
+- `Pidfd` (`Absent` / `Fd` / `Unavailable`), `FidEvent::{take_pidfd, fd_error,
+  access_range, mnt_id}`, and typed `FAN_RENAME` sides. A pidfd record is adopted
+  once per buffer and closed on drop.
+- `FidEvent::without_deleted_suffix()`, which strips the `" (deleted)"` marker
+  from every component rather than the last, and refuses to guess at a path a
+  file is legitimately named `foo (deleted)`.
+- All the setters a caller needs to build an event by hand (`set_dfid_name`,
+  `set_self_handle`, `set_pidfd`, `set_fs_error`, `set_rename_source`,
+  `set_rename_target`, `push_unknown_info_record`, …).
+- `ParseReport` and `EventStop`, with `parse_fid_events_reported`,
+  `parse_fid_events_into`, `parse_fd_events`, `parse_fd_events_into`,
+  `read_events_reported` and `read_fd_events_reported`. `bytes_left > 0` now says
+  the tail was not interpreted, instead of a short buffer merely yielding fewer
+  events.
+- `Fanotify::{init, mark_fd, flush_marks, wait_readable}`: `mark_fd` places a
+  mark on the object a descriptor names with no path resolution at all.
+- 24 new constants, including `FAN_REPORT_MNT`, `FAN_REPORT_FD_ERROR`,
+  `FAN_MARK_MNTNS`, `FAN_PRE_ACCESS`, `AT_EMPTY_PATH`, `AT_HANDLE_FID`,
+  `FANOTIFY_FID_BITS`, `FANOTIFY_ADMIN_INIT_FLAGS`, `FAN_NOPIDFD`,
+  `FAN_EPIDFD`, `MAX_HANDLE_SZ`, `EVENT_F_FLAGS_ALLOWED`, and
+  `FANOTIFY_METADATA_VERSION` — which is now enforced rather than assumed.
+
+### Changed
+
+- **Building a group.** `Fanotify::new()` now takes the flags and answers a
+  `Result`, and `Fanotify::init()` takes the flags and the `event_f_flags`.
+  0.7.1's `Default` added `FAN_CLOEXEC` for you; nothing is added now, so a group
+  built without it survives `exec`.
+- **Reading events.** `Fanotify::read_events` takes only `&mut Vec<u8>` and
+  returns `Result<Vec<FidEvent<'_>>>`: the events borrow the buffer, and their
+  `path()` is `None` until a `PathResolver` runs. `read_fd_events` gained the
+  same `&mut Vec<u8>` scratch parameter. The buffer's capacity is the read size,
+  with a 64 KiB floor.
+- **Reading no longer resolves.** 0.7.1's read took the mount descriptors and an
+  optional cache and resolved paths inside a fixed 10-pass loop. Resolution is
+  now separate, repeatable, and reports what it did.
+- **Validation is real.** An unknown `vers` is refused instead of parsed, and a
+  `metadata_len` that does not fit its event stops the walk — 0.7.1 read neither
+  field.
+- **`FidEvent` borrows rather than owns.** Its `path()` is `Option<&Path>`, its
+  names are bytes-first (`dfid_name`, `dfid_name_str`, `dfid_name_raw`,
+  `dfid_name_os_string`) and a name that is not UTF-8 is no longer dropped, its
+  `unknown_info_records()` yields `Cow<'buf, [u8]>`, and it is built with
+  `new()` plus setters rather than one six-argument constructor.
+- **Preserved records are one record each.** An info record the parser has no
+  typed field for is kept verbatim, from its own header to its own end. It used
+  to start after the header and run to the end of the event, so the records that
+  followed it were stored twice: once inside that entry and once under their own
+  typed fields. (`FAN_RENAME`'s two sides and the `RANGE`/`MNT`/`ERROR`/`PIDFD`
+  records are typed now, so this only applies to a type the kernel adds next.)
+- **Permissions answers.** `FanotifyResponse::{allow, deny, deny_errno,
+  audit_rule}` build the common forms, `raw` and `info` cover any decision word
+  or record type a newer kernel adds, `with_fd` attaches the descriptor a
+  record-carrying answer is matched by, and `info_type`/`info_payload` read one
+  back. All of them are built without a heap buffer; `info` with a payload past
+  32 bytes spills to exactly one. A response error is a `Write` error, and a
+  record that cannot fit is refused before the syscall.
+- **Constants.** `FAN_ALL_EVENTS`, `FAN_ALL_PERM_EVENTS` and
+  `FAN_ALL_OUTGOING_EVENTS` gained `FAN_ATTRIB`, `FAN_OPEN_EXEC` and
+  `FAN_OPEN_EXEC_PERM`; `FAN_ALL_MARK_FLAGS` gained the filesystem, evictable,
+  ignore and mount-namespace flags; `FAN_ALL_INIT_FLAGS` gained `FAN_ENABLE_AUDIT`
+  and every report flag. The six `FAN_ALL_*` constants are no longer
+  `#[deprecated]`. `mask_to_event_names` names the queue-overflow, pre-access,
+  mount and child bits it used to skip. The `O_*` constants now come from
+  `libc`, which fixes `O_LARGEFILE` on 32-bit targets.
+- **Errors.** `FanotifyError` has five variants (`Init`, `Mark`, `Read`,
+  `Write`, `UnknownEventVersion`), is `#[non_exhaustive]`, and its messages say
+  what the errno means *for that syscall*. Every errno is still the kernel's.
+- **A store hit costs one allocation, not two**: the key is no longer copied
+  into an owned `Vec` before the lookup. A handle whose filesystem reports
+  `f_fsid` zero is still indistinguishable from another such filesystem; the
+  docs now say what that costs a store keyed on the pair.
+- **`open_by_handle_at` takes any `AsFd`** and opens with `O_PATH | O_CLOEXEC`,
+  so it no longer leaks a descriptor across `exec`;
+  `name_to_handle_at`/`handle_from_fd` ask for a FID handle and retry without
+  `AT_HANDLE_FID` on a kernel that does not know it.
+- **MSRV is 1.88** (was 1.85), and the `smallvec` dependency is gone.
+
+### Removed
+
+- `FanotifyBuilder` and its fifteen methods: pass the flags to
+  `Fanotify::new`/`init`.
+- `FdReader` (`new`, `event_count`, `read`, `read_do`): use
+  `Fanotify::read_fd_events(&mut buf)` or `read_fd_events_reported`, or
+  `FdEventReader` for a loop.
+- `read_fid_events` and `resolve_with_cache`: use `Fanotify::read_events` /
+  `parse_fid_events` with a `PathResolver`.
+- `write_response` (now internal), `mark_mount`, `read_fd_events_do` and
+  `open_mount` (use `Mounts::new().with_fd(...)`).
+- `strip_deleted_suffix`: the marker is kept on `path()` and
+  `FidEvent::without_deleted_suffix` is the explicit removal.
+- `HandleKey`: it is `FileHandle`.
+- `FanotifyError::{Handle, Io}` and `impl From<io::Error>`, so `?` on a
+  `handle::*` call no longer converts — those functions return `io::Error`.
+- `PathStore::lookup` and `Mounts::as_owned_fds`, both added during this release
+  and never used by it: the first was a `&self` accessor that no store needing
+  `&mut self` or a lock guard can implement, and the second returned a shape
+  `iter`/`on_filesystem`/`candidates` already cover.
+
+### Breaking
+
+Read these first; the rest of the entry describes what to migrate *to*.
+
+- `Fanotify::new()` → `Fanotify::new(flags)?`, `Fanotify::init(flags,
+  event_f_flags)?`. `FAN_CLOEXEC` is no longer implied.
+- `Fanotify::read_events(mount_fds, buf, cache)` →
+  `read_events(&mut buf)` plus an explicit `PathResolver` pass. **This one is
+  silent:** events no longer carry a path from the read, so code that calls
+  `ev.path()` without resolving gets `None` rather than a compile error.
+- `FidEvent` carries a lifetime and borrows the buffer; `FidEvent::new` takes no
+  arguments and the setters replace the builder-style `with_*` methods;
+  `path()` is `Option<&Path>`; `dfid_name_filename()` is `dfid_name_str()`
+  (`dfid_name` keeps a non-UTF-8 name instead of dropping it);
+  `pidfd()` returns `&Pidfd` and `into_pidfd()` is `take_pidfd()`.
+- `unknown_info_records()` yields the record **including its 4-byte header**, so
+  a decoder that read the payload must slice `&raw[4..]`; the length is
+  `u16::from_ne_bytes([raw[2], raw[3]])` in the host's byte order.
+  `push_unknown_info_record` takes that same header-included record.
+- `PathStore::get` takes `&mut self` and `PathStore::insert` takes `path: &Path`.
+  An implementor changes both receivers. A caller that reached a store through
+  `PathResolver::store()` can no longer call `get` on it — use `store_mut()`,
+  `known()`, or `HandleCache::path_of`. A raw
+  `HashMap<(Fsid, FileHandle), PathBuf>` is no longer a store: `HandleCache` is
+  one.
+- `PathResolver::resolve_events` returns `Resolution` rather than `usize`. The
+  old number counted already-resolved events as resolved, so it reported the
+  same count for a settled batch as for the call that had just resolved it; a
+  caller that wants that total asks for `resolved + already_resolved`.
+- A `DFID_NAME` record naming a directory's own entry (`.`) resolves to the
+  directory rather than to `dir/.`: the same path to `Path::components`, a
+  different string to `display`, to `==`, or to a `HashMap` key.
+- Constants: `FAN_ALL_EVENTS`, `FAN_ALL_PERM_EVENTS`, `FAN_ALL_OUTGOING_EVENTS`,
+  `FAN_ALL_MARK_FLAGS` and `FAN_ALL_INIT_FLAGS` have different values.
+- `FANOTIFY_METADATA_VERSION` is public, and a buffer whose `vers` differs is
+  refused with `UnknownEventVersion` instead of parsed.
+
+### Fixed
+
+- An info record with no typed field no longer absorbs the records that follow
+  it — see the note under Changed. `tests/fid_identity.rs` pins it with two
+  records, one unknown and one typed.
+- A settled batch is no longer reported as newly resolved. `resolve_events`
+  counted `AlreadyResolved` towards its result, so a second call on a batch that
+  had not changed reported the same number as the call that resolved it, and a
+  progress check could not detect the absence of progress.
+- A read that fails leaves nothing of the previous batch behind. Both readers
+  cleared `bytes_read` and their event storage *after* the read succeeded, so an
+  error — `EAGAIN` on an empty queue above all — left `raw_bytes()` answering
+  with the previous batch, the fd reader still holding that batch's descriptors,
+  and the FID reader still holding its pidfds. A caller that copies `raw_bytes`
+  on the error path, which is what `examples/batch_to_worker.rs` demonstrates,
+  would process the previous batch twice. `Fanotify::read_events` clears its
+  caller's buffer on failure for the same reason: a length left over from a
+  successful read must not make an empty queue look like a batch.
+- `Mounts::add` no longer leaves a stray fsid behind when duplicating the
+  descriptor fails.
+- A read interrupted by a signal is retried rather than reported, so no read
+  path surfaces `EINTR`. `wait_readable` still reports the `EINTR` of `poll`,
+  because retrying there would be a decision about the caller's loop.
+- Documentation corrections, each of which described behavior the code does not
+  have: `resolve_dir` claimed a borrowed-path fast path that does not exist;
+  `Resolution::passes` claimed to count the confirming pass (it describes the
+  last productive one); `EventReader`'s safety argument covered neither its
+  second `unsafe` block nor drop order, and now states the invariant that keeps
+  the lifetime erasure sound — nothing in `FidEvent` may read the buffer when
+  dropped, and the next parse overwrites every live slot.
+
+### Tests
+
+- `tests/baseline.rs`: every legal group configuration and every cell that does
+  not exist, asserted against the kernel, with the verdict adjusted for the
+  capability actually held — because the privilege check runs *before* the
+  legality check, so an unprivileged run sees `EPERM` where a privileged one
+  sees `EINVAL`.
+- `tests/allocation.rs`: the costs the API promises, asserted with a counting
+  global allocator — a permission response built and written without allocating,
+  1000 empty-queue reads without allocating, a warm reader without allocating, a
+  store hit costing exactly the path it returns, and `path_of` costing nothing.
+  An absent cost is not something a behavioural test can observe.
+- `tests/properties.rs`: convergence, parser totality and the deleted-marker
+  rules as properties rather than examples.
+- `fuzz/`: three cargo-fuzz targets (`parse_fid_events`, `parse_fd_events`,
+  `resolve_dir`).
+- `examples/batch_to_worker.rs`: read a batch, copy its bytes once, parse them on
+  a worker thread — the architecture the borrowing model cannot serve directly,
+  and the one that shows why `raw_bytes` exists.
+
 
 ## [0.7.1] - 2026-09-16
 

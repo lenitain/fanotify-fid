@@ -274,8 +274,8 @@ impl From<OwnedFd> for Pidfd {
 /// A parsed event of a FID group.
 ///
 /// Every record the kernel defines has a typed accessor here, and a record this
-/// crate does not recognise is preserved rather than dropped — see
-/// [`unknown_info_records`](Self::unknown_info_records).
+/// crate does not recognise is preserved rather than dropped — verbatim, header
+/// included, see [`unknown_info_records`](Self::unknown_info_records).
 ///
 /// The raw identity data is exposed as reported: fsid, handles and name bytes,
 /// with no interpretation.  Turning a handle into a path is a separate call
@@ -549,12 +549,17 @@ impl<'buf> FidEvent<'buf> {
     }
 
     /// Add a record the crate has no typed field for.
+    ///
+    /// `record` is taken verbatim, **header included**, matching what
+    /// [`unknown_info_records`](Self::unknown_info_records) reports: a caller
+    /// forwarding a record reads it here with the same bytes it would parse
+    /// back.
     pub fn push_unknown_info_record(
         &mut self,
         info_type: u8,
-        payload: impl Into<Cow<'buf, [u8]>>,
+        record: impl Into<Cow<'buf, [u8]>>,
     ) -> &mut Self {
-        self.unknown_info_records.push((info_type, payload.into()));
+        self.unknown_info_records.push((info_type, record.into()));
         self
     }
 
@@ -809,14 +814,32 @@ impl<'buf> FidEvent<'buf> {
         self.rename_target.as_ref()
     }
 
-    /// Records this crate had no typed field for, as `(info_type, payload)`.
+    /// Records this crate could not turn into a typed field, as
+    /// `(info_type, raw_record)`.
     ///
-    /// The payload is the record body *after* its 4-byte header, borrowed from
-    /// the parse buffer like every other field.  Every info type the kernel
-    /// defines today has a field above, so in practice this fills for two
-    /// reasons: a type a newer kernel added, and a recognised type whose payload
-    /// failed its bounds check.  Either way the bytes are kept, so "the parser
-    /// dropped data" is observable instead of silent.
+    /// `raw_record` is the record **verbatim, its 4-byte
+    /// `fanotify_event_info_header` included**, borrowed from the parse buffer
+    /// like every other field.  So the first byte is the `info_type` the tuple
+    /// also carries, the next is the header's `pad`, and `raw_record[2..4]` is
+    /// the record's own `len` — in the host's byte order, because the kernel
+    /// writes these structures into this process's memory rather than into a
+    /// byte-order-independent wire format.  That makes the record
+    /// self-describing and re-parseable, and is why the header is kept rather
+    /// than sliced off.
+    ///
+    /// Every info type the kernel defines today has a field above, so in
+    /// practice this fills for two reasons: a type a newer kernel added, and a
+    /// recognised type that could not be interpreted.  Either way the bytes are
+    /// kept, so "the parser dropped data" is observable instead of silent.
+    ///
+    /// # The one entry whose bytes are not a single record
+    ///
+    /// A record whose `len` fails its bounds check — smaller than a header, or
+    /// past the end of the event — cannot be walked past, so the walk stops and
+    /// the entry holds the **rest of the event** starting at that record's
+    /// header rather than one record.  Nothing is lost and nothing is counted
+    /// twice; a caller consuming these bytes should read `len` off the front and
+    /// treat only `raw_record[..len]` as the record if it fits.
     pub fn unknown_info_records(&self) -> &[(u8, Cow<'buf, [u8]>)] {
         &self.unknown_info_records
     }
@@ -929,11 +952,19 @@ pub fn parse_fid_events_reported(buf: &[u8]) -> (Vec<FidEvent<'_>>, ParseReport)
 /// The returned [`ParseReport`] is [`parse_fid_events_reported`]'s, including
 /// its treatment of an unknown version: reported, not returned as an error.
 ///
-/// The events borrow `buf`, so the reused `Vec` carries `buf`'s lifetime; the
-/// caller decides how that fits a real stream.  For the ordinary loop of one
-/// read into one buffer, [`Fanotify::read_events`](crate::Fanotify::read_events)
-/// is the shape that fits, because a read cannot happen while events borrowing
-/// the buffer are alive whether the `Vec` is reused or not.
+/// # Reuse needs the two lifetimes to agree
+///
+/// The events borrow `buf`, so `events: &mut Vec<FidEvent<'buf>>` fixes `'buf`:
+/// a `Vec` that outlives one parse pins the buffer's borrow for as long as the
+/// `Vec` lives, and a read loop therefore cannot hand the same `Vec` back to a
+/// fresh borrow of a buffer it still borrows from.  A caller that owns both can
+/// still reuse the `Vec` within one buffer's lifetime — parse, work, parse again
+/// from the same bytes — which is what makes it worth having; what it cannot do
+/// is reuse the `Vec` across two different reads.
+///
+/// Reading from a group with no per-read allocation at all is
+/// [`EventReader`](crate::EventReader)'s job: it owns the buffer and the `Vec`
+/// together, so there is no pair of lifetimes left for the caller to reconcile.
 ///
 /// ```
 /// use fanotify_fid::fid::{FidEvent, parse_fid_events_into};
@@ -1042,12 +1073,18 @@ fn parse_one_event<'buf>(
 
         // A record that does not fit cannot be walked past, so stop and keep the
         // rest as unparsed bytes: that is more useful than skipping a length we
-        // have just decided is untrustworthy.
+        // have just decided is untrustworthy.  The range has to be the whole
+        // tail rather than `len` bytes, because `len` is exactly what failed the
+        // check.
         if record_len < INFO_HEADER_SIZE || record_len > event_end - header_at {
             event.preserve(buf, header_at, event_end, header.info_type);
             break;
         }
 
+        // Every other exit from the walk keeps exactly this record: the length
+        // passed its bounds check, so `record_end` is the record's own end and
+        // no byte of the next record is charged to this one.
+        let record_end = header_at + record_len;
         let payload_at = header_at + INFO_HEADER_SIZE;
         let payload_len = record_len - INFO_HEADER_SIZE;
 
@@ -1064,10 +1101,10 @@ fn parse_one_event<'buf>(
                         event.dfid_name_handle = Some(Cow::Borrowed(handle));
                         event.dfid_name_name = Some(Cow::Borrowed(name));
                     } else {
-                        event.preserve(buf, header_at, event_end, header.info_type);
+                        event.preserve(buf, header_at, record_end, header.info_type);
                     }
                 } else {
-                    event.preserve(buf, header_at, event_end, header.info_type);
+                    event.preserve(buf, header_at, record_end, header.info_type);
                 }
             }
             FAN_EVENT_INFO_TYPE_FID | FAN_EVENT_INFO_TYPE_DFID => {
@@ -1075,7 +1112,7 @@ fn parse_one_event<'buf>(
                     event.fsid = event.fsid.or(Some(fsid));
                     event.self_handle = Some(Cow::Borrowed(handle));
                 } else {
-                    event.preserve(buf, header_at, event_end, header.info_type);
+                    event.preserve(buf, header_at, record_end, header.info_type);
                 }
             }
             FAN_EVENT_INFO_TYPE_OLD_DFID_NAME => {
@@ -1087,7 +1124,7 @@ fn parse_one_event<'buf>(
                             name: Cow::Borrowed(name),
                         });
                     }
-                    None => event.preserve(buf, header_at, event_end, header.info_type),
+                    None => event.preserve(buf, header_at, record_end, header.info_type),
                 }
             }
             FAN_EVENT_INFO_TYPE_NEW_DFID_NAME => {
@@ -1099,7 +1136,7 @@ fn parse_one_event<'buf>(
                             name: Cow::Borrowed(name),
                         });
                     }
-                    None => event.preserve(buf, header_at, event_end, header.info_type),
+                    None => event.preserve(buf, header_at, record_end, header.info_type),
                 }
             }
             // A pidfd record is not adopted here: see `parse_fid_events`.  A
@@ -1110,10 +1147,10 @@ fn parse_one_event<'buf>(
                     if event.pidfd_is_absent() {
                         event.pidfd = Pidfd::Unavailable(raw as i32);
                     } else {
-                        event.preserve(buf, header_at, event_end, header.info_type);
+                        event.preserve(buf, header_at, record_end, header.info_type);
                     }
                 }
-                None => event.preserve(buf, header_at, event_end, header.info_type),
+                None => event.preserve(buf, header_at, record_end, header.info_type),
             },
             FAN_EVENT_INFO_TYPE_ERROR => {
                 match (
@@ -1121,7 +1158,7 @@ fn parse_one_event<'buf>(
                     read_u32(buf, payload_at + 4, payload_len.saturating_sub(4)),
                 ) {
                     (Some(error), Some(count)) => event.fs_error = Some((error as i32, count)),
-                    _ => event.preserve(buf, header_at, event_end, header.info_type),
+                    _ => event.preserve(buf, header_at, record_end, header.info_type),
                 }
             }
             FAN_EVENT_INFO_TYPE_RANGE => {
@@ -1130,32 +1167,43 @@ fn parse_one_event<'buf>(
                     read_u64(buf, payload_at + 8, payload_len.saturating_sub(8)),
                 ) {
                     (Some(offset), Some(count)) => event.access_range = Some((offset, count)),
-                    _ => event.preserve(buf, header_at, event_end, header.info_type),
+                    _ => event.preserve(buf, header_at, record_end, header.info_type),
                 }
             }
             FAN_EVENT_INFO_TYPE_MNT => match read_u64(buf, payload_at, payload_len) {
                 Some(mnt_id) => event.mnt_id = Some(mnt_id),
-                None => event.preserve(buf, header_at, event_end, header.info_type),
+                None => event.preserve(buf, header_at, record_end, header.info_type),
             },
-            // A type this crate does not know.  Kept verbatim so that a newer
-            // kernel's addition is visible rather than dropped.
-            _ => event.preserve(buf, header_at, event_end, header.info_type),
+            // A type this crate does not know.  Kept verbatim — header included,
+            // so the record can be re-parsed or forwarded intact — rather than
+            // dropped, which is what makes a newer kernel's addition survivable.
+            _ => event.preserve(buf, header_at, record_end, header.info_type),
         }
 
-        header_at += record_len;
+        header_at = record_end;
     }
 }
 
 impl<'buf> FidEvent<'buf> {
-    /// Present a malformed or unrecognised record verbatim, header included.
+    /// Present a record verbatim, header included, in `record_at..counted_end`.
     ///
-    /// The payload is borrowed from the parse buffer like every parsed field;
-    /// only a hand-built event can hold an owned one here.
-    fn preserve(&mut self, buf: &'buf [u8], record_at: usize, event_end: usize, info_type: u8) {
-        let payload_at = record_at + INFO_HEADER_SIZE;
-        let payload = buf.get(payload_at..event_end).unwrap_or_default();
+    /// `counted_end` is the end of the record this walk actually accounted for,
+    /// which is not always the record's own length: a record whose `len` field
+    /// cannot be trusted ends at the end of the event.  Either way the bytes are
+    /// borrowed from the parse buffer like every parsed field — only a
+    /// hand-built event can hold an owned one here.
+    ///
+    /// The stored range starts at the record **header**, so the four bytes the
+    /// kernel's `fanotify_event_info_header` occupies are part of it and the
+    /// entry is self-describing: `len` can be read back off the front of it
+    /// rather than assumed from the payload's length.  For a well-formed record
+    /// that cannot be walked past for some other reason, `counted_end` is
+    /// `record_at + len`, so the range is exactly that one record and no byte of
+    /// a following record is charged to it twice.
+    fn preserve(&mut self, buf: &'buf [u8], record_at: usize, counted_end: usize, info_type: u8) {
+        let record = buf.get(record_at..counted_end).unwrap_or_default();
         self.unknown_info_records
-            .push((info_type, Cow::Borrowed(payload)));
+            .push((info_type, Cow::Borrowed(record)));
     }
 
     /// Whether no pidfd record has been recorded yet.
@@ -1368,6 +1416,15 @@ mod tests {
         out
     }
 
+    /// The body of a `FID`/`DFID` record: an fsid followed by a file handle.
+    fn fid_record_payload(fsid: (i32, i32), handle_len: usize) -> Vec<u8> {
+        let mut out = Vec::new();
+        out.extend_from_slice(&fsid.0.to_ne_bytes());
+        out.extend_from_slice(&fsid.1.to_ne_bytes());
+        out.extend_from_slice(&file_handle(handle_len));
+        out
+    }
+
     fn with_len_prefix(records: &[Vec<u8>], mask: u64, fd: i32) -> Vec<u8> {
         let records_len: usize = records.iter().map(Vec::len).sum();
         let event_len = (METADATA_SIZE + records_len) as u32;
@@ -1546,13 +1603,54 @@ mod tests {
 
     #[test]
     fn an_unknown_record_type_is_preserved_not_dropped() {
-        let buf = with_len_prefix(&[record(200, b"future payload")], FAN_OPEN, FAN_NOFD);
+        let raw = record(200, b"future payload");
+        let buf = with_len_prefix(std::slice::from_ref(&raw), FAN_OPEN, FAN_NOFD);
         let events = parse_fid_events(&buf).unwrap();
 
         let unknown = events[0].unknown_info_records();
         assert_eq!(unknown.len(), 1);
         assert_eq!(unknown[0].0, 200);
-        assert_eq!(unknown[0].1.as_ref(), b"future payload");
+        assert_eq!(
+            unknown[0].1.as_ref(),
+            raw.as_slice(),
+            "verbatim means header included, so the record can be re-parsed"
+        );
+        // And it is self-describing: `len` reads back off the front.
+        let stored_len = u16::from_ne_bytes([unknown[0].1[2], unknown[0].1[3]]);
+        assert_eq!(stored_len as usize, raw.len());
+    }
+
+    #[test]
+    fn a_following_record_is_not_charged_to_an_unknown_one() {
+        // The regression this guards: an unknown record used to be stored as
+        // `record_at + 4 .. event_end`, so the whole of the next record was
+        // appended to it while that next record was *also* parsed into the
+        // event's typed fields — the same bytes in two places, and an entry
+        // whose length grew with whatever followed it.
+        let unknown = record(200, b"future bytes");
+        let fid = record(FAN_EVENT_INFO_TYPE_FID, &fid_record_payload((7, 9), 8));
+        let buf = with_len_prefix(&[unknown.clone(), fid.clone()], FAN_OPEN, FAN_NOFD);
+        let events = parse_fid_events(&buf).unwrap();
+
+        let kept = events[0].unknown_info_records();
+        assert_eq!(
+            kept.len(),
+            1,
+            "the FID record has a typed field, not an entry"
+        );
+        assert_eq!(
+            kept[0].1.as_ref(),
+            unknown.as_slice(),
+            "the unknown entry is its own record and stops at its own end"
+        );
+        assert!(
+            !kept[0].1.ends_with(&fid),
+            "the next record's bytes must not appear inside this entry"
+        );
+
+        // The next record is parsed, exactly once.
+        assert_eq!(events[0].fsid(), Some((7, 9)));
+        assert_eq!(events[0].self_handle().map(<[u8]>::len), Some(16));
     }
 
     #[test]
@@ -1896,6 +1994,44 @@ mod tests {
         let result = f();
         COUNTING.with(|c| c.set(false));
         (result, ALLOCATIONS.with(Cell::get))
+    }
+
+    #[test]
+    fn a_static_buffer_and_its_vec_reuse_both_allocations() {
+        // The reuse that a read loop can actually have: when the buffer and the
+        // events `Vec` are both `'static`, the borrow a `Vec<FidEvent<'buf>>`
+        // pins is the same one every iteration, so one buffer and one `Vec`
+        // serve every parse.  Reparsing into the same `Vec` is the half of that
+        // this can assert without a kernel; the lifetime half is what the
+        // `read_events` doc example compiles.
+        let mut payload = Vec::new();
+        payload.extend_from_slice(&7i32.to_ne_bytes());
+        payload.extend_from_slice(&42i32.to_ne_bytes());
+        payload.extend_from_slice(&file_handle(12));
+        payload.extend_from_slice(b"hello\0\0\0");
+        let buf = with_len_prefix(
+            &[record(FAN_EVENT_INFO_TYPE_DFID_NAME, &payload)],
+            FAN_CREATE,
+            FAN_NOFD,
+        );
+
+        let mut events: Vec<FidEvent<'_>> = Vec::new();
+        assert!(parse_fid_events_into(&mut events, &buf).is_complete());
+        let capacity = events.capacity();
+        assert!(capacity > 0);
+
+        for _ in 0..64 {
+            let (report, allocations) =
+                allocations_during(|| parse_fid_events_into(&mut events, &buf));
+            assert!(report.is_complete());
+            assert_eq!(events.len(), 1);
+            assert_eq!(
+                allocations, 0,
+                "a warm Vec must not allocate, however many times it is refilled"
+            );
+            assert_eq!(events.capacity(), capacity, "and must not regrow");
+            assert_eq!(events[0].dfid_name_str(), Some("hello"));
+        }
     }
 
     #[test]
