@@ -21,7 +21,7 @@
 //! │ struct fanotify_event_info_header    4 bytes  │  ┐
 //! │   u8  info_type                               │  │ repeated
 //! │   u8  pad                                     │  │ event_len −
-//! │   u16 len            total size of the record  │  │ metadata_len
+//! │   u16 len            total size of the record │  │ metadata_len
 //! ├───────────────────────────────────────────────┤  │ bytes
 //! │ payload, laid out per info_type:              │  │
 //! │   FID / DFID:        fsid(8) + file_handle    │  │
